@@ -1,4 +1,4 @@
-# Company Valuation Graph Visualizer
+# Bugscope Graph Visualizer
 
 ![Visualization Preview](assets/sample.png)
 
