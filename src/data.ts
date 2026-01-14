@@ -3,6 +3,29 @@ export interface TableSchema {
   columns: string[];
 }
 
+export interface NodeTypeConfig {
+  typeName: string;
+  colorCategoryField: string | null;
+  colorCategoryLabel: string | null;
+}
+
+export const NodeTypes: Record<string, NodeTypeConfig> = {
+  Company: {
+    typeName: 'Company',
+    colorCategoryField: 'sector',
+    colorCategoryLabel: 'sector'
+  },
+  VC: {
+    typeName: 'VC',
+    colorCategoryField: null,
+    colorCategoryLabel: null
+  }
+};
+
+export function setNodeTypes(config: Partial<Record<string, NodeTypeConfig>>): void {
+  Object.assign(NodeTypes, config);
+}
+
 export interface GraphData {
   companies: Record<string, unknown>[];
   vcs: Record<string, unknown>[];
@@ -57,13 +80,13 @@ export async function loadGraphData(): Promise<GraphData> {
   const companies: Record<string, unknown>[] = [];
 
   for (const table of schema) {
-    if (table.name === 'Company') {
+    if (table.name === NodeTypes.Company.typeName) {
       const data = await query(`MATCH (c:${table.name}) RETURN c`);
       companies.push(...data.map((row: any) => row.c));
     }
   }
 
-  const relData = await query('MATCH (v:VC)-[r]->(c:Company) RETURN v, c, r');
+  const relData = await query(`MATCH (v:${NodeTypes.VC.typeName})-[r]->(c:${NodeTypes.Company.typeName}) RETURN v, c, r`);
   const vcInvestmentMap = new Map<string, number>();
   const vcs: Record<string, unknown>[] = [];
 
@@ -86,18 +109,39 @@ export async function loadGraphData(): Promise<GraphData> {
   return cachedData;
 }
 
-export function getSectorColor(sector: string): string {
-  const colors: Record<string, string> = {
-    'Technology': '#FFB3BA',
-    'Fintech': '#FFDFBA',
-    'Travel': '#FFFFBA',
-    'Transportation': '#BAFFC9',
-    'Enterprise Software': '#BAE1FF',
-    'Crypto': '#E6B3FF',
-    'E-commerce': '#B3E6FF',
-    'Food Delivery': '#FFB3E6',
-  };
-  return colors[sector] || '#CCCCCC';
+let cachedNodeColors: Record<string, Record<string, string>> | null = null;
+
+export function getNodeColor(nodeType: string, category: string | null): string {
+  if (cachedNodeColors) {
+    return cachedNodeColors[nodeType]?.[category || ''] || '#CCCCCC';
+  }
+
+  cachedNodeColors = {};
+
+  const palette = [
+    '#FFB3BA', '#FFDFBA', '#FFFFBA', '#BAFFC9', '#BAE1FF',
+    '#E6B3FF', '#B3E6FF', '#FFB3E6', '#B3FFBA', '#FFBAE6',
+    '#BAFFFF', '#FFBAFF', '#E6FFBA', '#FFE6BA', '#BAE6FF'
+  ];
+
+  Object.keys(NodeTypes).forEach(type => {
+    cachedNodeColors![type] = {};
+    const config = NodeTypes[type];
+
+    if (config.colorCategoryField) {
+      const categories = new Set<string>();
+      cachedData?.companies.forEach((company: any) => {
+        const categoryValue = company[config.colorCategoryField];
+        if (categoryValue) categories.add(categoryValue);
+      });
+
+      Array.from(categories).sort().forEach((cat, i) => {
+        cachedNodeColors![type][cat] = palette[i % palette.length];
+      });
+    }
+  });
+
+  return cachedNodeColors[nodeType]?.[category || ''] || '#CCCCCC';
 }
 
 export function formatCurrency(value: number): string {

@@ -1,5 +1,5 @@
 import * as d3 from 'd3';
-import { CompanyData, VCData, getSectorColor, formatCurrency } from './data';
+import { CompanyData, VCData, getNodeColor, formatCurrency } from './data';
 
 export interface GraphNode extends d3.SimulationNodeDatum {
   id: string;
@@ -132,7 +132,7 @@ export class GraphVisualizer {
     // Render edge labels in separate group (on top)
     const edgeLabelsGroup = (this.svg.node() as any).__edgeLabelsGroup__;
     edgeLabelsGroup.selectAll('g').remove();
-    
+
     const labelGroups = edgeLabelsGroup.selectAll('g')
       .data(links)
       .join('g')
@@ -155,8 +155,8 @@ export class GraphVisualizer {
       .attr('pointer-events', 'none')
       .text(d => {
         const amountInMillions = Math.round(d.value / 1000000);
-        return amountInMillions >= 1000 
-          ? `$${(amountInMillions / 1000).toFixed(1)}B` 
+        return amountInMillions >= 1000
+          ? `$${(amountInMillions / 1000).toFixed(1)}B`
           : `$${amountInMillions}M`;
       })
       .each(function(d) {
@@ -202,7 +202,7 @@ export class GraphVisualizer {
           .classed('visible', true)
           .html(`
             <strong>${d.name}</strong><br/>
-            ${d.type === 'company' 
+            ${d.type === 'company'
               ? `Sector: ${d.sector}<br/>Valuation: ${formatCurrency(d.valuation)}`
               : `Total Investment: ${formatCurrency(d.totalInvestment!)}`
             }
@@ -246,7 +246,7 @@ export class GraphVisualizer {
 
       g.append('circle')
         .attr('r', 8)
-        .attr('fill', getSectorColor(sector));
+        .attr('fill', getNodeColor('Company', sector));
 
       g.append('text')
         .attr('x', 15)

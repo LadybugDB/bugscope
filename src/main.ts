@@ -1,5 +1,5 @@
 import { GraphVisualizer, GraphNode, GraphLink } from './graph';
-import { loadGraphData, getSectorColor } from './data';
+import { loadGraphData, getNodeColor } from './data';
 import * as d3 from 'd3';
 
 console.log('=== Main script loaded ===');
@@ -11,14 +11,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.error('Container not found');
     return;
   }
-  
+
   try {
     const data = await loadGraphData();
     console.log('Data loaded:', data);
 
     // Create nodes array with both companies and VCs
     const nodes: GraphNode[] = [];
-    
+
     // Scale for company radii
     const companyMinVal = Math.min(...data.companies.map(c => c.valuation));
     const companyMaxVal = Math.max(...data.companies.map(c => c.valuation));
@@ -35,7 +35,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         sector: c.sector,
         type: 'company',
         radius: companyRadiusScale(c.valuation),
-        color: getSectorColor(c.sector)
+        color: getNodeColor('Company', c.sector)
       });
     });
 

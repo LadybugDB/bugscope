@@ -36,6 +36,34 @@ Data is queried from `data/companies.lbdb` files via the API endpoint. The graph
 - Valuation (determines bubble size)
 - Industry sector (determines color)
 
+## Using with a Different Database
+
+The visualization is configured for a graph database with `Company` and `VC` node types. To use with a different database schema, configure the `NodeTypes` object in `src/data.ts`:
+
+```typescript
+import { setNodeTypes, NodeTypes } from './data';
+
+setNodeTypes({
+  Company: {
+    typeName: 'Organization',      // Cypher node label
+    colorCategoryField: 'industry', // Property to color by
+    colorCategoryLabel: 'industry'
+  },
+  VC: {
+    typeName: 'Investor',
+    colorCategoryField: null,       // No coloring for this type
+    colorCategoryLabel: null
+  }
+});
+```
+
+This will:
+1. Query `MATCH (n:Organization)` instead of `MATCH (c:Company)`
+2. Color nodes by the `industry` property instead of `sector`
+3. Query `MATCH (v:Investor)` instead of `MATCH (v:VC)`
+
+The `colorCategoryField` property determines which node property is used for color assignment. Set it to `null` to use a single color for that node type.
+
 ## Project Structure
 
 ```
