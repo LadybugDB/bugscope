@@ -16,6 +16,19 @@ conn.initSync();
 
 const PORT = 3000;
 
+function queryAllSync(query: string): any[] {
+  const result = conn.querySync(query);
+  const queryResult = result as any;
+  queryResult.resetIterator();
+  const rows: any[] = [];
+  let row;
+  while ((row = queryResult.getNextSync()) !== null) {
+    rows.push(row);
+  }
+  queryResult.close();
+  return rows;
+}
+
 Bun.serve({
   port: PORT,
   static: {
@@ -24,81 +37,31 @@ Bun.serve({
   },
   fetch(req) {
     const url = new URL(req.url);
-    
-    if (url.pathname === "/api/companies") {
-      const result = conn.querySync('MATCH (c:Company) RETURN c.name AS name, c.valuation AS valuation, c.sector AS sector');
-      const queryResult = result;
-      queryResult.resetIterator();
-      const companies = [];
-      let row;
-      while ((row = queryResult.getNextSync()) !== null) {
-        companies.push(row);
-      }
-      queryResult.close();
-      return new Response(JSON.stringify(companies), { headers: { "Content-Type": "application/json" } });
-    }
-    
-    if (url.pathname === "/api/vcs") {
-      const result = conn.querySync('MATCH (v:VC) RETURN v.name AS name, v.location AS location, v.founded AS founded');
-      const queryResult = result;
-      queryResult.resetIterator();
-      const vcs = [];
-      let row;
-      while ((row = queryResult.getNextSync()) !== null) {
-        vcs.push({ ...row, total_investment: row.founded * 1000000 });
-      }
-      queryResult.close();
-      return new Response(JSON.stringify(vcs), { headers: { "Content-Type": "application/json" } });
-    }
-    
-    if (url.pathname === "/api/investments") {
-      const result = conn.querySync('MATCH (v:VC)-[r:INVESTED_IN]->(c:Company) RETURN v.name AS vc, c.name AS company, r.amount AS amount');
-      const queryResult = result;
-      queryResult.resetIterator();
-      const investments = [];
-      let row;
-      while ((row = queryResult.getNextSync()) !== null) {
-        investments.push(row);
-      }
-      queryResult.close();
-      return new Response(JSON.stringify(investments), { headers: { "Content-Type": "application/json" } });
-    }
-    
-    if (url.pathname === "/api/graph-data") {
-      const companiesResult = conn.querySync('MATCH (c:Company) RETURN c.name AS name, c.valuation AS valuation, c.sector AS sector');
-      companiesResult.resetIterator();
-      const companies = [];
-      let row;
-      while ((row = companiesResult.getNextSync()) !== null) {
-        companies.push({ ...row, type: 'company' });
-      }
-      companiesResult.close();
 
-      // Query investments first
-      const investmentsResult = conn.querySync('MATCH (v:VC)-[r:INVESTED_IN]->(c:Company) RETURN v.name AS vc, c.name AS company, r.amount AS amount');
-      investmentsResult.resetIterator();
-      const investments = [];
-      const vcInvestmentMap = new Map();
-      while ((row = investmentsResult.getNextSync()) !== null) {
-        investments.push(row);
-        const current = vcInvestmentMap.get(row.vc) || 0;
-        vcInvestmentMap.set(row.vc, current + row.amount);
-      }
-      investmentsResult.close();
-
-      // Query VCs and add totalInvestment calculated from investments
-      const vcsResult = conn.querySync('MATCH (v:VC) RETURN v.name AS name, v.location AS location, v.founded AS founded');
-      vcsResult.resetIterator();
-      const vcs = [];
-      while ((row = vcsResult.getNextSync()) !== null) {
-        const totalInvestment = vcInvestmentMap.get(row.name) || 0;
-        vcs.push({ ...row, type: 'vc', totalInvestment });
-      }
-      vcsResult.close();
-
-      return new Response(JSON.stringify({ companies, vcs, investments }), { headers: { "Content-Type": "application/json" } });
+    if (url.pathname === "/api/schema") {
+      const schema = queryAllSync('CALL show_tables() RETURN *');
+      return new Response(JSON.stringify(schema), { headers: { "Content-Type": "application/json" } });
     }
-    
+
+    if (url.pathname === "/api/columns") {
+      const table = url.searchParams.get('table') || '';
+      const columns = queryAllSync(`CALL table_info('${table}') RETURN *`);
+      return new Response(JSON.stringify(columns), { headers: { "Content-Type": "application/json" } });
+    }
+
+    if (url.pathname === "/api/inspect") {
+      const companyData = queryAllSync('MATCH (c:Company) RETURN c LIMIT 1');
+      const vcData = queryAllSync('MATCH (v:VC) RETURN v LIMIT 1');
+      return new Response(JSON.stringify({ company: companyData[0], vc: vcData[0] }, null, 2), { headers: { "Content-Type": "application/json" } });
+    }
+
+    if (url.pathname.startsWith('/api/query')) {
+      const query = url.searchParams.get('q') || url.searchParams.get('query');
+      if (!query) return new Response("Missing query parameter", { status: 400 });
+      const results = queryAllSync(query);
+      return new Response(JSON.stringify(results), { headers: { "Content-Type": "application/json" } });
+    }
+
     return new Response("Not Found", { status: 404 });
   },
 });

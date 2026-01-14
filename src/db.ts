@@ -1,27 +1,9 @@
 import { Database, Connection } from 'lbug';
 import fs from 'fs';
 
-export interface CompanyData {
-  id: string;
-  name: string;
-  valuation: number;
-  sector: string;
-  type: 'company';
-}
-
-export interface VCData {
-  id: string;
-  name: string;
-  totalInvestment: number;
-  location: string;
-  founded: number;
-  type: 'vc';
-}
-
-export interface InvestmentData {
-  from: string;
-  to: string;
-  amount: number;
+export interface SchemaInfo {
+  tableName: string;
+  columns: string[];
 }
 
 const dbPath = './data/companies.lbdb';
@@ -35,73 +17,63 @@ db.initSync();
 const conn = new Connection(db);
 conn.initSync();
 
-export function getCompanies(): CompanyData[] {
-  const result = conn.querySync('MATCH (c:Company) RETURN c');
-  const queryResult = result as any;
-  queryResult.resetIterator();
-  
-  const companies: CompanyData[] = [];
+export function getSchema(): SchemaInfo[] {
+  const result = conn.querySync('CALL show_tables() RETURN *') as any;
+  result.resetIterator();
+
+  const schema: SchemaInfo[] = [];
   let row;
-  while ((row = queryResult.getNextSync()) !== null) {
-    const c = row.c as any;
-    companies.push({
-      id: `${c._id?.table}:${c._id?.offset}`,
-      name: c.name,
-      valuation: c.valuation,
-      sector: c.sector,
-      type: 'company'
+  while ((row = result.getNextSync()) !== null) {
+    schema.push({
+      tableName: row.name,
+      columns: []
     });
   }
-  queryResult.close();
-  return companies;
+  result.close();
+  return schema;
 }
 
-export function getVCs(): VCData[] {
-  const result = conn.querySync('MATCH (v:VC) RETURN v');
-  const queryResult = result as any;
-  queryResult.resetIterator();
-  
-  const vcs: VCData[] = [];
+export function getTableColumns(tableName: string): string[] {
+  const result = conn.querySync(`CALL table_info('${tableName}') RETURN *`) as any;
+  result.resetIterator();
+
+  const columns: string[] = [];
   let row;
-  while ((row = queryResult.getNextSync()) !== null) {
-    const v = row.v as any;
-    vcs.push({
-      id: `${v._id?.table}:${v._id?.offset}`,
-      name: v.name,
-      totalInvestment: v.founded * 1000000,
-      location: v.location,
-      founded: v.founded,
-      type: 'vc'
+  while ((row = result.getNextSync()) !== null) {
+    columns.push(row.name);
+  }
+  result.close();
+  return columns;
+}
+
+export function getTableData(tableName: string): Record<string, any>[] {
+  const result = conn.querySync(`MATCH (n:${tableName}) RETURN n`) as any;
+  result.resetIterator();
+
+  const data: Record<string, any>[] = [];
+  let row;
+  while ((row = result.getNextSync()) !== null) {
+    data.push(row.n);
+  }
+  result.close();
+  return data;
+}
+
+export function getRelationshipData(): Record<string, any>[] {
+  const result = conn.querySync('MATCH (v:VC)-[r]->(c:Company) RETURN v, c, r') as any;
+  result.resetIterator();
+
+  const data: Record<string, any>[] = [];
+  let row;
+  while ((row = result.getNextSync()) !== null) {
+    data.push({
+      vc: row.v.name,
+      company: row.c.name,
+      amount: row.r?.amount || row.c.valuation || 1000000
     });
   }
-  queryResult.close();
-  return vcs;
-}
-
-export function getInvestments(): InvestmentData[] {
-  const result = conn.querySync('MATCH (v:VC)-[r:INVESTED_IN]->(c:Company) RETURN v.name AS vc, c.name AS company, r.amount AS amount');
-  const queryResult = result as any;
-  queryResult.resetIterator();
-  
-  const investments: InvestmentData[] = [];
-  let row;
-  while ((row = queryResult.getNextSync()) !== null) {
-    investments.push({
-      from: row.vc,
-      to: row.company,
-      amount: row.amount
-    });
-  }
-  queryResult.close();
-  return investments;
-}
-
-export function getAllData(): { companies: CompanyData[], vcs: VCData[], investments: InvestmentData[] } {
-  return {
-    companies: getCompanies(),
-    vcs: getVCs(),
-    investments: getInvestments()
-  };
+  result.close();
+  return data;
 }
 
 conn.closeSync();
