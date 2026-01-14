@@ -9,7 +9,7 @@ if (!fs.existsSync(dbPath)) {
   process.exit(1);
 }
 
-const db = new Database(dbPath);
+const db = new Database(dbPath, 0, false, true);
 db.initSync();
 const conn = new Connection(db);
 conn.initSync();

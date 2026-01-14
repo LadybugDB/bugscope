@@ -12,7 +12,7 @@ if (!fs.existsSync(dbPath)) {
   throw new Error(`Database not found at ${dbPath}. Run 'npx tsx scripts/load-data.ts' first.`);
 }
 
-const db = new Database(dbPath);
+const db = new Database(dbPath, 0, false, true);
 db.initSync();
 const conn = new Connection(db);
 conn.initSync();
