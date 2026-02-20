@@ -25,7 +25,7 @@ An interactive graph visualization tool for ladybugdb. Explore relationships bet
 3. **Open in browser**
    Navigate to `http://localhost:5173` to view the visualizer.
 
-The application will automatically connect to the backend API at `http://localhost:3001` to fetch available databases and graph data.
+The application will automatically connect to the backend API at `http://localhost:3001` to fetch available databases and graph data. It will scan for databases starting from the parent directory looking for files with `.lbdb` extension.
 
 ## Usage
 
