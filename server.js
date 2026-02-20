@@ -50,7 +50,7 @@ app.get('/api/graph/:id', async (req, res) => {
   }
 
   try {
-    const db = new Database(dbInfo.path)
+    const db = new Database(dbInfo.path, 0, false, true)
     const conn = new Connection(db)
     
     const nodesResult = await conn.query('MATCH (n) RETURN n, LABEL(n) as label, ID(n) as nodeId LIMIT 500')
