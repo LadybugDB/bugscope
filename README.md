@@ -1,77 +1,43 @@
 # Bugscope Graph Visualizer
 
-![Visualization Preview](assets/sample.png)
+An interactive graph visualization tool for ladybugdb. Explore relationships between bugs, files, and other entities in your databases through an intuitive visual interface.
 
 ## Features
 
-- **Bubble Chart Visualization**: Companies are displayed as bubbles with size proportional to their valuation
-- **Color Coding**: Pastel colors by industry sector
-- **VC Connections**: VCs are displayed in red with investment size shown on edges
-- **Edge Width**: Edge width is determined by investment size
-- **Interactive**: Drag bubbles, hover for tooltips
-- **Responsive**: Adapts to window size
-- **Force Layout**: Physics-based positioning with sector clustering
+- **Interactive Graph View** - Navigate through connected data using a force-directed graph. Drag nodes to rearrange, zoom in/out, and pan around the canvas.
+- **Database Selection** - Choose from available ladybugdb databases in the sidebar to visualize their relationships.
+- **Visual Encoding** - Node size reflects connection count (more connections = larger nodes), and colors differentiate entity types.
+- **Dark/Light Mode** - Toggle between dark and light themes for comfortable viewing.
+- **Relationship Labels** - Hover over edges to see the type of relationship between connected nodes.
 
-## Setup
+## Getting Started
 
-1. Install dependencies:
+1. **Install dependencies**
    ```bash
-   bun install
+   npm install
    ```
 
-2. Start development server:
+2. **Start the application**
    ```bash
-   bun run dev
+   npm run dev
    ```
 
-3. Build for production:
-   ```bash
-   bun run build
-   ```
+3. **Open in browser**
+   Navigate to `http://localhost:5173` to view the visualizer.
 
-## Data Source
+The application will automatically connect to the backend API at `http://localhost:3001` to fetch available databases and graph data.
 
-Data is queried from `data/companies.lbdb` files via the API endpoint. The graph displays:
-- Company name (inside bubble)
-- Valuation (determines bubble size)
-- Industry sector (determines color)
+## Usage
 
-## Using with a Different Database
+1. Select a database from the sidebar on the left
+2. The graph will load and display nodes (entities) and edges (relationships)
+3. Click and drag nodes to rearrange the layout
+4. Scroll to zoom in/out, click and drag the canvas to pan
+5. Hover over nodes to see their labels
+6. Hover over edges to see relationship types
+7. Use the theme toggle button to switch between dark and light modes
 
-The visualization is configured for a graph database with `Company` and `VC` node types. To use with a different database schema, configure the `NodeTypes` object in `src/data.ts`:
+## Requirements
 
-```typescript
-import { setNodeTypes, NodeTypes } from './data';
-
-setNodeTypes({
-  Company: {
-    typeName: 'Organization',      // Cypher node label
-    colorCategoryField: 'industry', // Property to color by
-    colorCategoryLabel: 'industry'
-  },
-  VC: {
-    typeName: 'Investor',
-    colorCategoryField: null,       // No coloring for this type
-    colorCategoryLabel: null
-  }
-});
-```
-
-This will:
-1. Query `MATCH (n:Organization)` instead of `MATCH (c:Company)`
-2. Color nodes by the `industry` property instead of `sector`
-3. Query `MATCH (v:Investor)` instead of `MATCH (v:VC)`
-
-The `colorCategoryField` property determines which node property is used for color assignment. Set it to `null` to use a single color for that node type.
-
-## Project Structure
-
-```
-├── src/
-│   ├── main.ts          # Entry point
-│   ├── graph.ts         # D3.js visualization logic
-│   └── data.ts          # Data handling and color schemes
-├── index.html           # HTML template
-├── package.json         # Dependencies and scripts
-└── tsconfig.json        # TypeScript configuration
-```
+- Node.js
+- A running ladybugdb backend API at `http://localhost:3001`
