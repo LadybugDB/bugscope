@@ -14,6 +14,8 @@ app.use(express.json())
 
 const DATA_DIR = path.join(__dirname, '.')
 
+let customDatabases = []
+
 function scanForDatabases(dir = DATA_DIR, baseDir = DATA_DIR) {
   const databases = []
   try {
@@ -37,13 +39,69 @@ function scanForDatabases(dir = DATA_DIR, baseDir = DATA_DIR) {
   return databases
 }
 
+function getAllDatabases() {
+  const scanned = scanForDatabases()
+  const all = [...scanned, ...customDatabases]
+  return all.map((d, i) => ({ id: i, ...d }))
+}
+
 app.get('/api/databases', (req, res) => {
-  const databases = scanForDatabases()
-  res.json(databases.map((d, i) => ({ id: i, ...d })))
+  const databases = getAllDatabases()
+  res.json(databases)
+})
+
+app.post('/api/databases', (req, res) => {
+  const { filePath } = req.body
+  if (!filePath) {
+    return res.status(400).json({ error: 'filePath is required' })
+  }
+
+  try {
+    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(filePath)
+    if (!fs.existsSync(absPath)) {
+      return res.status(404).json({ error: 'File not found' })
+    }
+    if (!absPath.endsWith('.lbdb')) {
+      return res.status(400).json({ error: 'Only .lbdb files are supported' })
+    }
+
+    const existing = customDatabases.find(d => d.path === absPath)
+    if (existing) {
+      return res.status(409).json({ error: 'Database already added' })
+    }
+
+    const db = {
+      name: path.basename(absPath, '.lbdb'),
+      path: absPath,
+      relativePath: absPath
+    }
+    customDatabases.push(db)
+    res.json({ id: getAllDatabases().length - 1, ...db })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/directories', (req, res) => {
+  const dir = req.query.path ? path.resolve(req.query.path) : DATA_DIR
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+    const directories = entries
+      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+      .map(e => ({ name: e.name, path: path.join(dir, e.name), type: 'directory' }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    const files = entries
+      .filter(e => e.isFile() && e.name.endsWith('.lbdb'))
+      .map(e => ({ name: e.name.replace('.lbdb', ''), path: path.join(dir, e.name), type: 'file' }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    res.json({ current: dir, parent: path.dirname(dir), directories, files })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.get('/api/graph/:id', async (req, res) => {
-  const databases = scanForDatabases()
+  const databases = getAllDatabases()
   const dbInfo = databases[parseInt(req.params.id)]
   if (!dbInfo) {
     return res.status(404).json({ error: 'Database not found' })
@@ -52,30 +110,30 @@ app.get('/api/graph/:id', async (req, res) => {
   try {
     const db = new Database(dbInfo.path, 0, false, true)
     const conn = new Connection(db)
-    
+
     const nodesResult = await conn.query('MATCH (n) RETURN n, LABEL(n) as label, ID(n) as nodeId LIMIT 500')
     const nodesRows = await nodesResult.getAll()
-    
+
     const linksResult = await conn.query('MATCH (a)-[r]->(b) RETURN ID(a) as src, ID(b) as dst, LABEL(r) as relType LIMIT 500')
     const linksRows = await linksResult.getAll()
-    
+
     const idToString = (id) => `${id.table}:${id.offset}`
-    
+
     const nodes = nodesRows.map((row) => {
       const node = row.n || {}
       const label = row.label || 'Node'
       const name = node.name || node.id || node.title || 'Node'
       return { id: idToString(row.nodeId), name: String(name), label }
     })
-    
+
     const nodeIdSet = new Set(nodes.map(n => n.id))
-    
+
     const links = linksRows.map((row) => ({
       source: idToString(row.src),
       target: idToString(row.dst),
       label: row.relType
     })).filter((link) => nodeIdSet.has(link.source) && nodeIdSet.has(link.target))
-    
+
     res.json({ nodes, links })
   } catch (err) {
     console.error(err)
