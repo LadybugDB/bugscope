@@ -12,7 +12,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-const DATA_DIR = path.join(__dirname, '..')
+const DATA_DIR = path.join(__dirname, '.')
 
 function scanForDatabases(dir = DATA_DIR, baseDir = DATA_DIR) {
   const databases = []
