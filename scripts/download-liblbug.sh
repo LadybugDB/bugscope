@@ -29,9 +29,9 @@ case "$OS" in
     ;;
   MINGW*|MSYS*|CYGWIN*)
     if [ "$ARCH" = "x86_64" ]; then
-      ARCHIVE="liblbug-windows-x86_64.tar.gz"
+      ARCHIVE="liblbug-windows-x86_64.zip"
     elif [ "$ARCH" = "aarch64" ]; then
-      ARCHIVE="liblbug-windows-aarch64.tar.gz"
+      ARCHIVE="liblbug-windows-aarch64.zip"
     else
       echo "Unsupported Windows architecture: $ARCH" >&2
       exit 1
@@ -63,7 +63,12 @@ TMPFILE="$(mktemp)"
 trap "rm -f '$TMPFILE'" EXIT
 
 curl -fSL "$DOWNLOAD_URL" -o "$TMPFILE"
-tar xzf "$TMPFILE" -C "$TARGET_DIR"
+
+if [[ "$ARCHIVE" == *.zip ]]; then
+  unzip -o "$TMPFILE" -d "$TARGET_DIR"
+else
+  tar xzf "$TMPFILE" -C "$TARGET_DIR"
+fi
 
 echo ""
 echo "liblbug v${LBUG_VERSION} installed to $TARGET_DIR"
