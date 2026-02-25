@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "setup": "bash scripts/download-liblbug.sh",
     "dev:frontend": "vite",
     "build:frontend": "tsc -b && vite build",
     "tauri": "cargo tauri",

@@ -1,0 +1,22 @@
+# Use prebuilt liblbug from GitHub releases instead of compiling C++ from source.
+# The prebuilt library lives in src-tauri/liblbug/ (downloaded separately, gitignored).
+# These env vars are read by the lbug crate's build.rs to skip the CMake build.
+[env]
+LBUG_LIBRARY_DIR = { value = "liblbug", relative = true }
+LBUG_INCLUDE_DIR = { value = "liblbug", relative = true }
+LBUG_SHARED = "1"
+
+# Embed rpath so the binary can find liblbug.dylib at runtime.
+# First rpath: for production .app bundles (Contents/Frameworks/)
+# Second rpath: for development (liblbug/ dir relative to the binary in target/)
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks",
+  "-C", "link-arg=-Wl,-rpath,@executable_path/../liblbug",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks",
+  "-C", "link-arg=-Wl,-rpath,@executable_path/../liblbug",
+]
