@@ -45,8 +45,11 @@ function App() {
   const [pickerError, setPickerError] = useState<string | null>(null)
   const [customQuery, setCustomQuery] = useState<string>('')
   const [isCustomQuery, setIsCustomQuery] = useState(false)
+  const [queryActivated, setQueryActivated] = useState(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
+  const customQueryRef = useRef<string>('')
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const fetchDatabases = () => {
     invoke<Database[]>('get_databases')
@@ -87,8 +90,9 @@ function App() {
     setLoading(true)
     setError(null)
 
-    if (isCustomQuery && customQuery.trim()) {
-      invoke<GraphData>('execute_query', { id: selectedId, query: customQuery.trim() })
+    const query = customQueryRef.current.trim()
+    if (query) {
+      invoke<GraphData>('execute_query', { id: selectedId, query })
         .then(data => {
           setGraphData(data)
           setLoading(false)
@@ -118,7 +122,7 @@ function App() {
           setLoading(false)
         })
     }
-  }, [selectedId, databases.length, isCustomQuery, customQuery])
+  }, [selectedId, databases.length])
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -274,41 +278,7 @@ function App() {
             </span>
             {error && <span className="error-message">{error}</span>}
           </div>
-          <div className="query-box">
-            <input
-              type="text"
-              value={customQuery}
-              placeholder="Enter Cypher query (e.g., MATCH (n) RETURN n LIMIT 100)"
-              onChange={e => {
-                setCustomQuery(e.target.value)
-                setIsCustomQuery(e.target.value.trim().length > 0)
-              }}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && customQuery.trim()) {
-                  fetchGraphData()
-                }
-              }}
-              className="query-input"
-            />
-            <button
-              className="query-btn"
-              onClick={fetchGraphData}
-              disabled={!customQuery.trim()}
-            >
-              Run
-            </button>
-            {isCustomQuery && (
-              <button
-                className="query-btn secondary"
-                onClick={() => {
-                  setCustomQuery('')
-                  setIsCustomQuery(false)
-                }}
-              >
-                Reset
-              </button>
-            )}
-          </div>
+
           <div className="header-right">
             <button
               className="theme-toggle"
@@ -342,6 +312,63 @@ function App() {
               enableNodeDrag
             />
           )}
+        </div>
+
+        <div className="query-box">
+          <textarea
+            value={customQuery}
+            placeholder="Enter Cypher query (e.g., MATCH (n) RETURN n LIMIT 100)"
+            onChange={e => {
+              const val = e.target.value
+              setCustomQuery(val)
+              customQueryRef.current = val
+              setIsCustomQuery(val.trim().length > 0)
+              // After first activation, debounce auto-execution
+              if (queryActivated && val.trim()) {
+                if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+                debounceTimerRef.current = setTimeout(() => {
+                  fetchGraphData()
+                }, 3000)
+              }
+            }}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey && customQuery.trim()) {
+                e.preventDefault()
+                if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+                setQueryActivated(true)
+                fetchGraphData()
+              }
+            }}
+            className="query-input"
+            rows={5}
+          />
+          <div className="query-actions">
+            <button
+              className="query-btn"
+              onClick={() => {
+                if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+                setQueryActivated(true)
+                fetchGraphData()
+              }}
+              disabled={!customQuery.trim()}
+            >
+              Run
+            </button>
+            {isCustomQuery && (
+              <button
+                className="query-btn secondary"
+                onClick={() => {
+                  if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+                  setCustomQuery('')
+                  customQueryRef.current = ''
+                  setIsCustomQuery(false)
+                  setQueryActivated(false)
+                }}
+              >
+                Reset
+              </button>
+            )}
+          </div>
         </div>
 
         {filePickerOpen && (

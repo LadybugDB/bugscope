@@ -347,26 +347,18 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
         .map_err(|e| format!("Query failed: {}", e))?;
 
     let mut nodes = Vec::new();
-    let links = Vec::new();
+    let mut links = Vec::new();
     let mut node_id_set: HashSet<String> = HashSet::new();
 
     for row in &mut result {
-        for (col_idx, val) in row.iter().enumerate() {
+        for val in row.iter() {
             match val {
                 Value::Node(node_val) => {
-                    // Extract properties to build ID and label
-                    let props = node_val.get_properties();
-                    let node_id = props
-                        .iter()
-                        .find(|(k, _)| k == "id")
-                        .map(|(_, v)| value_to_string(v))
-                        .unwrap_or_else(|| {
-                            // Generate a unique ID from row/column position
-                            format!("node_{}_{}", nodes.len(), col_idx)
-                        });
+                    let node_id = id_to_string(node_val.get_node_id());
 
                     if !node_id_set.contains(&node_id) {
                         node_id_set.insert(node_id.clone());
+                        let props = node_val.get_properties();
                         let name = props
                             .iter()
                             .find(|(k, _)| k == "name")
@@ -375,12 +367,7 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
                             .map(|(_, v)| value_to_string(v))
                             .unwrap_or_else(|| "Node".to_string());
 
-                        // Try to get label from properties, fallback to "Node"
-                        let label = props
-                            .iter()
-                            .find(|(k, _)| k == "label")
-                            .map(|(_, v)| value_to_string(v))
-                            .unwrap_or_else(|| "Node".to_string());
+                        let label = node_val.get_label_name().clone();
 
                         nodes.push(GraphNode {
                             id: node_id,
@@ -389,14 +376,27 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
                         });
                     }
                 }
-                Value::InternalID(id_val) => {
-                    // Store internal IDs that might be useful for linking
-                    let _id_str = id_to_string(id_val);
+                Value::Rel(rel_val) => {
+                    let source = id_to_string(rel_val.get_src_node());
+                    let target = id_to_string(rel_val.get_dst_node());
+                    let label = rel_val.get_label_name().clone();
+
+                    links.push(GraphLink {
+                        source,
+                        target,
+                        label,
+                    });
                 }
                 _ => {}
             }
         }
     }
+
+    // Filter links to only include those where both endpoints exist
+    let links = links
+        .into_iter()
+        .filter(|link| node_id_set.contains(&link.source) && node_id_set.contains(&link.target))
+        .collect();
 
     Ok(GraphData { nodes, links })
 }

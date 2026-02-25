@@ -126,10 +126,11 @@ body {
 
 .query-box {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
-  flex: 1;
-  max-width: 600px;
+  padding: 8px 16px;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
 }
 
 .query-input {
@@ -141,11 +142,19 @@ body {
   border-radius: 4px;
   font-size: 14px;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  resize: vertical;
+  line-height: 1.4;
 }
 
 .query-input:focus {
   outline: none;
   border-color: var(--accent-color);
+}
+
+.query-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .query-btn {
