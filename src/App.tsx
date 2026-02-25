@@ -43,6 +43,8 @@ function App() {
   const [parentDir, setParentDir] = useState<string>('')
   const [manualPath, setManualPath] = useState<string>('')
   const [pickerError, setPickerError] = useState<string | null>(null)
+  const [customQuery, setCustomQuery] = useState<string>('')
+  const [isCustomQuery, setIsCustomQuery] = useState(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
 
@@ -77,29 +79,52 @@ function App() {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light')
   }, [darkMode])
 
-  /* eslint-disable react-hooks/set-state-in-effect */
-  useEffect(() => {
+  const fetchGraphData = useCallback(() => {
     if (databases.length === 0) {
       setGraphData({ nodes: [], links: [] })
       return
     }
     setLoading(true)
     setError(null)
-    invoke<GraphData>('get_graph', { id: selectedId })
-      .then(data => {
-        setGraphData(data)
-        setLoading(false)
-        setTimeout(() => {
-          if (graphRef.current) {
-            graphRef.current.zoomToFit(400)
-          }
-        }, 500)
-      })
-      .catch(err => {
-        setError(String(err))
-        setLoading(false)
-      })
-  }, [selectedId, databases.length])
+
+    if (isCustomQuery && customQuery.trim()) {
+      invoke<GraphData>('execute_query', { id: selectedId, query: customQuery.trim() })
+        .then(data => {
+          setGraphData(data)
+          setLoading(false)
+          setTimeout(() => {
+            if (graphRef.current) {
+              graphRef.current.zoomToFit(400)
+            }
+          }, 500)
+        })
+        .catch(err => {
+          setError(String(err))
+          setLoading(false)
+        })
+    } else {
+      invoke<GraphData>('get_graph', { id: selectedId })
+        .then(data => {
+          setGraphData(data)
+          setLoading(false)
+          setTimeout(() => {
+            if (graphRef.current) {
+              graphRef.current.zoomToFit(400)
+            }
+          }, 500)
+        })
+        .catch(err => {
+          setError(String(err))
+          setLoading(false)
+        })
+    }
+  }, [selectedId, databases.length, isCustomQuery, customQuery])
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    fetchGraphData()
+  }, [fetchGraphData])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const openFilePicker = () => {
     setManualPath('')
@@ -248,6 +273,41 @@ function App() {
               {loading ? 'Loading...' : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
             {error && <span className="error-message">{error}</span>}
+          </div>
+          <div className="query-box">
+            <input
+              type="text"
+              value={customQuery}
+              placeholder="Enter Cypher query (e.g., MATCH (n) RETURN n LIMIT 100)"
+              onChange={e => {
+                setCustomQuery(e.target.value)
+                setIsCustomQuery(e.target.value.trim().length > 0)
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && customQuery.trim()) {
+                  fetchGraphData()
+                }
+              }}
+              className="query-input"
+            />
+            <button
+              className="query-btn"
+              onClick={fetchGraphData}
+              disabled={!customQuery.trim()}
+            >
+              Run
+            </button>
+            {isCustomQuery && (
+              <button
+                className="query-btn secondary"
+                onClick={() => {
+                  setCustomQuery('')
+                  setIsCustomQuery(false)
+                }}
+              >
+                Reset
+              </button>
+            )}
           </div>
           <div className="header-right">
             <button

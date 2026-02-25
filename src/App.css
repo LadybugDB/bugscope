@@ -124,6 +124,60 @@ body {
   gap: 12px;
 }
 
+.query-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  max-width: 600px;
+}
+
+.query-input {
+  flex: 1;
+  padding: 8px 12px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 14px;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.query-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.query-btn {
+  padding: 8px 16px;
+  background-color: var(--accent-color);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.query-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.query-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.query-btn.secondary {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.query-btn.secondary:hover {
+  background-color: var(--border-color);
+}
+
 .graph-stats {
   color: var(--text-secondary);
   font-size: 14px;

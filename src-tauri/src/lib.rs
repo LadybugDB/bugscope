@@ -331,6 +331,76 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
     Ok(GraphData { nodes, links })
 }
 
+#[tauri::command]
+fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<GraphData, String> {
+    let databases = get_all_databases(&state);
+    let db_info = databases.get(id).ok_or("Database not found")?;
+
+    let db = Database::new(&db_info.path, SystemConfig::default())
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::new(&db)
+        .map_err(|e| format!("Failed to create connection: {}", e))?;
+
+    // Execute user query
+    let mut result = conn
+        .query(&query)
+        .map_err(|e| format!("Query failed: {}", e))?;
+
+    let mut nodes = Vec::new();
+    let links = Vec::new();
+    let mut node_id_set: HashSet<String> = HashSet::new();
+
+    for row in &mut result {
+        for (col_idx, val) in row.iter().enumerate() {
+            match val {
+                Value::Node(node_val) => {
+                    // Extract properties to build ID and label
+                    let props = node_val.get_properties();
+                    let node_id = props
+                        .iter()
+                        .find(|(k, _)| k == "id")
+                        .map(|(_, v)| value_to_string(v))
+                        .unwrap_or_else(|| {
+                            // Generate a unique ID from row/column position
+                            format!("node_{}_{}", nodes.len(), col_idx)
+                        });
+
+                    if !node_id_set.contains(&node_id) {
+                        node_id_set.insert(node_id.clone());
+                        let name = props
+                            .iter()
+                            .find(|(k, _)| k == "name")
+                            .or_else(|| props.iter().find(|(k, _)| k == "id"))
+                            .or_else(|| props.iter().find(|(k, _)| k == "title"))
+                            .map(|(_, v)| value_to_string(v))
+                            .unwrap_or_else(|| "Node".to_string());
+
+                        // Try to get label from properties, fallback to "Node"
+                        let label = props
+                            .iter()
+                            .find(|(k, _)| k == "label")
+                            .map(|(_, v)| value_to_string(v))
+                            .unwrap_or_else(|| "Node".to_string());
+
+                        nodes.push(GraphNode {
+                            id: node_id,
+                            name,
+                            label,
+                        });
+                    }
+                }
+                Value::InternalID(id_val) => {
+                    // Store internal IDs that might be useful for linking
+                    let _id_str = id_to_string(id_val);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(GraphData { nodes, links })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -345,6 +415,7 @@ pub fn run() {
             add_database,
             get_directories,
             get_graph,
+            execute_query,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
