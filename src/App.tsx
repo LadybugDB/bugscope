@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
+import type { NodeObject } from 'react-force-graph-2d'
 import './App.css'
 
 interface Database {
@@ -42,6 +43,7 @@ function App() {
   const [parentDir, setParentDir] = useState<string>('')
   const [manualPath, setManualPath] = useState<string>('')
   const [pickerError, setPickerError] = useState<string | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
 
   const fetchDatabases = () => {
@@ -75,6 +77,7 @@ function App() {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light')
   }, [darkMode])
 
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (databases.length === 0) {
       setGraphData({ nodes: [], links: [] })
@@ -121,17 +124,17 @@ function App() {
     }
   }
 
-  const colorMap: Record<string, string> = useMemo(() => ({}), [])
-  const edgeColorMap: Record<string, string> = useMemo(() => ({}), [])
+  const colorMapRef = useRef<Record<string, string>>({})
+  const edgeColorMapRef = useRef<Record<string, string>>({})
 
   const nodeDegree = useMemo(() => {
     const degrees: Record<string, number> = {}
     graphData.nodes.forEach(n => degrees[n.id] = 0)
     graphData.links.forEach(link => {
-      const src = typeof link.source === 'object' ? (link.source as any).id : link.source
-      const dst = typeof link.target === 'object' ? (link.target as any).id : link.target
-      degrees[src] = (degrees[src] || 0) + 1
-      degrees[dst] = (degrees[dst] || 0) + 1
+      const src = typeof link.source === 'object' ? (link.source as NodeObject).id : link.source
+      const dst = typeof link.target === 'object' ? (link.target as NodeObject).id : link.target
+      degrees[src as string] = (degrees[src as string] || 0) + 1
+      degrees[dst as string] = (degrees[dst as string] || 0) + 1
     })
     return degrees
   }, [graphData])
@@ -139,19 +142,19 @@ function App() {
   const maxDegree = useMemo(() => Math.max(1, ...Object.values(nodeDegree)), [nodeDegree])
 
   const getNodeColor = useCallback((label: string) => {
-    if (!colorMap[label]) {
+    if (!colorMapRef.current[label]) {
       const colors = ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab']
-      colorMap[label] = colors[Object.keys(colorMap).length % colors.length]
+      colorMapRef.current[label] = colors[Object.keys(colorMapRef.current).length % colors.length]
     }
-    return colorMap[label]
+    return colorMapRef.current[label]
   }, [])
 
   const getEdgeColor = useCallback((label: string) => {
-    if (!edgeColorMap[label]) {
+    if (!edgeColorMapRef.current[label]) {
       const colors = ['#5a9bd5', '#e07b39', '#d94452', '#6cc4a4', '#8cc63f', '#f0c040', '#c47ab6', '#ff7f7f', '#b8860b', '#7b9ea8']
-      edgeColorMap[label] = colors[Object.keys(edgeColorMap).length % colors.length]
+      edgeColorMapRef.current[label] = colors[Object.keys(edgeColorMapRef.current).length % colors.length]
     }
-    return edgeColorMap[label]
+    return edgeColorMapRef.current[label]
   }, [])
 
   const getNodeSize = useCallback((node: GraphNode) => {
@@ -170,6 +173,7 @@ function App() {
     return sizes[Math.min(cutoffIndex, sizes.length - 1)] ?? 16
   }, [graphData.nodes, nodeDegree, maxDegree])
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
     const size = getNodeSize(node)
     const color = getNodeColor(node.label)
@@ -192,7 +196,7 @@ function App() {
 
       const maxWidth = size * 1.6
       let label = node.name
-      let measured = ctx.measureText(label)
+      const measured = ctx.measureText(label)
       if (measured.width > maxWidth) {
         while (label.length > 1 && ctx.measureText(label + '\u2026').width > maxWidth) {
           label = label.slice(0, -1)
@@ -261,15 +265,15 @@ function App() {
               ref={graphRef}
               graphData={graphData}
               nodeCanvasObject={paintNode}
-              nodeVal={(node: any) => { const s = getNodeSize(node); return s * s; }}
+              nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
               nodeRelSize={1}
               nodeLabel={(node) => `${node.label}: ${node.name}`}
-              linkLabel={(link: any) => link.label}
-              linkColor={(link: any) => getEdgeColor(link.label)}
+              linkLabel={(link) => link.label}
+              linkColor={(link) => getEdgeColor(link.label)}
               linkWidth={2.5}
               linkDirectionalArrowLength={6}
               linkDirectionalArrowRelPos={1}
-              linkDirectionalArrowColor={(link: any) => getEdgeColor(link.label)}
+              linkDirectionalArrowColor={(link) => getEdgeColor(link.label)}
               linkDirectionalParticles={2}
               linkDirectionalParticleWidth={2}
               cooldownTicks={100}
