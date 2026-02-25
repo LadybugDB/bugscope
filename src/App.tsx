@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
 import './App.css'
 
@@ -10,14 +11,14 @@ interface Database {
 }
 
 interface GraphNode {
-  id: number
+  id: string
   name: string
   label: string
 }
 
 interface GraphLink {
-  source: number
-  target: number
+  source: string
+  target: string
   label: string
 }
 
@@ -44,21 +45,14 @@ function App() {
   const graphRef = useRef<any>(null)
 
   const fetchDatabases = () => {
-    fetch('http://localhost:3001/api/databases')
-      .then(res => res.json())
+    invoke<Database[]>('get_databases')
       .then(setDatabases)
-      .catch(err => setError(err.message))
+      .catch(err => setError(String(err)))
   }
 
   const fetchDirectories = (dir: string) => {
     setPickerError(null)
-    fetch(`http://localhost:3001/api/directories?path=${encodeURIComponent(dir)}`)
-      .then(res => {
-        if (!res.ok) {
-          return res.json().then(err => { throw new Error(err.error || 'Failed to fetch directories') })
-        }
-        return res.json()
-      })
+    invoke<{ current: string; parent: string; directories: { name: string; path: string; type: string }[]; files: { name: string; path: string; type: string }[] }>('get_directories', { path: dir || null })
       .then(data => {
         setCurrentDir(data.current || dir || '')
         setParentDir(data.parent || '')
@@ -66,7 +60,7 @@ function App() {
         setFiles(data.files || [])
       })
       .catch(err => {
-        setPickerError(err.message)
+        setPickerError(String(err))
         setCurrentDir(dir || 'Failed to load')
         setDirs([])
         setFiles([])
@@ -88,13 +82,7 @@ function App() {
     }
     setLoading(true)
     setError(null)
-    fetch(`http://localhost:3001/api/graph/${selectedId}`)
-      .then(res => {
-        if (!res.ok) {
-          return res.json().then(err => Promise.reject(new Error(err.error)))
-        }
-        return res.json()
-      })
+    invoke<GraphData>('get_graph', { id: selectedId })
       .then(data => {
         setGraphData(data)
         setLoading(false)
@@ -105,7 +93,7 @@ function App() {
         }, 500)
       })
       .catch(err => {
-        setError(err.message)
+        setError(String(err))
         setLoading(false)
       })
   }, [selectedId, databases.length])
@@ -123,22 +111,13 @@ function App() {
 
   const addDatabase = async (filePath: string) => {
     try {
-      const res = await fetch('http://localhost:3001/api/databases', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath })
-      })
-      if (res.ok) {
-        fetchDatabases()
-        setFilePickerOpen(false)
-        setPickerError(null)
-        setManualPath('')
-      } else {
-        const err = await res.json()
-        setPickerError(err.error || 'Failed to add database')
-      }
-    } catch (err: any) {
-      setPickerError(err.message || 'Network error')
+      await invoke('add_database', { filePath })
+      fetchDatabases()
+      setFilePickerOpen(false)
+      setPickerError(null)
+      setManualPath('')
+    } catch (err) {
+      setPickerError(String(err))
     }
   }
 
@@ -146,11 +125,13 @@ function App() {
   const edgeColorMap: Record<string, string> = useMemo(() => ({}), [])
 
   const nodeDegree = useMemo(() => {
-    const degrees: Record<number, number> = {}
+    const degrees: Record<string, number> = {}
     graphData.nodes.forEach(n => degrees[n.id] = 0)
     graphData.links.forEach(link => {
-      degrees[link.source] = (degrees[link.source] || 0) + 1
-      degrees[link.target] = (degrees[link.target] || 0) + 1
+      const src = typeof link.source === 'object' ? (link.source as any).id : link.source
+      const dst = typeof link.target === 'object' ? (link.target as any).id : link.target
+      degrees[src] = (degrees[src] || 0) + 1
+      degrees[dst] = (degrees[dst] || 0) + 1
     })
     return degrees
   }, [graphData])

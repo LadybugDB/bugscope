@@ -24,3 +24,11 @@ dist-ssr
 *.sw?
 
 pnpm-lock.yaml
+
+# Database files
+*.lbdb
+
+# Tauri
+src-tauri/target/
+src-tauri/liblbug/
+src-tauri/gen/
