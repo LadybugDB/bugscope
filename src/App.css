@@ -131,6 +131,7 @@ body {
   padding: 8px 16px;
   background-color: var(--bg-secondary);
   border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
 .query-input {
@@ -217,7 +218,9 @@ body {
 
 .graph-container {
   flex: 1;
+  min-height: 0;
   position: relative;
+  overflow: hidden;
 }
 
 .add-db-btn {
