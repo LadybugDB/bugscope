@@ -143,6 +143,7 @@ function App() {
   }
 
   const colorMap: Record<string, string> = useMemo(() => ({}), [])
+  const edgeColorMap: Record<string, string> = useMemo(() => ({}), [])
 
   const nodeDegree = useMemo(() => {
     const degrees: Record<number, number> = {}
@@ -164,10 +165,29 @@ function App() {
     return colorMap[label]
   }, [])
 
+  const getEdgeColor = useCallback((label: string) => {
+    if (!edgeColorMap[label]) {
+      const colors = ['#5a9bd5', '#e07b39', '#d94452', '#6cc4a4', '#8cc63f', '#f0c040', '#c47ab6', '#ff7f7f', '#b8860b', '#7b9ea8']
+      edgeColorMap[label] = colors[Object.keys(edgeColorMap).length % colors.length]
+    }
+    return edgeColorMap[label]
+  }, [])
+
   const getNodeSize = useCallback((node: GraphNode) => {
     const degree = nodeDegree[node.id] || 0
     return 4 + (degree / maxDegree) * 12
   }, [nodeDegree, maxDegree])
+
+  const labelSizeThreshold = useMemo(() => {
+    const sizes = graphData.nodes.map(n => {
+      const degree = nodeDegree[n.id] || 0
+      return 4 + (degree / maxDegree) * 12
+    })
+    sizes.sort((a, b) => b - a)
+    // Label the top 20% of nodes, but at least the top 5
+    const cutoffIndex = Math.max(4, Math.floor(sizes.length * 0.2) - 1)
+    return sizes[Math.min(cutoffIndex, sizes.length - 1)] ?? 16
+  }, [graphData.nodes, nodeDegree, maxDegree])
 
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
     const size = getNodeSize(node)
@@ -181,7 +201,26 @@ function App() {
     ctx.strokeStyle = darkMode ? '#222' : '#ddd'
     ctx.lineWidth = 1
     ctx.stroke()
-  }, [getNodeSize, getNodeColor, darkMode])
+
+    if (size >= labelSizeThreshold && node.name) {
+      const fontSize = 3
+      ctx.font = `${fontSize}px Sans-Serif`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillStyle = '#fff'
+
+      const maxWidth = size * 1.6
+      let label = node.name
+      let measured = ctx.measureText(label)
+      if (measured.width > maxWidth) {
+        while (label.length > 1 && ctx.measureText(label + '\u2026').width > maxWidth) {
+          label = label.slice(0, -1)
+        }
+        label = label + '\u2026'
+      }
+      ctx.fillText(label, node.x, node.y)
+    }
+  }, [getNodeSize, getNodeColor, darkMode, labelSizeThreshold])
 
   return (
     <div className="app-container">
@@ -241,11 +280,15 @@ function App() {
               ref={graphRef}
               graphData={graphData}
               nodeCanvasObject={paintNode}
-              nodeVal={getNodeSize}
+              nodeVal={(node: any) => { const s = getNodeSize(node); return s * s; }}
+              nodeRelSize={1}
               nodeLabel={(node) => `${node.label}: ${node.name}`}
               linkLabel={(link: any) => link.label}
-              linkColor={() => darkMode ? 'rgba(100, 100, 100, 0.6)' : 'rgba(80, 80, 80, 0.6)'}
-              linkWidth={1.5}
+              linkColor={(link: any) => getEdgeColor(link.label)}
+              linkWidth={2.5}
+              linkDirectionalArrowLength={6}
+              linkDirectionalArrowRelPos={1}
+              linkDirectionalArrowColor={(link: any) => getEdgeColor(link.label)}
               linkDirectionalParticles={2}
               linkDirectionalParticleWidth={2}
               cooldownTicks={100}
