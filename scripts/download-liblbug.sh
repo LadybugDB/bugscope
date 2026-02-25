@@ -27,6 +27,16 @@ case "$OS" in
       exit 1
     fi
     ;;
+  MINGW*|MSYS*|CYGWIN*)
+    if [ "$ARCH" = "x86_64" ]; then
+      ARCHIVE="liblbug-windows-x86_64.tar.gz"
+    elif [ "$ARCH" = "aarch64" ]; then
+      ARCHIVE="liblbug-windows-aarch64.tar.gz"
+    else
+      echo "Unsupported Windows architecture: $ARCH" >&2
+      exit 1
+    fi
+    ;;
   *)
     echo "Unsupported OS: $OS" >&2
     exit 1
@@ -36,7 +46,7 @@ esac
 DOWNLOAD_URL="${RELEASE_URL}/${ARCHIVE}"
 
 # Check if already downloaded
-if [ -f "$TARGET_DIR/liblbug.dylib" ] || [ -f "$TARGET_DIR/liblbug.so" ]; then
+if [ -f "$TARGET_DIR/liblbug.dylib" ] || [ -f "$TARGET_DIR/liblbug.so" ] || [ -f "$TARGET_DIR/liblbug.dll" ]; then
   echo "liblbug already exists in $TARGET_DIR"
   echo "To re-download, remove the directory first: rm -rf $TARGET_DIR"
   exit 0
