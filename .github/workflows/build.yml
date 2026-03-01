@@ -41,13 +41,13 @@ jobs:
             bundles: dmg
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+            bundles: "appimage deb"
           - platform: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            bundles: appimage,deb
+            bundles: "appimage deb"
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            bundles: msi,nsis
+            bundles: "msi nsis"
 
     runs-on: ${{ matrix.platform }}
 
@@ -87,12 +87,19 @@ jobs:
       - name: Download liblbug
         run: bash scripts/download-liblbug.sh
 
-      - name: Build Tauri app
+      - name: Build Tauri app (Linux)
+        if: matrix.platform == 'ubuntu-latest' || matrix.platform == 'ubuntu-24.04-arm'
         run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
         env:
           # Needed for linuxdeploy AppImage bundling on CI runners
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # Ensure linuxdeploy can resolve and bundle liblbug.so
+          LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/liblbug
           NO_STRIP: "true"  # https://github.com/tauri-apps/tauri/issues/14796
+
+      - name: Build Tauri app (macOS/Windows)
+        if: matrix.platform == 'macos-latest' || matrix.platform == 'windows-latest'
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
