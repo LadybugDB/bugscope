@@ -37,13 +37,17 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --target aarch64-apple-darwin
+            target: aarch64-apple-darwin
+            bundles: dmg
           - platform: ubuntu-latest
-            args: ''
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
           - platform: ubuntu-24.04-arm
-            args: --target aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-gnu
+            bundles: appimage,deb
           - platform: windows-latest
-            args: ''
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
 
     runs-on: ${{ matrix.platform }}
 
@@ -60,6 +64,9 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Tauri CLI (cargo plugin)
+        run: cargo install tauri-cli --locked
+
       - name: Install dependencies (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
@@ -74,16 +81,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Enable pnpm
+        run: corepack enable
+
       - name: Download liblbug
         run: bash scripts/download-liblbug.sh
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Needed for linuxdeploy AppImage bundling on CI runners
+          APPIMAGE_EXTRACT_AND_RUN: "1"
           NO_STRIP: "true"  # https://github.com/tauri-apps/tauri/issues/14796
-        with:
-          args: ${{ matrix.args }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
