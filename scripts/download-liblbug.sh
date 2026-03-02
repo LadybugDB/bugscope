@@ -3,7 +3,7 @@
 # This is required before building the Tauri app.
 set -euo pipefail
 
-LBUG_VERSION="0.14.1"
+LBUG_VERSION="latest"
 RELEASE_URL="https://github.com/LadybugDB/ladybug/releases/download/v${LBUG_VERSION}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
