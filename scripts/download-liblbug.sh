@@ -4,7 +4,7 @@
 set -euo pipefail
 
 LBUG_VERSION="latest"
-RELEASE_URL="https://github.com/LadybugDB/ladybug/releases/download/${LBUG_VERSION}"
+RELEASE_URL="https://github.com/LadybugDB/ladybug/releases/${LBUG_VERSION}/download"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_DIR="$PROJECT_DIR/src-tauri/liblbug"
