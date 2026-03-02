@@ -32,7 +32,8 @@
       "icons/icon.png"
     ],
     "macOS": {
-      "frameworks": ["liblbug/liblbug.dylib"]
+      "frameworks": ["liblbug/liblbug.dylib"],
+      "minimumSystemVersion": "13.3"
     }
   }
 }
