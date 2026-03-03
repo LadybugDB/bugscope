@@ -1,7 +1,7 @@
 {
   "name": "bugscope",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.15.1",
   "type": "module",
   "scripts": {
     "setup": "bash scripts/download-liblbug.sh",
