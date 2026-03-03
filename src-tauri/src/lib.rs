@@ -57,6 +57,12 @@ struct AppState {
     data_dir: PathBuf,
 }
 
+fn get_default_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("bugscope")
+}
+
 fn scan_for_databases(dir: &Path, base_dir: &Path) -> Vec<DatabaseInfo> {
     let mut databases = Vec::new();
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
@@ -90,10 +96,7 @@ fn scan_for_databases(dir: &Path, base_dir: &Path) -> Vec<DatabaseInfo> {
 fn get_all_databases(state: &AppState) -> Vec<DatabaseInfo> {
     let scanned = scan_for_databases(&state.data_dir, &state.data_dir);
     let custom = state.custom_databases.lock().unwrap();
-    let mut all: Vec<DatabaseInfo> = scanned
-        .into_iter()
-        .chain(custom.iter().cloned())
-        .collect();
+    let mut all: Vec<DatabaseInfo> = scanned.into_iter().chain(custom.iter().cloned()).collect();
     for (i, db) in all.iter_mut().enumerate() {
         db.id = i;
     }
@@ -132,9 +135,7 @@ fn add_database(state: State<AppState>, file_path: String) -> Result<DatabaseInf
     let abs_path = if Path::new(&file_path).is_absolute() {
         PathBuf::from(&file_path)
     } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(&file_path)
+        std::env::current_dir().unwrap_or_default().join(&file_path)
     };
 
     if !abs_path.exists() {
@@ -173,7 +174,10 @@ fn add_database(state: State<AppState>, file_path: String) -> Result<DatabaseInf
 }
 
 #[tauri::command]
-fn get_directories(state: State<AppState>, path: Option<String>) -> Result<DirectoryListing, String> {
+fn get_directories(
+    state: State<AppState>,
+    path: Option<String>,
+) -> Result<DirectoryListing, String> {
     let dir = match &path {
         Some(p) if !p.is_empty() => {
             let resolved = PathBuf::from(p);
@@ -193,10 +197,7 @@ fn get_directories(state: State<AppState>, path: Option<String>) -> Result<Direc
 
     for entry in entries.flatten() {
         let entry_path = entry.path();
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        let name = entry.file_name().to_string_lossy().to_string();
 
         if name.starts_with('.') {
             continue;
@@ -240,8 +241,7 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
 
     let db = Database::new(&db_info.path, SystemConfig::default())
         .map_err(|e| format!("Failed to open database: {}", e))?;
-    let conn = Connection::new(&db)
-        .map_err(|e| format!("Failed to create connection: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
 
     // Query nodes
     let mut nodes_result = conn
@@ -291,7 +291,9 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
 
     // Query links
     let mut links_result = conn
-        .query("MATCH (a)-[r]->(b) RETURN ID(a) as src, ID(b) as dst, LABEL(r) as relType LIMIT 500")
+        .query(
+            "MATCH (a)-[r]->(b) RETURN ID(a) as src, ID(b) as dst, LABEL(r) as relType LIMIT 500",
+        )
         .map_err(|e| format!("Link query failed: {}", e))?;
 
     let node_id_set: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
@@ -338,8 +340,7 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
 
     let db = Database::new(&db_info.path, SystemConfig::default())
         .map_err(|e| format!("Failed to open database: {}", e))?;
-    let conn = Connection::new(&db)
-        .map_err(|e| format!("Failed to create connection: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
 
     // Execute user query
     let mut result = conn
@@ -403,7 +404,7 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let data_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let data_dir = get_default_data_dir();
 
     tauri::Builder::default()
         .manage(AppState {
