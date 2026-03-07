@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bugscope"
-version = "0.1.0"
+version = "0.15.1"
 dependencies = [
  "dirs 5.0.1",
  "lbug",
@@ -1726,9 +1726,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lbug"
-version = "0.14.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fa3b4608caa57f85cf2563fa2c90337bd1e567afb36c07fe1c1f98ff372b314"
+checksum = "28fde1b078a1ca4c30926a396f43c092fb2e11e74b3542c66ef9287922331a7a"
 dependencies = [
  "cmake",
  "cxx",

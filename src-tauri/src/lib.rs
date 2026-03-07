@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,12 +55,6 @@ struct DirectoryListing {
 struct AppState {
     custom_databases: Mutex<Vec<DatabaseInfo>>,
     data_dir: PathBuf,
-}
-
-fn get_default_data_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("bugscope")
 }
 
 fn scan_for_databases(dir: &Path, base_dir: &Path) -> Vec<DatabaseInfo> {
@@ -404,12 +398,18 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let data_dir = get_default_data_dir();
-
     tauri::Builder::default()
-        .manage(AppState {
-            custom_databases: Mutex::new(Vec::new()),
-            data_dir,
+        .setup(|app| {
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("Failed to get app data dir");
+            std::fs::create_dir_all(&data_dir).ok();
+            app.manage(AppState {
+                custom_databases: Mutex::new(Vec::new()),
+                data_dir,
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_databases,
