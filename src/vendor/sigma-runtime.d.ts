@@ -3,11 +3,31 @@ export interface SigmaSettings {
   defaultEdgeType?: string
   labelColor?: { color: string } | { attribute: string; color?: string }
   renderEdgeLabels?: boolean
+  edgeLabelColor?: { color: string } | { attribute: string; color?: string }
+  edgeLabelSize?: number
+  edgeLabelWeight?: string
   labelRenderedSizeThreshold?: number
   minCameraRatio?: number
   maxCameraRatio?: number
+  defaultDrawEdgeLabel?: (
+    context: CanvasRenderingContext2D,
+    edgeData: SigmaEdgeLabelData,
+    sourceData: SigmaEdgeLabelNodeData,
+    targetData: SigmaEdgeLabelNodeData,
+  ) => void
   defaultDrawNodeLabel?: (context: CanvasRenderingContext2D, data: SigmaLabelData) => void
   defaultDrawNodeHover?: (context: CanvasRenderingContext2D, data: SigmaLabelData) => void
+}
+
+export interface SigmaEdgeLabelData {
+  label?: string
+  size: number
+}
+
+export interface SigmaEdgeLabelNodeData {
+  x: number
+  y: number
+  size: number
 }
 
 export interface SigmaLabelData {

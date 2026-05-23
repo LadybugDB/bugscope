@@ -63,6 +63,7 @@ interface SigmaEdgeAttributes extends Record<string, unknown> {
   size: number
   color: string
   label: string
+  forceLabel: boolean
 }
 
 interface SigmaGraphViewProps {
@@ -83,6 +84,17 @@ interface SigmaLabelData {
   hoverLabel?: string
   color: string
   isNewlyExpanded?: boolean
+}
+
+interface SigmaEdgeLabelData {
+  label?: string
+  size: number
+}
+
+interface SigmaEdgeLabelNodeData {
+  x: number
+  y: number
+  size: number
 }
 
 class SigmaGraph<
@@ -291,6 +303,61 @@ function drawSigmaNode(
   context.restore()
 }
 
+function drawSigmaEdgeLabel(
+  context: CanvasRenderingContext2D,
+  edgeData: SigmaEdgeLabelData,
+  sourceData: SigmaEdgeLabelNodeData,
+  targetData: SigmaEdgeLabelNodeData,
+  textColor: string,
+  backgroundColor: string,
+) {
+  if (!edgeData.label) return
+
+  const dx = targetData.x - sourceData.x
+  const dy = targetData.y - sourceData.y
+  const distance = Math.hypot(dx, dy)
+  if (distance < sourceData.size + targetData.size + 18) return
+
+  const fontSize = 11
+  const paddingX = 5
+  const paddingY = 3
+  const unitX = dx / distance
+  const unitY = dy / distance
+  const startX = sourceData.x + unitX * sourceData.size
+  const startY = sourceData.y + unitY * sourceData.size
+  const endX = targetData.x - unitX * targetData.size
+  const endY = targetData.y - unitY * targetData.size
+  const midX = (startX + endX) / 2
+  const midY = (startY + endY) / 2
+  const availableWidth = Math.max(12, Math.hypot(endX - startX, endY - startY) - 8)
+
+  context.save()
+  context.font = `600 ${fontSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.textBaseline = 'middle'
+
+  let label = edgeData.label
+  let textWidth = context.measureText(label).width
+  if (textWidth > availableWidth) {
+    while (label.length > 1 && context.measureText(`${label}...`).width > availableWidth) {
+      label = label.slice(0, -1)
+    }
+    label = `${label}...`
+    textWidth = context.measureText(label).width
+  }
+
+  const boxWidth = textWidth + paddingX * 2
+  const boxHeight = fontSize + paddingY * 2
+  const boxX = midX - boxWidth / 2
+  const boxY = midY - boxHeight / 2
+
+  context.fillStyle = backgroundColor
+  drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, 4)
+  context.fill()
+  context.fillStyle = textColor
+  context.fillText(label, boxX + paddingX, midY)
+  context.restore()
+}
+
 function createInitialLayout(graphData: NormalizedGraphData) {
   const nodeCount = Math.max(1, graphData.nodes.length)
   const degrees: Record<string, number> = {}
@@ -354,6 +421,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
         size: 1.8,
         color: getEdgeColor(link.label || 'edge'),
         label: link.label || '',
+        forceLabel: Boolean(link.label),
       })
     })
 
@@ -370,16 +438,31 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
     const expandedBackgroundColor = 'rgba(254, 243, 199, 0.96)'
     const hoverTextColor = '#111827'
     const hoverBackgroundColor = darkMode ? 'rgba(255, 255, 255, 0.98)' : 'rgba(255, 255, 255, 0.98)'
+    const edgeLabelTextColor = '#111827'
+    const edgeLabelBackgroundColor = darkMode ? 'rgba(248, 250, 252, 0.92)' : 'rgba(255, 255, 255, 0.92)'
 
     rendererRef.current?.kill()
     rendererRef.current = new Sigma(graph, container, {
       allowInvalidContainer: true,
       defaultEdgeType: 'arrow',
       labelColor: { color: labelTextColor },
-      renderEdgeLabels: false,
+      renderEdgeLabels: true,
+      edgeLabelColor: { color: edgeLabelTextColor },
+      edgeLabelSize: 11,
+      edgeLabelWeight: '600',
       labelRenderedSizeThreshold: 0,
       minCameraRatio: 0.03,
       maxCameraRatio: 12,
+      defaultDrawEdgeLabel: (context, edgeData, sourceData, targetData) => {
+        drawSigmaEdgeLabel(
+          context,
+          edgeData,
+          sourceData,
+          targetData,
+          edgeLabelTextColor,
+          edgeLabelBackgroundColor,
+        )
+      },
       defaultDrawNodeLabel: (context, data) => {
         drawSigmaLabel(
           context,
