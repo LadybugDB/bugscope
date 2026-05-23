@@ -1,6 +1,6 @@
 use lbug::{Connection, Database, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -21,6 +21,14 @@ struct GraphNode {
     id: String,
     name: String,
     label: String,
+    #[serde(rename = "expansionKind", skip_serializing_if = "Option::is_none")]
+    expansion_kind: Option<String>,
+    #[serde(rename = "expandNodeId", skip_serializing_if = "Option::is_none")]
+    expand_node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<usize>,
+    #[serde(rename = "hiddenCount", skip_serializing_if = "Option::is_none")]
+    hidden_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +43,11 @@ struct GraphData {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
 }
+
+const SEED_NODE_COUNT: usize = 8;
+const EXPAND_BATCH_SIZE: usize = 8;
+const EDGE_SCAN_LIMIT: usize = 10_000;
+const EXPANDER_PREFIX: &str = "__expand__:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirEntry {
@@ -150,6 +163,233 @@ fn id_to_string(id: &lbug::InternalID) -> String {
     format!("{}:{}", id.table_id, id.offset)
 }
 
+fn make_expander_node(parent_id: &str, hidden_count: usize, offset: usize) -> GraphNode {
+    GraphNode {
+        id: format!("{EXPANDER_PREFIX}node:{parent_id}:{offset}"),
+        name: format!("+{hidden_count}"),
+        label: "More".to_string(),
+        expansion_kind: Some("node".to_string()),
+        expand_node_id: Some(parent_id.to_string()),
+        offset: Some(offset),
+        hidden_count: Some(hidden_count),
+    }
+}
+
+fn merge_node(nodes: &mut HashMap<String, GraphNode>, node: GraphNode) {
+    nodes.entry(node.id.clone()).or_insert(node);
+}
+
+fn merge_link(links: &mut Vec<GraphLink>, seen: &mut HashSet<(String, String, String)>, link: GraphLink) {
+    let key = (link.source.clone(), link.target.clone(), link.label.clone());
+    if seen.insert(key) {
+        links.push(link);
+    }
+}
+
+fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, String> {
+    let mut result = conn
+        .query(&format!("MATCH (a)-[r]->(b) RETURN a, r, b LIMIT {limit}"))
+        .map_err(|e| format!("Relationship query failed: {}", e))?;
+
+    let mut nodes = HashMap::new();
+    let mut links = Vec::new();
+    let mut seen_links = HashSet::new();
+
+    for row in &mut result {
+        if row.len() < 3 {
+            continue;
+        }
+        let (source_node, rel, target_node) = match (&row[0], &row[1], &row[2]) {
+            (Value::Node(source_node), Value::Rel(rel), Value::Node(target_node)) => {
+                (source_node, rel, target_node)
+            }
+            _ => continue,
+        };
+
+        let source = id_to_string(rel.get_src_node());
+        let target = id_to_string(rel.get_dst_node());
+        for node_val in [source_node, target_node] {
+            let props = node_val.get_properties();
+            let name = props
+                .iter()
+                .find(|(k, _)| k == "name")
+                .or_else(|| props.iter().find(|(k, _)| k == "id"))
+                .or_else(|| props.iter().find(|(k, _)| k == "title"))
+                .map(|(_, val)| value_to_string(val))
+                .unwrap_or_else(|| "Node".to_string());
+            merge_node(
+                &mut nodes,
+                GraphNode {
+                    id: id_to_string(node_val.get_node_id()),
+                    name,
+                    label: node_val.get_label_name().clone(),
+                    expansion_kind: None,
+                    expand_node_id: None,
+                    offset: None,
+                    hidden_count: None,
+                },
+            );
+        }
+        merge_link(
+            &mut links,
+            &mut seen_links,
+            GraphLink {
+                source,
+                target,
+                label: rel.get_label_name().clone(),
+            },
+        );
+    }
+
+    Ok(GraphData {
+        nodes: nodes.into_values().collect(),
+        links,
+    })
+}
+
+fn add_expanders(graph: &GraphData, visible_ids: &HashSet<String>, nodes: &mut Vec<GraphNode>, links: &mut Vec<GraphLink>) {
+    let known_ids: HashSet<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
+    let mut neighbors: HashMap<String, HashSet<String>> = HashMap::new();
+    for link in &graph.links {
+        neighbors
+            .entry(link.source.clone())
+            .or_default()
+            .insert(link.target.clone());
+        neighbors
+            .entry(link.target.clone())
+            .or_default()
+            .insert(link.source.clone());
+    }
+
+    for node_id in visible_ids {
+        let hidden_count = neighbors
+            .get(node_id)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|neighbor_id| !visible_ids.contains(*neighbor_id) && known_ids.contains(*neighbor_id))
+                    .count()
+            })
+            .unwrap_or(0);
+        if hidden_count == 0 {
+            continue;
+        }
+
+        let expander = make_expander_node(node_id, hidden_count, 0);
+        links.push(GraphLink {
+            source: node_id.clone(),
+            target: expander.id.clone(),
+            label: "more".to_string(),
+        });
+        nodes.push(expander);
+    }
+}
+
+fn seed_graph_from_full(full_graph: GraphData) -> GraphData {
+    let mut degrees: HashMap<String, usize> = HashMap::new();
+    for node in &full_graph.nodes {
+        degrees.entry(node.id.clone()).or_insert(0);
+    }
+    for link in &full_graph.links {
+        *degrees.entry(link.source.clone()).or_insert(0) += 1;
+        *degrees.entry(link.target.clone()).or_insert(0) += 1;
+    }
+
+    let mut ranked_nodes = full_graph.nodes.clone();
+    ranked_nodes.sort_by_key(|node| std::cmp::Reverse(*degrees.get(&node.id).unwrap_or(&0)));
+    let visible_ids: HashSet<String> = ranked_nodes
+        .iter()
+        .take(SEED_NODE_COUNT)
+        .map(|node| node.id.clone())
+        .collect();
+
+    let mut nodes: Vec<GraphNode> = ranked_nodes
+        .into_iter()
+        .filter(|node| visible_ids.contains(&node.id))
+        .collect();
+    let mut links: Vec<GraphLink> = full_graph
+        .links
+        .iter()
+        .filter(|link| visible_ids.contains(&link.source) && visible_ids.contains(&link.target))
+        .cloned()
+        .collect();
+
+    add_expanders(&full_graph, &visible_ids, &mut nodes, &mut links);
+    GraphData { nodes, links }
+}
+
+fn expand_node_from_full(full_graph: GraphData, node_id: &str, visible_node_ids: &[String], offset: usize) -> GraphData {
+    let visible_ids: HashSet<String> = visible_node_ids
+        .iter()
+        .filter(|id| !id.starts_with(EXPANDER_PREFIX))
+        .cloned()
+        .collect();
+
+    let mut degrees: HashMap<String, usize> = HashMap::new();
+    for link in &full_graph.links {
+        *degrees.entry(link.source.clone()).or_insert(0) += 1;
+        *degrees.entry(link.target.clone()).or_insert(0) += 1;
+    }
+
+    let mut neighbor_ids: Vec<String> = full_graph
+        .links
+        .iter()
+        .filter_map(|link| {
+            if link.source == node_id {
+                Some(link.target.clone())
+            } else if link.target == node_id {
+                Some(link.source.clone())
+            } else {
+                None
+            }
+        })
+        .filter(|neighbor_id| !visible_ids.contains(neighbor_id))
+        .collect();
+    neighbor_ids.sort();
+    neighbor_ids.dedup();
+    neighbor_ids.sort_by_key(|id| std::cmp::Reverse(*degrees.get(id).unwrap_or(&0)));
+
+    let selected_ids: HashSet<String> = neighbor_ids
+        .iter()
+        .skip(offset)
+        .take(EXPAND_BATCH_SIZE)
+        .cloned()
+        .collect();
+
+    let full_node_by_id: HashMap<String, GraphNode> = full_graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect();
+    let mut return_ids = visible_ids.clone();
+    return_ids.extend(selected_ids.iter().cloned());
+
+    let mut nodes: Vec<GraphNode> = selected_ids
+        .iter()
+        .filter_map(|id| full_node_by_id.get(id).cloned())
+        .collect();
+    let mut links: Vec<GraphLink> = full_graph
+        .links
+        .iter()
+        .filter(|link| return_ids.contains(&link.source) && return_ids.contains(&link.target))
+        .cloned()
+        .collect();
+
+    let next_offset = offset + selected_ids.len();
+    let remaining = neighbor_ids.len().saturating_sub(next_offset);
+    if remaining > 0 {
+        let expander = make_expander_node(node_id, remaining, next_offset);
+        links.push(GraphLink {
+            source: node_id.to_string(),
+            target: expander.id.clone(),
+            label: "more".to_string(),
+        });
+        nodes.push(expander);
+    }
+
+    GraphData { nodes, links }
+}
+
 #[tauri::command]
 fn get_databases(state: State<AppState>) -> Vec<DatabaseInfo> {
     get_all_databases(&state)
@@ -258,94 +498,31 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
         .map_err(|e| format!("Failed to open database: {}", e))?;
     let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
 
-    // Query nodes
-    let mut nodes_result = conn
-        .query("MATCH (n) RETURN n, LABEL(n) as label, ID(n) as nodeId LIMIT 500")
-        .map_err(|e| format!("Node query failed: {}", e))?;
+    collect_edge_graph(&conn, EDGE_SCAN_LIMIT).map(seed_graph_from_full)
+}
 
-    let mut nodes = Vec::new();
-    for row in &mut nodes_result {
-        // row is Vec<Value> with 3 columns: [node, label, nodeId]
-        if row.len() < 3 {
-            continue;
-        }
+#[tauri::command]
+fn expand_node(
+    state: State<AppState>,
+    id: usize,
+    node_id: String,
+    visible_node_ids: Vec<String>,
+    offset: Option<usize>,
+) -> Result<GraphData, String> {
+    let databases = get_all_databases(&state);
+    let db_info = databases.get(id).ok_or("Database not found")?;
 
-        let node_id = match &row[2] {
-            Value::InternalID(id) => id_to_string(id),
-            _ => continue,
-        };
+    let db = Database::new(&db_info.path, SystemConfig::default())
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
+    let full_graph = collect_edge_graph(&conn, EDGE_SCAN_LIMIT)?;
 
-        let label = match &row[1] {
-            Value::String(s) => s.clone(),
-            _ => "Node".to_string(),
-        };
-
-        // Extract display name from node properties
-        let name = match &row[0] {
-            Value::Node(node_val) => {
-                let props = node_val.get_properties();
-                let name_val = props
-                    .iter()
-                    .find(|(k, _)| k == "name")
-                    .or_else(|| props.iter().find(|(k, _)| k == "id"))
-                    .or_else(|| props.iter().find(|(k, _)| k == "title"));
-                match name_val {
-                    Some((_, val)) => value_to_string(val),
-                    None => "Node".to_string(),
-                }
-            }
-            _ => "Node".to_string(),
-        };
-
-        nodes.push(GraphNode {
-            id: node_id,
-            name,
-            label,
-        });
-    }
-
-    // Query links
-    let mut links_result = conn
-        .query(
-            "MATCH (a)-[r]->(b) RETURN ID(a) as src, ID(b) as dst, LABEL(r) as relType LIMIT 500",
-        )
-        .map_err(|e| format!("Link query failed: {}", e))?;
-
-    let node_id_set: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-
-    let mut links = Vec::new();
-    for row in &mut links_result {
-        // row is Vec<Value> with 3 columns: [src, dst, relType]
-        if row.len() < 3 {
-            continue;
-        }
-
-        let source = match &row[0] {
-            Value::InternalID(id) => id_to_string(id),
-            _ => continue,
-        };
-
-        let target = match &row[1] {
-            Value::InternalID(id) => id_to_string(id),
-            _ => continue,
-        };
-
-        let label = match &row[2] {
-            Value::String(s) => s.clone(),
-            _ => String::new(),
-        };
-
-        // Only include links where both endpoints exist in our node set
-        if node_id_set.contains(&source) && node_id_set.contains(&target) {
-            links.push(GraphLink {
-                source,
-                target,
-                label,
-            });
-        }
-    }
-
-    Ok(GraphData { nodes, links })
+    Ok(expand_node_from_full(
+        full_graph,
+        &node_id,
+        &visible_node_ids,
+        offset.unwrap_or(0),
+    ))
 }
 
 #[tauri::command]
@@ -389,6 +566,10 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
                             id: node_id,
                             name,
                             label,
+                            expansion_kind: None,
+                            expand_node_id: None,
+                            offset: None,
+                            hidden_count: None,
                         });
                     }
                 }
@@ -450,6 +631,7 @@ pub fn run() {
             add_database,
             get_directories,
             get_graph,
+            expand_node,
             execute_query,
         ])
         .run(tauri::generate_context!())

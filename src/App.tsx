@@ -16,6 +16,10 @@ interface GraphNode {
   id: string
   name: string
   label: string
+  expansionKind?: 'node' | 'cluster'
+  expandNodeId?: string
+  offset?: number
+  hiddenCount?: number
 }
 
 interface GraphLink {
@@ -57,9 +61,19 @@ interface SigmaEdgeAttributes extends Record<string, unknown> {
 
 interface SigmaGraphViewProps {
   graphData: NormalizedGraphData
+  labelNodeIds: Set<string>
   darkMode: boolean
   getNodeColor: (label: string) => string
   getEdgeColor: (label: string) => string
+  onNodeClick: (nodeId: string) => void
+}
+
+interface SigmaLabelData {
+  x: number
+  y: number
+  size: number
+  label?: string
+  color: string
 }
 
 class SigmaGraph<
@@ -147,11 +161,100 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
   }
 }
 
-function cloneGraphData(graphData: NormalizedGraphData): NormalizedGraphData {
+function cloneGraphData(graphData: GraphData): GraphData {
   return {
     nodes: graphData.nodes.map(node => ({ ...node })),
     links: graphData.links.map(link => ({ ...link })),
   }
+}
+
+const EXPANDER_PREFIX = '__expand__:'
+
+function isExpanderNode(node: GraphNode) {
+  return Boolean(node.expansionKind) || node.id.startsWith(EXPANDER_PREFIX)
+}
+
+function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?: string): GraphData {
+  const nodesById = new Map<string, GraphNode>()
+  current.nodes
+    .filter(node => node.id !== expandedNodeId)
+    .forEach(node => nodesById.set(node.id, { ...node }))
+  incoming.nodes.forEach(node => nodesById.set(node.id, { ...node }))
+
+  const linksByKey = new Map<string, GraphLink>()
+  current.links
+    .filter(link => getEndpointId(link.source) !== expandedNodeId && getEndpointId(link.target) !== expandedNodeId)
+    .forEach(link => linksByKey.set(`${getEndpointId(link.source)}\t${getEndpointId(link.target)}\t${link.label}`, { ...link }))
+  incoming.links.forEach(link => {
+    linksByKey.set(`${getEndpointId(link.source)}\t${getEndpointId(link.target)}\t${link.label}`, { ...link })
+  })
+
+  return {
+    nodes: [...nodesById.values()],
+    links: [...linksByKey.values()],
+  }
+}
+
+function drawRoundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  context.beginPath()
+  context.moveTo(x + radius, y)
+  context.lineTo(x + width - radius, y)
+  context.quadraticCurveTo(x + width, y, x + width, y + radius)
+  context.lineTo(x + width, y + height - radius)
+  context.quadraticCurveTo(x + width, y + height, x + width - radius, y + height)
+  context.lineTo(x + radius, y + height)
+  context.quadraticCurveTo(x, y + height, x, y + height - radius)
+  context.lineTo(x, y + radius)
+  context.quadraticCurveTo(x, y, x + radius, y)
+  context.closePath()
+}
+
+function drawSigmaLabel(
+  context: CanvasRenderingContext2D,
+  data: SigmaLabelData,
+  textColor: string,
+  backgroundColor: string,
+  strongBackground: boolean,
+) {
+  if (!data.label) return
+
+  const fontSize = 13
+  const paddingX = strongBackground ? 7 : 4
+  const paddingY = strongBackground ? 4 : 2
+
+  context.font = `600 ${fontSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.textBaseline = 'middle'
+
+  const textWidth = context.measureText(data.label).width
+  const boxWidth = textWidth + paddingX * 2
+  const boxHeight = fontSize + paddingY * 2
+  const canvasWidth = context.canvas.width
+  const canvasHeight = context.canvas.height
+  const margin = 6
+  const preferredX = data.x + data.size + 5 - paddingX
+  const preferredY = data.y - fontSize / 2 - paddingY
+  const boxX = Math.min(Math.max(preferredX, margin), Math.max(margin, canvasWidth - boxWidth - margin))
+  const boxY = Math.min(Math.max(preferredY, margin), Math.max(margin, canvasHeight - boxHeight - margin))
+  const textX = boxX + paddingX
+  const textY = boxY + boxHeight / 2
+
+  context.save()
+  context.fillStyle = backgroundColor
+  drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, strongBackground ? 6 : 4)
+  context.fill()
+
+  context.fillStyle = textColor
+  context.shadowColor = strongBackground ? 'transparent' : backgroundColor
+  context.shadowBlur = strongBackground ? 0 : 3
+  context.fillText(data.label, textX, textY)
+  context.restore()
 }
 
 function createInitialLayout(graphData: NormalizedGraphData) {
@@ -183,7 +286,7 @@ function createInitialLayout(graphData: NormalizedGraphData) {
   return { degrees, positions }
 }
 
-function SigmaGraphView({ graphData, darkMode, getNodeColor, getEdgeColor }: SigmaGraphViewProps) {
+function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
 
@@ -199,8 +302,8 @@ function SigmaGraphView({ graphData, darkMode, getNodeColor, getEdgeColor }: Sig
         x: position.x,
         y: position.y,
         size: 4 + (degree / maxDegree) * 14,
-        color: getNodeColor(node.label),
-        label: node.name || node.id,
+        color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label),
+        label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
         nodeType: node.label,
       })
     })
@@ -219,21 +322,45 @@ function SigmaGraphView({ graphData, darkMode, getNodeColor, getEdgeColor }: Sig
     })
 
     return sigmaGraph
-  }, [graphData, getNodeColor, getEdgeColor])
+  }, [graphData, labelNodeIds, getNodeColor, getEdgeColor])
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
 
+    const labelTextColor = '#111827'
+    const labelBackgroundColor = darkMode ? 'rgba(248, 250, 252, 0.94)' : 'rgba(255, 255, 255, 0.9)'
+    const hoverTextColor = '#111827'
+    const hoverBackgroundColor = darkMode ? 'rgba(255, 255, 255, 0.98)' : 'rgba(255, 255, 255, 0.98)'
+
     rendererRef.current?.kill()
     rendererRef.current = new Sigma(graph, container, {
       allowInvalidContainer: true,
       defaultEdgeType: 'arrow',
-      labelColor: { color: darkMode ? '#f3f4f6' : '#172033' },
+      labelColor: { color: labelTextColor },
       renderEdgeLabels: false,
-      labelRenderedSizeThreshold: 9,
+      labelRenderedSizeThreshold: 0,
       minCameraRatio: 0.03,
       maxCameraRatio: 12,
+      defaultDrawNodeLabel: (context, data) => {
+        drawSigmaLabel(context, data, labelTextColor, labelBackgroundColor, false)
+      },
+      defaultDrawNodeHover: (context, data) => {
+        context.save()
+        context.fillStyle = data.color
+        context.strokeStyle = hoverTextColor
+        context.lineWidth = 2
+        context.beginPath()
+        context.arc(data.x, data.y, data.size + 2, 0, Math.PI * 2)
+        context.fill()
+        context.stroke()
+        context.restore()
+
+        drawSigmaLabel(context, data, hoverTextColor, hoverBackgroundColor, true)
+      },
+    })
+    rendererRef.current.on('clickNode', ({ node }: { node: string }) => {
+      onNodeClick(node)
     })
 
     rendererRef.current.refresh()
@@ -242,7 +369,7 @@ function SigmaGraphView({ graphData, darkMode, getNodeColor, getEdgeColor }: Sig
       rendererRef.current?.kill()
       rendererRef.current = null
     }
-  }, [graph, darkMode])
+  }, [graph, darkMode, onNodeClick])
 
   return <div ref={containerRef} className="sigma-canvas" />
 }
@@ -384,6 +511,28 @@ function App() {
   const colorMapRef = useRef<Record<string, string>>({})
   const edgeColorMapRef = useRef<Record<string, string>>({})
 
+  const handleNodeClick = useCallback((nodeId: string) => {
+    const node = graphData.nodes.find(item => item.id === nodeId)
+    if (!node?.expansionKind || node.expansionKind !== 'node' || !node.expandNodeId) return
+
+    setLoading(true)
+    setError(null)
+    invoke<GraphData>('expand_node', {
+      id: selectedId,
+      nodeId: node.expandNodeId,
+      visibleNodeIds: graphData.nodes.map(item => item.id),
+      offset: node.offset ?? 0,
+    })
+      .then(data => {
+        setGraphData(current => mergeGraphData(current, data, node.id))
+        setLoading(false)
+      })
+      .catch(err => {
+        setError(String(err))
+        setLoading(false)
+      })
+  }, [graphData.nodes, selectedId])
+
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
   const forceGraphData = useMemo(() => cloneGraphData(normalizedGraphData), [normalizedGraphData])
 
@@ -398,6 +547,16 @@ function App() {
   }, [normalizedGraphData])
 
   const maxDegree = useMemo(() => Math.max(1, ...Object.values(nodeDegree)), [nodeDegree])
+
+  const topLabelNodeIds = useMemo(() => {
+    return new Set(
+      [...normalizedGraphData.nodes]
+        .sort((a, b) => (nodeDegree[b.id] || 0) - (nodeDegree[a.id] || 0))
+        .filter(node => !isExpanderNode(node))
+        .slice(0, 5)
+        .map(node => node.id),
+    )
+  }, [normalizedGraphData.nodes, nodeDegree])
 
   const getNodeColor = useCallback((label: string) => {
     if (!colorMapRef.current[label]) {
@@ -420,21 +579,10 @@ function App() {
     return 4 + (degree / maxDegree) * 12
   }, [nodeDegree, maxDegree])
 
-  const labelSizeThreshold = useMemo(() => {
-    const sizes = normalizedGraphData.nodes.map(n => {
-      const degree = nodeDegree[n.id] || 0
-      return 4 + (degree / maxDegree) * 12
-    })
-    sizes.sort((a, b) => b - a)
-    // Label the top 20% of nodes, but at least the top 5
-    const cutoffIndex = Math.max(4, Math.floor(sizes.length * 0.2) - 1)
-    return sizes[Math.min(cutoffIndex, sizes.length - 1)] ?? 16
-  }, [normalizedGraphData.nodes, nodeDegree, maxDegree])
-
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
     const size = getNodeSize(node)
-    const color = getNodeColor(node.label)
+    const color = isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label)
 
     ctx.fillStyle = color
     ctx.beginPath()
@@ -445,7 +593,7 @@ function App() {
     ctx.lineWidth = 1
     ctx.stroke()
 
-    if (size >= labelSizeThreshold && node.name) {
+    if ((isExpanderNode(node) || topLabelNodeIds.has(node.id)) && node.name) {
       const fontSize = 3
       ctx.font = `${fontSize}px Sans-Serif`
       ctx.textAlign = 'center'
@@ -463,7 +611,7 @@ function App() {
       }
       ctx.fillText(label, node.x, node.y)
     }
-  }, [getNodeSize, getNodeColor, darkMode, labelSizeThreshold])
+  }, [getNodeSize, getNodeColor, darkMode, topLabelNodeIds])
 
   return (
     <div className="app-container">
@@ -488,7 +636,9 @@ function App() {
                 <li
                   key={db.id}
                   className={`file-item ${selectedId === db.id ? 'active' : ''}`}
-                  onClick={() => setSelectedId(db.id)}
+                  onClick={() => {
+                    setSelectedId(db.id)
+                  }}
                   title={db.relativePath}
                 >
                   {db.name}
@@ -537,17 +687,20 @@ function App() {
             <SigmaGraphView
               key="sigma"
               graphData={normalizedGraphData}
+              labelNodeIds={topLabelNodeIds}
               darkMode={darkMode}
               getNodeColor={getNodeColor}
               getEdgeColor={getEdgeColor}
+              onNodeClick={handleNodeClick}
             />
           )}
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'force' && (
             <ForceGraph2D
               key="force"
               ref={graphRef}
-              graphData={forceGraphData}
+              graphData={forceGraphData as any}
               nodeCanvasObject={paintNode}
+              onNodeClick={(node) => handleNodeClick(String(node.id))}
               nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
               nodeRelSize={1}
               nodeLabel={(node) => `${node.label}: ${node.name}`}
