@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
 import type { NodeObject } from 'react-force-graph-2d'
+import { Sigma } from './vendor/sigma-runtime.js'
 import './App.css'
 
 interface Database {
@@ -28,6 +29,191 @@ interface GraphData {
   links: GraphLink[]
 }
 
+interface SigmaNodeAttributes extends Record<string, unknown> {
+  x: number
+  y: number
+  size: number
+  color: string
+  label: string
+  nodeType: string
+}
+
+interface SigmaEdgeAttributes extends Record<string, unknown> {
+  size: number
+  color: string
+  label: string
+}
+
+interface SigmaGraphViewProps {
+  graphData: GraphData
+  darkMode: boolean
+  getNodeColor: (label: string) => string
+  getEdgeColor: (label: string) => string
+}
+
+class SigmaGraph<
+  N extends Record<string, unknown> = Record<string, unknown>,
+  E extends Record<string, unknown> = Record<string, unknown>,
+> {
+  private nodeAttributes = new Map<string, N>()
+  private edgeRecords = new Map<string, { source: string; target: string; attributes: E }>()
+
+  get order() {
+    return this.nodeAttributes.size
+  }
+
+  addNode(key: string, attributes = {} as N): void {
+    if (this.nodeAttributes.has(key)) throw new Error(`SigmaGraph: node "${key}" already exists.`)
+    this.nodeAttributes.set(key, attributes)
+  }
+
+  addEdge(key: string, source: string, target: string, attributes = {} as E): void {
+    if (this.edgeRecords.has(key)) throw new Error(`SigmaGraph: edge "${key}" already exists.`)
+    if (!this.nodeAttributes.has(source)) this.addNode(source)
+    if (!this.nodeAttributes.has(target)) this.addNode(target)
+    this.edgeRecords.set(key, { source, target, attributes })
+  }
+
+  hasNode(key: string): boolean {
+    return this.nodeAttributes.has(key)
+  }
+
+  hasEdge(key: string): boolean {
+    return this.edgeRecords.has(key)
+  }
+
+  nodes(): string[] {
+    return [...this.nodeAttributes.keys()]
+  }
+
+  edges(): string[] {
+    return [...this.edgeRecords.keys()]
+  }
+
+  forEachNode(callback: (key: string, attributes: N) => void): void {
+    this.nodeAttributes.forEach((attributes, key) => callback(key, attributes))
+  }
+
+  forEachEdge(callback: (key: string, attributes: E) => void): void {
+    this.edgeRecords.forEach(({ attributes }, key) => callback(key, attributes))
+  }
+
+  getNodeAttributes(key: string): N {
+    const attributes = this.nodeAttributes.get(key)
+    if (!attributes) throw new Error(`SigmaGraph: node "${key}" not found.`)
+    return attributes
+  }
+
+  getEdgeAttributes(key: string): E {
+    const record = this.edgeRecords.get(key)
+    if (!record) throw new Error(`SigmaGraph: edge "${key}" not found.`)
+    return record.attributes
+  }
+
+  extremities(key: string): [string, string] {
+    const record = this.edgeRecords.get(key)
+    if (!record) throw new Error(`SigmaGraph: edge "${key}" not found.`)
+    return [record.source, record.target]
+  }
+
+  on(): void {}
+
+  removeListener(): void {}
+}
+
+function createInitialLayout(graphData: GraphData) {
+  const nodeCount = Math.max(1, graphData.nodes.length)
+  const degrees: Record<string, number> = {}
+  const positions: Record<string, { x: number; y: number }> = {}
+
+  graphData.nodes.forEach(node => {
+    degrees[node.id] = 0
+  })
+
+  graphData.links.forEach(link => {
+    degrees[link.source] = (degrees[link.source] || 0) + 1
+    degrees[link.target] = (degrees[link.target] || 0) + 1
+  })
+
+  const rankedNodes = [...graphData.nodes].sort((a, b) => (degrees[b.id] || 0) - (degrees[a.id] || 0))
+  const radius = Math.max(4, Math.sqrt(nodeCount) * 2.4)
+
+  rankedNodes.forEach((node, index) => {
+    const angle = index * Math.PI * (3 - Math.sqrt(5))
+    const ring = radius * Math.sqrt((index + 0.5) / nodeCount)
+    positions[node.id] = {
+      x: Math.cos(angle) * ring,
+      y: Math.sin(angle) * ring,
+    }
+  })
+
+  return { degrees, positions }
+}
+
+function SigmaGraphView({ graphData, darkMode, getNodeColor, getEdgeColor }: SigmaGraphViewProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const rendererRef = useRef<Sigma | null>(null)
+
+  const graph = useMemo(() => {
+    const { degrees, positions } = createInitialLayout(graphData)
+    const maxDegree = Math.max(1, ...Object.values(degrees))
+    const sigmaGraph = new SigmaGraph<SigmaNodeAttributes, SigmaEdgeAttributes>()
+
+    graphData.nodes.forEach(node => {
+      const position = positions[node.id] || { x: 0, y: 0 }
+      const degree = degrees[node.id] || 0
+      sigmaGraph.addNode(node.id, {
+        x: position.x,
+        y: position.y,
+        size: 4 + (degree / maxDegree) * 14,
+        color: getNodeColor(node.label),
+        label: node.name || node.id,
+        nodeType: node.label,
+      })
+    })
+
+    const edgeCounts = new Map<string, number>()
+    graphData.links.forEach((link, index) => {
+      if (!sigmaGraph.hasNode(link.source) || !sigmaGraph.hasNode(link.target)) return
+      const pairKey = `${link.source}->${link.target}`
+      const pairIndex = edgeCounts.get(pairKey) || 0
+      edgeCounts.set(pairKey, pairIndex + 1)
+      sigmaGraph.addEdge(`${pairKey}#${pairIndex}-${index}`, link.source, link.target, {
+        size: 1.8,
+        color: getEdgeColor(link.label || 'edge'),
+        label: link.label || '',
+      })
+    })
+
+    return sigmaGraph
+  }, [graphData, getNodeColor, getEdgeColor])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    rendererRef.current?.kill()
+    rendererRef.current = new Sigma(graph, container, {
+      allowInvalidContainer: true,
+      defaultEdgeType: 'arrow',
+      labelColor: { color: darkMode ? '#f3f4f6' : '#172033' },
+      renderEdgeLabels: false,
+      labelRenderedSizeThreshold: 9,
+      minCameraRatio: 0.03,
+      maxCameraRatio: 12,
+    })
+
+    rendererRef.current.refresh()
+
+    return () => {
+      rendererRef.current?.kill()
+      rendererRef.current = null
+    }
+  }, [graph, darkMode])
+
+  return <div ref={containerRef} className="sigma-canvas" />
+}
+
 function App() {
   const [databases, setDatabases] = useState<Database[]>([])
   const [selectedId, setSelectedId] = useState(0)
@@ -46,6 +232,7 @@ function App() {
   const [customQuery, setCustomQuery] = useState<string>('')
   const [isCustomQuery, setIsCustomQuery] = useState(false)
   const [queryActivated, setQueryActivated] = useState(false)
+  const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
   const customQueryRef = useRef<string>('')
@@ -280,6 +467,20 @@ function App() {
           </div>
 
           <div className="header-right">
+            <div className="renderer-toggle" aria-label="Renderer">
+              <button
+                className={renderer === 'sigma' ? 'active' : ''}
+                onClick={() => setRenderer('sigma')}
+              >
+                Sigma
+              </button>
+              <button
+                className={renderer === 'force' ? 'active' : ''}
+                onClick={() => setRenderer('force')}
+              >
+                Force
+              </button>
+            </div>
             <button
               className="theme-toggle"
               onClick={() => setDarkMode(!darkMode)}
@@ -290,7 +491,15 @@ function App() {
         </div>
 
         <div className="graph-container">
-          {!loading && !error && graphData.nodes.length > 0 && (
+          {!loading && !error && graphData.nodes.length > 0 && renderer === 'sigma' && (
+            <SigmaGraphView
+              graphData={graphData}
+              darkMode={darkMode}
+              getNodeColor={getNodeColor}
+              getEdgeColor={getEdgeColor}
+            />
+          )}
+          {!loading && !error && graphData.nodes.length > 0 && renderer === 'force' && (
             <ForceGraph2D
               ref={graphRef}
               graphData={graphData}

@@ -124,6 +124,38 @@ body {
   gap: 12px;
 }
 
+.renderer-toggle {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.renderer-toggle button {
+  min-width: 68px;
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 0;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.renderer-toggle button + button {
+  border-left: 1px solid var(--border-color);
+}
+
+.renderer-toggle button.active {
+  background-color: var(--accent-color);
+  color: white;
+}
+
+.renderer-toggle button:hover:not(.active) {
+  color: var(--text-primary);
+}
+
 .query-box {
   display: flex;
   align-items: flex-start;
@@ -221,6 +253,12 @@ body {
   min-height: 0;
   position: relative;
   overflow: hidden;
+}
+
+.sigma-canvas {
+  position: absolute;
+  inset: 0;
+  background-color: var(--bg-primary);
 }
 
 .add-db-btn {
