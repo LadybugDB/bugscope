@@ -19,14 +19,25 @@ interface GraphNode {
 }
 
 interface GraphLink {
-  source: string
-  target: string
+  source: string | NodeObject
+  target: string | NodeObject
   label: string
 }
 
 interface GraphData {
   nodes: GraphNode[]
   links: GraphLink[]
+}
+
+interface NormalizedGraphLink {
+  source: string
+  target: string
+  label: string
+}
+
+interface NormalizedGraphData {
+  nodes: GraphNode[]
+  links: NormalizedGraphLink[]
 }
 
 interface SigmaNodeAttributes extends Record<string, unknown> {
@@ -45,7 +56,7 @@ interface SigmaEdgeAttributes extends Record<string, unknown> {
 }
 
 interface SigmaGraphViewProps {
-  graphData: GraphData
+  graphData: NormalizedGraphData
   darkMode: boolean
   getNodeColor: (label: string) => string
   getEdgeColor: (label: string) => string
@@ -121,7 +132,29 @@ class SigmaGraph<
   removeListener(): void {}
 }
 
-function createInitialLayout(graphData: GraphData) {
+function getEndpointId(endpoint: string | NodeObject): string {
+  return typeof endpoint === 'object' ? String(endpoint.id) : endpoint
+}
+
+function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
+  return {
+    nodes: graphData.nodes.map(node => ({ ...node })),
+    links: graphData.links.map(link => ({
+      source: getEndpointId(link.source),
+      target: getEndpointId(link.target),
+      label: link.label,
+    })),
+  }
+}
+
+function cloneGraphData(graphData: NormalizedGraphData): NormalizedGraphData {
+  return {
+    nodes: graphData.nodes.map(node => ({ ...node })),
+    links: graphData.links.map(link => ({ ...link })),
+  }
+}
+
+function createInitialLayout(graphData: NormalizedGraphData) {
   const nodeCount = Math.max(1, graphData.nodes.length)
   const degrees: Record<string, number> = {}
   const positions: Record<string, { x: number; y: number }> = {}
@@ -239,8 +272,16 @@ function App() {
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const fetchDatabases = () => {
-    invoke<Database[]>('get_databases')
-      .then(setDatabases)
+    Promise.all([
+      invoke<Database[]>('get_databases'),
+      invoke<number | null>('get_initial_database_id'),
+    ])
+      .then(([items, initialId]) => {
+        setDatabases(items)
+        if (typeof initialId === 'number') {
+          setSelectedId(initialId)
+        }
+      })
       .catch(err => setError(String(err)))
   }
 
@@ -343,17 +384,18 @@ function App() {
   const colorMapRef = useRef<Record<string, string>>({})
   const edgeColorMapRef = useRef<Record<string, string>>({})
 
+  const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
+  const forceGraphData = useMemo(() => cloneGraphData(normalizedGraphData), [normalizedGraphData])
+
   const nodeDegree = useMemo(() => {
     const degrees: Record<string, number> = {}
-    graphData.nodes.forEach(n => degrees[n.id] = 0)
-    graphData.links.forEach(link => {
-      const src = typeof link.source === 'object' ? (link.source as NodeObject).id : link.source
-      const dst = typeof link.target === 'object' ? (link.target as NodeObject).id : link.target
-      degrees[src as string] = (degrees[src as string] || 0) + 1
-      degrees[dst as string] = (degrees[dst as string] || 0) + 1
+    normalizedGraphData.nodes.forEach(n => degrees[n.id] = 0)
+    normalizedGraphData.links.forEach(link => {
+      degrees[link.source] = (degrees[link.source] || 0) + 1
+      degrees[link.target] = (degrees[link.target] || 0) + 1
     })
     return degrees
-  }, [graphData])
+  }, [normalizedGraphData])
 
   const maxDegree = useMemo(() => Math.max(1, ...Object.values(nodeDegree)), [nodeDegree])
 
@@ -379,7 +421,7 @@ function App() {
   }, [nodeDegree, maxDegree])
 
   const labelSizeThreshold = useMemo(() => {
-    const sizes = graphData.nodes.map(n => {
+    const sizes = normalizedGraphData.nodes.map(n => {
       const degree = nodeDegree[n.id] || 0
       return 4 + (degree / maxDegree) * 12
     })
@@ -387,7 +429,7 @@ function App() {
     // Label the top 20% of nodes, but at least the top 5
     const cutoffIndex = Math.max(4, Math.floor(sizes.length * 0.2) - 1)
     return sizes[Math.min(cutoffIndex, sizes.length - 1)] ?? 16
-  }, [graphData.nodes, nodeDegree, maxDegree])
+  }, [normalizedGraphData.nodes, nodeDegree, maxDegree])
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
@@ -493,7 +535,8 @@ function App() {
         <div className="graph-container">
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'sigma' && (
             <SigmaGraphView
-              graphData={graphData}
+              key="sigma"
+              graphData={normalizedGraphData}
               darkMode={darkMode}
               getNodeColor={getNodeColor}
               getEdgeColor={getEdgeColor}
@@ -501,8 +544,9 @@ function App() {
           )}
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'force' && (
             <ForceGraph2D
+              key="force"
               ref={graphRef}
-              graphData={graphData}
+              graphData={forceGraphData}
               nodeCanvasObject={paintNode}
               nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
               nodeRelSize={1}

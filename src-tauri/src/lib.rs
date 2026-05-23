@@ -54,6 +54,7 @@ struct DirectoryListing {
 
 struct AppState {
     custom_databases: Mutex<Vec<DatabaseInfo>>,
+    initial_database_path: Option<String>,
     data_dir: PathBuf,
 }
 
@@ -97,6 +98,40 @@ fn get_all_databases(state: &AppState) -> Vec<DatabaseInfo> {
     all
 }
 
+fn database_info_from_path(file_path: &str) -> Result<DatabaseInfo, String> {
+    if file_path.is_empty() {
+        return Err("filePath is required".to_string());
+    }
+
+    let abs_path = if Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        std::env::current_dir().unwrap_or_default().join(file_path)
+    };
+
+    if !abs_path.exists() {
+        return Err("File not found".to_string());
+    }
+
+    if abs_path.extension().and_then(|e| e.to_str()) != Some("lbdb") {
+        return Err("Only .lbdb files are supported".to_string());
+    }
+
+    let abs_path_str = abs_path.to_string_lossy().to_string();
+    let name = abs_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    Ok(DatabaseInfo {
+        id: 0,
+        name,
+        path: abs_path_str.clone(),
+        relative_path: abs_path_str,
+    })
+}
+
 fn value_to_string(val: &Value) -> String {
     match val {
         Value::String(s) => s.clone(),
@@ -121,50 +156,34 @@ fn get_databases(state: State<AppState>) -> Vec<DatabaseInfo> {
 }
 
 #[tauri::command]
-fn add_database(state: State<AppState>, file_path: String) -> Result<DatabaseInfo, String> {
-    if file_path.is_empty() {
-        return Err("filePath is required".to_string());
-    }
+fn get_initial_database_id(state: State<AppState>) -> Option<usize> {
+    let initial_path = state.initial_database_path.as_ref()?;
+    get_all_databases(&state)
+        .iter()
+        .find(|db| db.path == *initial_path)
+        .map(|db| db.id)
+}
 
-    let abs_path = if Path::new(&file_path).is_absolute() {
-        PathBuf::from(&file_path)
-    } else {
-        std::env::current_dir().unwrap_or_default().join(&file_path)
-    };
-
-    if !abs_path.exists() {
-        return Err("File not found".to_string());
-    }
-
-    if abs_path.extension().and_then(|e| e.to_str()) != Some("lbdb") {
-        return Err("Only .lbdb files are supported".to_string());
-    }
-
-    let abs_path_str = abs_path.to_string_lossy().to_string();
-
+fn add_database_info(state: &AppState, db_info: DatabaseInfo) -> Result<DatabaseInfo, String> {
     let mut custom = state.custom_databases.lock().unwrap();
-    if custom.iter().any(|d| d.path == abs_path_str) {
+    if custom.iter().any(|d| d.path == db_info.path) {
         return Err("Database already added".to_string());
     }
-
-    let name = abs_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let db_info = DatabaseInfo {
-        id: 0, // will be recalculated
-        name,
-        path: abs_path_str.clone(),
-        relative_path: abs_path_str,
-    };
     custom.push(db_info.clone());
 
     // Return with correct id
     drop(custom);
     let all = get_all_databases(&state);
-    Ok(all.last().cloned().unwrap_or(db_info))
+    Ok(all
+        .into_iter()
+        .find(|db| db.path == db_info.path)
+        .unwrap_or(db_info))
+}
+
+#[tauri::command]
+fn add_database(state: State<AppState>, file_path: String) -> Result<DatabaseInfo, String> {
+    let db_info = database_info_from_path(&file_path)?;
+    add_database_info(&state, db_info)
 }
 
 #[tauri::command]
@@ -178,10 +197,12 @@ fn get_directories(
             if resolved.is_absolute() {
                 resolved
             } else {
-                state.data_dir.join(p)
+                std::env::current_dir()
+                    .unwrap_or_else(|_| state.data_dir.clone())
+                    .join(p)
             }
         }
-        _ => state.data_dir.clone(),
+        _ => std::env::current_dir().unwrap_or_else(|_| state.data_dir.clone()),
     };
 
     let entries = fs::read_dir(&dir).map_err(|e| e.to_string())?;
@@ -405,14 +426,27 @@ pub fn run() {
                 .app_data_dir()
                 .expect("Failed to get app data dir");
             std::fs::create_dir_all(&data_dir).ok();
+            let initial_database = std::env::args()
+                .skip(1)
+                .find(|arg| !arg.starts_with('-'))
+                .and_then(|arg| match database_info_from_path(&arg) {
+                    Ok(db_info) => Some(db_info),
+                    Err(err) => {
+                        eprintln!("Ignoring database path {arg:?}: {err}");
+                        None
+                    }
+                });
+            let initial_database_path = initial_database.as_ref().map(|db| db.path.clone());
             app.manage(AppState {
-                custom_databases: Mutex::new(Vec::new()),
+                custom_databases: Mutex::new(initial_database.into_iter().collect()),
+                initial_database_path,
                 data_dir,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_databases,
+            get_initial_database_id,
             add_database,
             get_directories,
             get_graph,
