@@ -110,6 +110,9 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 2;
 }
 
 .header-left {
@@ -253,6 +256,7 @@ body {
   min-height: 0;
   position: relative;
   overflow: hidden;
+  z-index: 1;
 }
 
 .sigma-canvas {

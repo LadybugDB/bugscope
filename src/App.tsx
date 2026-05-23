@@ -437,6 +437,8 @@ function App() {
   const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
+  const graphContainerRef = useRef<HTMLDivElement | null>(null)
+  const [graphSize, setGraphSize] = useState({ width: 1, height: 1 })
   const customQueryRef = useRef<string>('')
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -478,6 +480,32 @@ function App() {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light')
   }, [darkMode])
+
+  useEffect(() => {
+    const container = graphContainerRef.current
+    if (!container) return
+
+    const updateGraphSize = () => {
+      const rect = container.getBoundingClientRect()
+      const width = Math.max(1, Math.floor(rect.width))
+      const height = Math.max(1, Math.floor(rect.height))
+      setGraphSize(current => (
+        current.width === width && current.height === height
+          ? current
+          : { width, height }
+      ))
+    }
+
+    updateGraphSize()
+    const observer = new ResizeObserver(updateGraphSize)
+    observer.observe(container)
+    window.addEventListener('resize', updateGraphSize)
+
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', updateGraphSize)
+    }
+  }, [])
 
   const fetchGraphData = useCallback(() => {
     if (databases.length === 0) {
@@ -749,7 +777,7 @@ function App() {
           </div>
         </div>
 
-        <div className="graph-container">
+        <div className="graph-container" ref={graphContainerRef}>
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'sigma' && (
             <SigmaGraphView
               key="sigma"
@@ -766,6 +794,8 @@ function App() {
             <ForceGraph2D
               key="force"
               ref={graphRef}
+              width={graphSize.width}
+              height={graphSize.height}
               graphData={forceGraphData}
               nodeCanvasObject={paintNode}
               onNodeClick={(node) => handleNodeClick(String(node.id))}
