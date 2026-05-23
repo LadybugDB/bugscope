@@ -50,6 +50,7 @@ interface SigmaNodeAttributes extends Record<string, unknown> {
   size: number
   color: string
   label: string
+  hoverLabel: string
   nodeType: string
 }
 
@@ -73,6 +74,7 @@ interface SigmaLabelData {
   y: number
   size: number
   label?: string
+  hoverLabel?: string
   color: string
 }
 
@@ -304,6 +306,7 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
         size: 4 + (degree / maxDegree) * 14,
         color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label),
         label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
+        hoverLabel: node.name || node.id,
         nodeType: node.label,
       })
     })
@@ -346,6 +349,11 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
         drawSigmaLabel(context, data, labelTextColor, labelBackgroundColor, false)
       },
       defaultDrawNodeHover: (context, data) => {
+        const labelData = {
+          ...data,
+          label: typeof data.hoverLabel === 'string' ? data.hoverLabel : data.label,
+        }
+
         context.save()
         context.fillStyle = data.color
         context.strokeStyle = hoverTextColor
@@ -356,7 +364,7 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
         context.stroke()
         context.restore()
 
-        drawSigmaLabel(context, data, hoverTextColor, hoverBackgroundColor, true)
+        drawSigmaLabel(context, labelData, hoverTextColor, hoverBackgroundColor, true)
       },
     })
     rendererRef.current.on('clickNode', ({ node }: { node: string }) => {
@@ -393,6 +401,7 @@ function App() {
   const [isCustomQuery, setIsCustomQuery] = useState(false)
   const [queryActivated, setQueryActivated] = useState(false)
   const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
+  const [expandedLabelNodeIds, setExpandedLabelNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
   const customQueryRef = useRef<string>('')
@@ -450,6 +459,7 @@ function App() {
       invoke<GraphData>('execute_query', { id: selectedId, query })
         .then(data => {
           setGraphData(data)
+          setExpandedLabelNodeIds(new Set())
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -465,6 +475,7 @@ function App() {
       invoke<GraphData>('get_graph', { id: selectedId })
         .then(data => {
           setGraphData(data)
+          setExpandedLabelNodeIds(new Set())
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -525,6 +536,13 @@ function App() {
     })
       .then(data => {
         setGraphData(current => mergeGraphData(current, data, node.id))
+        setExpandedLabelNodeIds(current => {
+          const next = new Set(current)
+          data.nodes
+            .filter(item => !isExpanderNode(item))
+            .forEach(item => next.add(item.id))
+          return next
+        })
         setLoading(false)
       })
       .catch(err => {
@@ -550,13 +568,16 @@ function App() {
 
   const topLabelNodeIds = useMemo(() => {
     return new Set(
-      [...normalizedGraphData.nodes]
+      [
+        ...expandedLabelNodeIds,
+        ...[...normalizedGraphData.nodes]
         .sort((a, b) => (nodeDegree[b.id] || 0) - (nodeDegree[a.id] || 0))
         .filter(node => !isExpanderNode(node))
         .slice(0, 5)
         .map(node => node.id),
+      ]
     )
-  }, [normalizedGraphData.nodes, nodeDegree])
+  }, [expandedLabelNodeIds, normalizedGraphData.nodes, nodeDegree])
 
   const getNodeColor = useCallback((label: string) => {
     if (!colorMapRef.current[label]) {
