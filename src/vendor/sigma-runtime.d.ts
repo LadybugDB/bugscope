@@ -17,6 +17,7 @@ export interface SigmaLabelData {
   label?: string
   hoverLabel?: string
   color: string
+  isNewlyExpanded?: boolean
 }
 
 export class Sigma {

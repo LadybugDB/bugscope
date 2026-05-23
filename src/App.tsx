@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
-import type { NodeObject } from 'react-force-graph-2d'
+import type { GraphData as ForceGraphData, NodeObject } from 'react-force-graph-2d'
 import { Sigma } from './vendor/sigma-runtime.js'
 import './App.css'
 
@@ -44,6 +44,10 @@ interface NormalizedGraphData {
   links: NormalizedGraphLink[]
 }
 
+interface ForceGraphLink {
+  label: string
+}
+
 interface SigmaNodeAttributes extends Record<string, unknown> {
   x: number
   y: number
@@ -51,6 +55,7 @@ interface SigmaNodeAttributes extends Record<string, unknown> {
   color: string
   label: string
   hoverLabel: string
+  isNewlyExpanded: boolean
   nodeType: string
 }
 
@@ -63,6 +68,7 @@ interface SigmaEdgeAttributes extends Record<string, unknown> {
 interface SigmaGraphViewProps {
   graphData: NormalizedGraphData
   labelNodeIds: Set<string>
+  newlyExpandedNodeIds: Set<string>
   darkMode: boolean
   getNodeColor: (label: string) => string
   getEdgeColor: (label: string) => string
@@ -76,6 +82,7 @@ interface SigmaLabelData {
   label?: string
   hoverLabel?: string
   color: string
+  isNewlyExpanded?: boolean
 }
 
 class SigmaGraph<
@@ -163,13 +170,6 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
   }
 }
 
-function cloneGraphData(graphData: GraphData): GraphData {
-  return {
-    nodes: graphData.nodes.map(node => ({ ...node })),
-    links: graphData.links.map(link => ({ ...link })),
-  }
-}
-
 const EXPANDER_PREFIX = '__expand__:'
 
 function isExpanderNode(node: GraphNode) {
@@ -195,6 +195,10 @@ function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?
     nodes: [...nodesById.values()],
     links: [...linksByKey.values()],
   }
+}
+
+function realNodeIds(nodes: GraphNode[]): Set<string> {
+  return new Set(nodes.filter(node => !isExpanderNode(node)).map(node => node.id))
 }
 
 function drawRoundedRect(
@@ -259,6 +263,34 @@ function drawSigmaLabel(
   context.restore()
 }
 
+function drawSigmaNode(
+  context: CanvasRenderingContext2D,
+  data: SigmaLabelData,
+  highlighted: boolean,
+) {
+  context.save()
+  if (highlighted) {
+    context.fillStyle = 'rgba(245, 158, 11, 0.22)'
+    context.beginPath()
+    context.arc(data.x, data.y, data.size + 7, 0, Math.PI * 2)
+    context.fill()
+  }
+
+  context.fillStyle = data.color
+  context.beginPath()
+  context.arc(data.x, data.y, data.size, 0, Math.PI * 2)
+  context.fill()
+
+  if (highlighted) {
+    context.strokeStyle = '#f59e0b'
+    context.lineWidth = 3
+    context.beginPath()
+    context.arc(data.x, data.y, data.size + 2, 0, Math.PI * 2)
+    context.stroke()
+  }
+  context.restore()
+}
+
 function createInitialLayout(graphData: NormalizedGraphData) {
   const nodeCount = Math.max(1, graphData.nodes.length)
   const degrees: Record<string, number> = {}
@@ -288,7 +320,7 @@ function createInitialLayout(graphData: NormalizedGraphData) {
   return { degrees, positions }
 }
 
-function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
+function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeColor, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
 
@@ -307,6 +339,7 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
         color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label),
         label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
         hoverLabel: node.name || node.id,
+        isNewlyExpanded: newlyExpandedNodeIds.has(node.id),
         nodeType: node.label,
       })
     })
@@ -325,7 +358,7 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
     })
 
     return sigmaGraph
-  }, [graphData, labelNodeIds, getNodeColor, getEdgeColor])
+  }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeColor, getEdgeColor])
 
   useEffect(() => {
     const container = containerRef.current
@@ -333,6 +366,8 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
 
     const labelTextColor = '#111827'
     const labelBackgroundColor = darkMode ? 'rgba(248, 250, 252, 0.94)' : 'rgba(255, 255, 255, 0.9)'
+    const expandedTextColor = '#111827'
+    const expandedBackgroundColor = 'rgba(254, 243, 199, 0.96)'
     const hoverTextColor = '#111827'
     const hoverBackgroundColor = darkMode ? 'rgba(255, 255, 255, 0.98)' : 'rgba(255, 255, 255, 0.98)'
 
@@ -346,7 +381,13 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
       minCameraRatio: 0.03,
       maxCameraRatio: 12,
       defaultDrawNodeLabel: (context, data) => {
-        drawSigmaLabel(context, data, labelTextColor, labelBackgroundColor, false)
+        drawSigmaLabel(
+          context,
+          data,
+          data.isNewlyExpanded ? expandedTextColor : labelTextColor,
+          data.isNewlyExpanded ? expandedBackgroundColor : labelBackgroundColor,
+          Boolean(data.isNewlyExpanded),
+        )
       },
       defaultDrawNodeHover: (context, data) => {
         const labelData = {
@@ -354,15 +395,7 @@ function SigmaGraphView({ graphData, labelNodeIds, darkMode, getNodeColor, getEd
           label: typeof data.hoverLabel === 'string' ? data.hoverLabel : data.label,
         }
 
-        context.save()
-        context.fillStyle = data.color
-        context.strokeStyle = hoverTextColor
-        context.lineWidth = 2
-        context.beginPath()
-        context.arc(data.x, data.y, data.size + 2, 0, Math.PI * 2)
-        context.fill()
-        context.stroke()
-        context.restore()
+        drawSigmaNode(context, data, Boolean(data.isNewlyExpanded))
 
         drawSigmaLabel(context, labelData, hoverTextColor, hoverBackgroundColor, true)
       },
@@ -401,7 +434,7 @@ function App() {
   const [isCustomQuery, setIsCustomQuery] = useState(false)
   const [queryActivated, setQueryActivated] = useState(false)
   const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
-  const [expandedLabelNodeIds, setExpandedLabelNodeIds] = useState<Set<string>>(() => new Set())
+  const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
   const customQueryRef = useRef<string>('')
@@ -459,7 +492,7 @@ function App() {
       invoke<GraphData>('execute_query', { id: selectedId, query })
         .then(data => {
           setGraphData(data)
-          setExpandedLabelNodeIds(new Set())
+          setLastExpandedNodeIds(new Set())
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -475,7 +508,7 @@ function App() {
       invoke<GraphData>('get_graph', { id: selectedId })
         .then(data => {
           setGraphData(data)
-          setExpandedLabelNodeIds(new Set())
+          setLastExpandedNodeIds(new Set())
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -535,24 +568,29 @@ function App() {
       offset: node.offset ?? 0,
     })
       .then(data => {
-        setGraphData(current => mergeGraphData(current, data, node.id))
-        setExpandedLabelNodeIds(current => {
-          const next = new Set(current)
-          data.nodes
-            .filter(item => !isExpanderNode(item))
-            .forEach(item => next.add(item.id))
-          return next
+        const beforeNodeIds = realNodeIds(graphData.nodes)
+        const returnedNodeIds = realNodeIds(data.nodes)
+        const merged = mergeGraphData(graphData, data, node.id)
+        const highlightedNodeIds = realNodeIds(merged.nodes)
+
+        beforeNodeIds.forEach(id => {
+          if (!returnedNodeIds.has(id)) highlightedNodeIds.delete(id)
         })
+        setGraphData(merged)
+        setLastExpandedNodeIds(highlightedNodeIds)
         setLoading(false)
       })
       .catch(err => {
         setError(String(err))
         setLoading(false)
       })
-  }, [graphData.nodes, selectedId])
+  }, [graphData, selectedId])
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
-  const forceGraphData = useMemo(() => cloneGraphData(normalizedGraphData), [normalizedGraphData])
+  const forceGraphData = useMemo<ForceGraphData<GraphNode, ForceGraphLink>>(() => ({
+    nodes: normalizedGraphData.nodes.map(node => ({ ...node })),
+    links: normalizedGraphData.links.map(link => ({ ...link })),
+  }), [normalizedGraphData])
 
   const nodeDegree = useMemo(() => {
     const degrees: Record<string, number> = {}
@@ -569,7 +607,7 @@ function App() {
   const topLabelNodeIds = useMemo(() => {
     return new Set(
       [
-        ...expandedLabelNodeIds,
+        ...lastExpandedNodeIds,
         ...[...normalizedGraphData.nodes]
         .sort((a, b) => (nodeDegree[b.id] || 0) - (nodeDegree[a.id] || 0))
         .filter(node => !isExpanderNode(node))
@@ -577,7 +615,7 @@ function App() {
         .map(node => node.id),
       ]
     )
-  }, [expandedLabelNodeIds, normalizedGraphData.nodes, nodeDegree])
+  }, [lastExpandedNodeIds, normalizedGraphData.nodes, nodeDegree])
 
   const getNodeColor = useCallback((label: string) => {
     if (!colorMapRef.current[label]) {
@@ -604,14 +642,22 @@ function App() {
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
     const size = getNodeSize(node)
     const color = isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label)
+    const highlighted = lastExpandedNodeIds.has(node.id)
+
+    if (highlighted) {
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.22)'
+      ctx.beginPath()
+      ctx.arc(node.x, node.y, size + 7, 0, 2 * Math.PI)
+      ctx.fill()
+    }
 
     ctx.fillStyle = color
     ctx.beginPath()
     ctx.arc(node.x, node.y, size, 0, 2 * Math.PI)
     ctx.fill()
 
-    ctx.strokeStyle = darkMode ? '#222' : '#ddd'
-    ctx.lineWidth = 1
+    ctx.strokeStyle = highlighted ? '#f59e0b' : darkMode ? '#222' : '#ddd'
+    ctx.lineWidth = highlighted ? 3 : 1
     ctx.stroke()
 
     if ((isExpanderNode(node) || topLabelNodeIds.has(node.id)) && node.name) {
@@ -619,7 +665,7 @@ function App() {
       ctx.font = `${fontSize}px Sans-Serif`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
-      ctx.fillStyle = '#fff'
+      ctx.fillStyle = highlighted ? '#f59e0b' : '#fff'
 
       const maxWidth = size * 1.6
       let label = node.name
@@ -632,7 +678,7 @@ function App() {
       }
       ctx.fillText(label, node.x, node.y)
     }
-  }, [getNodeSize, getNodeColor, darkMode, topLabelNodeIds])
+  }, [getNodeSize, getNodeColor, darkMode, topLabelNodeIds, lastExpandedNodeIds])
 
   return (
     <div className="app-container">
@@ -709,6 +755,7 @@ function App() {
               key="sigma"
               graphData={normalizedGraphData}
               labelNodeIds={topLabelNodeIds}
+              newlyExpandedNodeIds={lastExpandedNodeIds}
               darkMode={darkMode}
               getNodeColor={getNodeColor}
               getEdgeColor={getEdgeColor}
@@ -719,7 +766,7 @@ function App() {
             <ForceGraph2D
               key="force"
               ref={graphRef}
-              graphData={forceGraphData as any}
+              graphData={forceGraphData}
               nodeCanvasObject={paintNode}
               onNodeClick={(node) => handleNodeClick(String(node.id))}
               nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
