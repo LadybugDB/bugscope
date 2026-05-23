@@ -15,6 +15,7 @@ export interface SigmaLabelData {
   y: number
   size: number
   label?: string
+  hoverLabel?: string
   color: string
 }
 
