@@ -1,4 +1,4 @@
-onlyBuiltDependencies:
-  - '@ladybugmem/icebug'
-  - esbuild
-  - lbug
+allowBuilds:
+  '@ladybugmem/icebug': true
+  esbuild: true
+  lbug: true
