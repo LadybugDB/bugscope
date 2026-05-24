@@ -14,6 +14,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ladybugmem/icebug": "^12.8.0",
     "@tauri-apps/api": "^2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
