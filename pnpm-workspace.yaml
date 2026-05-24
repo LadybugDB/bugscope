@@ -2,3 +2,5 @@ allowBuilds:
   '@ladybugmem/icebug': true
   esbuild: true
   lbug: true
+minimumReleaseAgeExclude:
+  - "@ladybugmem/*"
