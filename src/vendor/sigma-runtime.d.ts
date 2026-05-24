@@ -1,6 +1,7 @@
 export interface SigmaSettings {
   allowInvalidContainer?: boolean
   defaultEdgeType?: string
+  enableEdgeEvents?: boolean
   labelColor?: { color: string } | { attribute: string; color?: string }
   renderEdgeLabels?: boolean
   edgeLabelColor?: { color: string } | { attribute: string; color?: string }
@@ -20,8 +21,10 @@ export interface SigmaSettings {
 }
 
 export interface SigmaEdgeLabelData {
+  key?: string
   label?: string
   size: number
+  forceLabel?: boolean
 }
 
 export interface SigmaEdgeLabelNodeData {
@@ -43,6 +46,8 @@ export interface SigmaLabelData {
 export class Sigma {
   constructor(graph: unknown, container: HTMLElement, settings?: SigmaSettings)
   on(event: 'clickNode', callback: (payload: { node: string }) => void): void
+  on(event: 'enterEdge', callback: (payload: { edge: string }) => void): void
+  on(event: 'leaveEdge', callback: (payload: { edge: string }) => void): void
   refresh(): void
   kill(): void
 }
