@@ -157,6 +157,7 @@ jobs:
       - name: Download liblbug
         env:
           GH_TOKEN: ${{ github.token }}
+          LBUG_TARGET_DIR: ${{ github.workspace }}/src-tauri/liblbug
         run: bash scripts/download-liblbug.sh
 
       - name: Build Tauri app (Linux)
