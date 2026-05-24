@@ -87,8 +87,10 @@ interface SigmaLabelData {
 }
 
 interface SigmaEdgeLabelData {
+  key?: string
   label?: string
   size: number
+  forceLabel?: boolean
 }
 
 interface SigmaEdgeLabelNodeData {
@@ -308,9 +310,11 @@ function drawSigmaEdgeLabel(
   edgeData: SigmaEdgeLabelData,
   sourceData: SigmaEdgeLabelNodeData,
   targetData: SigmaEdgeLabelNodeData,
+  hoveredEdgeId: string | null,
   textColor: string,
   backgroundColor: string,
 ) {
+  if (edgeData.key !== hoveredEdgeId) return
   if (!edgeData.label) return
 
   const dx = targetData.x - sourceData.x
@@ -390,6 +394,7 @@ function createInitialLayout(graphData: NormalizedGraphData) {
 function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeColor, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
+  const hoveredEdgeRef = useRef<string | null>(null)
 
   const graph = useMemo(() => {
     const { degrees, positions } = createInitialLayout(graphData)
@@ -417,11 +422,13 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
       const pairKey = `${link.source}->${link.target}`
       const pairIndex = edgeCounts.get(pairKey) || 0
       edgeCounts.set(pairKey, pairIndex + 1)
-      sigmaGraph.addEdge(`${pairKey}#${pairIndex}-${index}`, link.source, link.target, {
+      const edgeKey = `${pairKey}#${pairIndex}-${index}`
+      const edgeLabel = link.label === 'more' ? '' : link.label || ''
+      sigmaGraph.addEdge(edgeKey, link.source, link.target, {
         size: 1.8,
         color: getEdgeColor(link.label || 'edge'),
-        label: link.label || '',
-        forceLabel: Boolean(link.label),
+        label: edgeLabel,
+        forceLabel: Boolean(edgeLabel),
       })
     })
 
@@ -445,6 +452,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
     rendererRef.current = new Sigma(graph, container, {
       allowInvalidContainer: true,
       defaultEdgeType: 'arrow',
+      enableEdgeEvents: true,
       labelColor: { color: labelTextColor },
       renderEdgeLabels: true,
       edgeLabelColor: { color: edgeLabelTextColor },
@@ -459,6 +467,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
           edgeData,
           sourceData,
           targetData,
+          hoveredEdgeRef.current,
           edgeLabelTextColor,
           edgeLabelBackgroundColor,
         )
@@ -485,6 +494,14 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
     })
     rendererRef.current.on('clickNode', ({ node }: { node: string }) => {
       onNodeClick(node)
+    })
+    rendererRef.current.on('enterEdge', ({ edge }: { edge: string }) => {
+      hoveredEdgeRef.current = edge
+      rendererRef.current?.refresh()
+    })
+    rendererRef.current.on('leaveEdge', () => {
+      hoveredEdgeRef.current = null
+      rendererRef.current?.refresh()
     })
 
     rendererRef.current.refresh()
