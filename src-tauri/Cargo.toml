@@ -14,6 +14,6 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-lbug = "0.15.1"
+lbug = { git = "https://github.com/LadybugDB/ladybug-rust" }
 walkdir = "2"
 dirs = "5"
