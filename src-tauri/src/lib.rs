@@ -821,11 +821,12 @@ fn expand_node_from_full(
     visible_node_ids: &[String],
     offset: usize,
 ) -> GraphData {
-    let visible_ids: HashSet<String> = visible_node_ids
+    let visible_order: Vec<String> = visible_node_ids
         .iter()
         .filter(|id| !id.starts_with(EXPANDER_PREFIX))
         .cloned()
         .collect();
+    let visible_ids: HashSet<String> = visible_order.iter().cloned().collect();
 
     let mut degrees: HashMap<String, usize> = HashMap::new();
     for link in &full_graph.links {
@@ -866,7 +867,15 @@ fn expand_node_from_full(
     let mut return_ids = visible_ids.clone();
     return_ids.extend(selected_ids.iter().cloned());
 
-    let mut nodes: Vec<GraphNode> = selected_ids
+    let mut node_ids = visible_order;
+    for id in &selected_ids {
+        if node_ids.contains(id) {
+            continue;
+        }
+        node_ids.push(id.clone());
+    }
+
+    let mut nodes: Vec<GraphNode> = node_ids
         .iter()
         .filter_map(|id| full_node_by_id.get(id).cloned())
         .collect();
