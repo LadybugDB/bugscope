@@ -51,3 +51,27 @@ export class Sigma {
   refresh(): void
   kill(): void
 }
+
+export type IcebugCSRArray = number[] | Uint32Array | BigUint64Array
+
+export interface IcebugSigmaGraphOptions<
+  N extends Record<string, unknown> = Record<string, unknown>,
+  E extends Record<string, unknown> = Record<string, unknown>,
+> {
+  directed?: boolean
+  nodes: Array<{ key: string; attributes: N }>
+  csr: {
+    indptr: IcebugCSRArray
+    indices: IcebugCSRArray
+    edgeIds?: IcebugCSRArray | null
+  }
+  edgeAttributes?: E[]
+  edgeKeys?: string[]
+}
+
+export class IcebugSigmaGraph<
+  N extends Record<string, unknown> = Record<string, unknown>,
+  E extends Record<string, unknown> = Record<string, unknown>,
+> {
+  constructor(options: IcebugSigmaGraphOptions<N, E>)
+}
