@@ -1,3 +1,5 @@
+use arrow_array::UInt64Array;
+use icebug::{GraphR, Leiden};
 use lbug::{Connection, Database, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -53,16 +55,36 @@ struct GraphCsr {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphCluster {
+    #[serde(rename = "clusterId")]
+    cluster_id: u64,
+    label: String,
+    size: usize,
+    #[serde(rename = "parentClusterId", skip_serializing_if = "Option::is_none")]
+    parent_cluster_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphClusterLevel {
+    level: usize,
+    membership: Vec<u64>,
+    clusters: Vec<GraphCluster>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GraphData {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     csr: Option<GraphCsr>,
+    #[serde(rename = "clusterLevels", skip_serializing_if = "Option::is_none")]
+    cluster_levels: Option<Vec<GraphClusterLevel>>,
 }
 
 const SEED_NODE_COUNT: usize = 8;
 const EXPAND_BATCH_SIZE: usize = 8;
 const EDGE_SCAN_LIMIT: usize = 10_000;
+const CLUSTER_LEVEL_LIMIT: usize = 3;
 const EXPANDER_PREFIX: &str = "__expand__:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,9 +265,223 @@ fn build_csr(nodes: &[GraphNode], links: &[GraphLink]) -> GraphCsr {
     }
 }
 
+fn build_undirected_csr(node_count: usize, links: &[GraphLink], node_index: &HashMap<String, usize>) -> GraphCsr {
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    for link in links {
+        let Some(&source) = node_index.get(&link.source) else {
+            continue;
+        };
+        let Some(&target) = node_index.get(&link.target) else {
+            continue;
+        };
+        if source == target {
+            continue;
+        }
+        outgoing[source].push(target);
+        outgoing[target].push(source);
+    }
+
+    let mut indptr = Vec::with_capacity(node_count + 1);
+    let mut indices = Vec::new();
+    for mut neighbors in outgoing {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        indptr.push(indices.len() as u64);
+        indices.extend(neighbors.into_iter().map(|target| target as u64));
+    }
+    indptr.push(indices.len() as u64);
+
+    GraphCsr {
+        indptr,
+        indices,
+        edge_ids: None,
+    }
+}
+
+fn leiden_membership(node_count: usize, csr: &GraphCsr) -> Result<Vec<u64>, String> {
+    if node_count == 0 {
+        return Ok(Vec::new());
+    }
+    if csr.indices.is_empty() {
+        return Ok((0..node_count as u64).collect());
+    }
+
+    let graph = GraphR::from_csr(
+        node_count as u64,
+        false,
+        UInt64Array::from(csr.indices.clone()),
+        UInt64Array::from(csr.indptr.clone()),
+    )
+    .map_err(|e| format!("Failed to create Icebug CSR graph: {e}"))?;
+    let mut leiden = Leiden::new(&graph, 3, true, 1.0)
+        .map_err(|e| format!("Failed to create Leiden clustering: {e}"))?;
+    leiden.run().map_err(|e| format!("Leiden clustering failed: {e}"))?;
+    let partition = leiden
+        .partition()
+        .map_err(|e| format!("Failed to read Leiden partition: {e}"))?;
+    Ok(partition.membership)
+}
+
+fn remap_membership(membership: &[u64]) -> (Vec<u64>, HashMap<u64, u64>) {
+    let mut ids: Vec<u64> = membership.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let remap: HashMap<u64, u64> = ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| (id, index as u64))
+        .collect();
+    let mapped = membership
+        .iter()
+        .map(|id| *remap.get(id).unwrap_or(&0))
+        .collect();
+    (mapped, remap)
+}
+
+fn cluster_records(membership: &[u64], parent_membership: Option<&[u64]>) -> Vec<GraphCluster> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    let mut parents: HashMap<u64, u64> = HashMap::new();
+    for (index, cluster_id) in membership.iter().enumerate() {
+        *counts.entry(*cluster_id).or_insert(0) += 1;
+        if let Some(parent_ids) = parent_membership {
+            if let Some(parent_id) = parent_ids.get(index) {
+                parents.entry(*cluster_id).or_insert(*parent_id);
+            }
+        }
+    }
+
+    let mut clusters: Vec<GraphCluster> = counts
+        .into_iter()
+        .map(|(cluster_id, size)| GraphCluster {
+            cluster_id,
+            label: format!("Cluster {cluster_id}"),
+            size,
+            parent_cluster_id: parents.get(&cluster_id).copied(),
+        })
+        .collect();
+    clusters.sort_by_key(|cluster| cluster.cluster_id);
+    clusters
+}
+
+fn aggregate_cluster_edges(membership: &[u64], links: &[GraphLink], node_index: &HashMap<String, usize>) -> (usize, Vec<GraphLink>) {
+    let cluster_count = membership.iter().max().map(|id| *id as usize + 1).unwrap_or(0);
+    let mut seen = HashSet::new();
+    let mut links_out = Vec::new();
+
+    for link in links {
+        let Some(&source_index) = node_index.get(&link.source) else {
+            continue;
+        };
+        let Some(&target_index) = node_index.get(&link.target) else {
+            continue;
+        };
+        let source = membership[source_index];
+        let target = membership[target_index];
+        if source == target {
+            continue;
+        }
+        let key = if source < target { (source, target) } else { (target, source) };
+        if seen.insert(key) {
+            links_out.push(GraphLink {
+                source: key.0.to_string(),
+                target: key.1.to_string(),
+                label: "cluster".to_string(),
+            });
+        }
+    }
+
+    (cluster_count, links_out)
+}
+
+fn compute_cluster_levels(nodes: &[GraphNode], links: &[GraphLink]) -> Option<Vec<GraphClusterLevel>> {
+    let node_count = nodes.len();
+    if node_count < 2 || links.is_empty() {
+        return None;
+    }
+
+    let node_index: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.clone(), index))
+        .collect();
+
+    let csr = build_undirected_csr(node_count, links, &node_index);
+    let (level_zero, _) = remap_membership(&leiden_membership(node_count, &csr).ok()?);
+    let mut levels = Vec::new();
+    levels.push(GraphClusterLevel {
+        level: 0,
+        membership: level_zero.clone(),
+        clusters: cluster_records(&level_zero, None),
+    });
+
+    let mut node_membership = level_zero.clone();
+    let mut graph_membership = level_zero;
+    let mut current_links = links.to_vec();
+    let mut current_node_index = node_index;
+
+    for level in 1..CLUSTER_LEVEL_LIMIT {
+        let (cluster_count, aggregate_links) = aggregate_cluster_edges(&graph_membership, &current_links, &current_node_index);
+        if cluster_count < 2 || aggregate_links.is_empty() || cluster_count >= graph_membership.len() {
+            break;
+        }
+
+        let cluster_nodes: Vec<GraphNode> = (0..cluster_count)
+            .map(|index| GraphNode {
+                id: index.to_string(),
+                name: format!("Cluster {index}"),
+                label: "Cluster".to_string(),
+                table_id: None,
+                rowid: None,
+                community: Some(index as u64),
+                expansion_kind: None,
+                expand_node_id: None,
+                offset: None,
+                hidden_count: None,
+            })
+            .collect();
+        let cluster_node_index: HashMap<String, usize> = cluster_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.clone(), index))
+            .collect();
+        let cluster_csr = build_undirected_csr(cluster_count, &aggregate_links, &cluster_node_index);
+        let (cluster_membership, _) = remap_membership(&leiden_membership(cluster_count, &cluster_csr).ok()?);
+        let next_membership: Vec<u64> = node_membership
+            .iter()
+            .map(|cluster_id| cluster_membership[*cluster_id as usize])
+            .collect();
+
+        if next_membership == node_membership {
+            break;
+        }
+
+        if let Some(previous) = levels.last_mut() {
+            previous.clusters = cluster_records(&node_membership, Some(&next_membership));
+        }
+        levels.push(GraphClusterLevel {
+            level,
+            membership: next_membership.clone(),
+            clusters: cluster_records(&next_membership, None),
+        });
+
+        node_membership = next_membership;
+        graph_membership = cluster_membership;
+        current_links = aggregate_links;
+        current_node_index = cluster_node_index;
+    }
+
+    Some(levels)
+}
+
 fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
     let csr = Some(build_csr(&nodes, &links));
-    GraphData { nodes, links, csr }
+    let cluster_levels = compute_cluster_levels(&nodes, &links);
+    GraphData {
+        nodes,
+        links,
+        csr,
+        cluster_levels,
+    }
 }
 
 fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, String> {

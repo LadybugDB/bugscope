@@ -37,10 +37,24 @@ interface GraphCsr {
   edgeIds?: number[] | null
 }
 
+interface GraphCluster {
+  clusterId: number
+  label: string
+  size: number
+  parentClusterId?: number | null
+}
+
+interface GraphClusterLevel {
+  level: number
+  membership: number[]
+  clusters: GraphCluster[]
+}
+
 interface GraphData {
   nodes: GraphNode[]
   links: GraphLink[]
   csr?: GraphCsr
+  clusterLevels?: GraphClusterLevel[]
 }
 
 interface NormalizedGraphLink {
@@ -53,6 +67,7 @@ interface NormalizedGraphData {
   nodes: GraphNode[]
   links: NormalizedGraphLink[]
   csr?: GraphCsr
+  clusterLevels?: GraphClusterLevel[]
 }
 
 interface ForceGraphLink {
@@ -123,6 +138,7 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
       label: link.label,
     })),
     csr: graphData.csr,
+    clusterLevels: graphData.clusterLevels,
   }
 }
 
@@ -150,6 +166,89 @@ function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?
   return {
     nodes: [...nodesById.values()],
     links: [...linksByKey.values()],
+  }
+}
+
+function buildCommunityClusterLevels(graphData: NormalizedGraphData): GraphClusterLevel[] {
+  if (graphData.clusterLevels?.length) return graphData.clusterLevels
+
+  const communityIds = graphData.nodes.map(node => node.community)
+  if (communityIds.some(id => id === undefined)) return []
+
+  const counts = new Map<number, number>()
+  communityIds.forEach(id => {
+    if (id !== undefined) counts.set(id, (counts.get(id) || 0) + 1)
+  })
+
+  return [{
+    level: 0,
+    membership: communityIds.map(id => id ?? 0),
+    clusters: [...counts.entries()].map(([clusterId, size]) => ({
+      clusterId,
+      label: `Community ${clusterId}`,
+      size,
+    })),
+  }]
+}
+
+function collapseGraphByClusterLevel(graphData: NormalizedGraphData, level: GraphClusterLevel): NormalizedGraphData {
+  const clusterById = new Map(level.clusters.map(cluster => [cluster.clusterId, cluster]))
+  const clusterCounts = new Map<number, number>()
+
+  level.membership.forEach(clusterId => {
+    clusterCounts.set(clusterId, (clusterCounts.get(clusterId) || 0) + 1)
+  })
+
+  const nodes: GraphNode[] = [...clusterCounts.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([clusterId, size]) => {
+      const cluster = clusterById.get(clusterId)
+      return {
+        id: `__cluster__:${level.level}:${clusterId}`,
+        name: cluster?.label || `Cluster ${clusterId}`,
+        label: `Cluster L${level.level}`,
+        community: clusterId,
+        expansionKind: 'cluster',
+        hiddenCount: cluster?.size ?? size,
+      }
+    })
+
+  const clusterNodeId = new Map(nodes.map(node => [node.community ?? 0, node.id]))
+  const edgeCounts = new Map<string, { source: string; target: string; labels: Map<string, number>; count: number }>()
+  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
+
+  graphData.links.forEach(link => {
+    const sourceIndex = nodeIndex.get(link.source)
+    const targetIndex = nodeIndex.get(link.target)
+    if (sourceIndex === undefined || targetIndex === undefined) return
+
+    const sourceCluster = level.membership[sourceIndex]
+    const targetCluster = level.membership[targetIndex]
+    if (sourceCluster === targetCluster) return
+
+    const source = clusterNodeId.get(sourceCluster)
+    const target = clusterNodeId.get(targetCluster)
+    if (!source || !target) return
+
+    const key = `${source}\t${target}`
+    const record = edgeCounts.get(key) || { source, target, labels: new Map<string, number>(), count: 0 }
+    record.count += 1
+    record.labels.set(link.label, (record.labels.get(link.label) || 0) + 1)
+    edgeCounts.set(key, record)
+  })
+
+  const links = [...edgeCounts.values()].map(record => {
+    const label = record.count === 1
+      ? [...record.labels.keys()][0] || 'edge'
+      : `${record.count} edges`
+    return { source: record.source, target: record.target, label }
+  })
+
+  return {
+    nodes,
+    links,
+    csr: buildGraphCsr({ nodes, links }),
+    clusterLevels: graphData.clusterLevels,
   }
 }
 
@@ -524,6 +623,8 @@ function App() {
   const [isCustomQuery, setIsCustomQuery] = useState(false)
   const [queryActivated, setQueryActivated] = useState(false)
   const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
+  const [clusterCollapsed, setClusterCollapsed] = useState(false)
+  const [selectedClusterLevel, setSelectedClusterLevel] = useState(0)
   const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
@@ -705,20 +806,43 @@ function App() {
   }, [graphData, selectedId])
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
+  const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
+  const selectedCluster = useMemo(() => (
+    clusterLevels.find(level => level.level === selectedClusterLevel) || clusterLevels[0]
+  ), [clusterLevels, selectedClusterLevel])
+  const visibleGraphData = useMemo(() => (
+    clusterCollapsed && selectedCluster
+      ? collapseGraphByClusterLevel(normalizedGraphData, selectedCluster)
+      : normalizedGraphData
+  ), [clusterCollapsed, normalizedGraphData, selectedCluster])
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (!selectedCluster) {
+      setClusterCollapsed(false)
+      setSelectedClusterLevel(0)
+      return
+    }
+    if (!clusterLevels.some(level => level.level === selectedClusterLevel)) {
+      setSelectedClusterLevel(selectedCluster.level)
+    }
+  }, [clusterLevels, selectedCluster, selectedClusterLevel])
+  /* eslint-enable react-hooks/set-state-in-effect */
+
   const forceGraphData = useMemo<ForceGraphData<GraphNode, ForceGraphLink>>(() => ({
-    nodes: normalizedGraphData.nodes.map(node => ({ ...node })),
-    links: normalizedGraphData.links.map(link => ({ ...link })),
-  }), [normalizedGraphData])
+    nodes: visibleGraphData.nodes.map(node => ({ ...node })),
+    links: visibleGraphData.links.map(link => ({ ...link })),
+  }), [visibleGraphData])
 
   const nodeDegree = useMemo(() => {
     const degrees: Record<string, number> = {}
-    normalizedGraphData.nodes.forEach(n => degrees[n.id] = 0)
-    normalizedGraphData.links.forEach(link => {
+    visibleGraphData.nodes.forEach(n => degrees[n.id] = 0)
+    visibleGraphData.links.forEach(link => {
       degrees[link.source] = (degrees[link.source] || 0) + 1
       degrees[link.target] = (degrees[link.target] || 0) + 1
     })
     return degrees
-  }, [normalizedGraphData])
+  }, [visibleGraphData])
 
   const maxDegree = useMemo(() => Math.max(1, ...Object.values(nodeDegree)), [nodeDegree])
 
@@ -726,14 +850,14 @@ function App() {
     return new Set(
       [
         ...lastExpandedNodeIds,
-        ...[...normalizedGraphData.nodes]
+        ...[...visibleGraphData.nodes]
         .sort((a, b) => (nodeDegree[b.id] || 0) - (nodeDegree[a.id] || 0))
         .filter(node => !isExpanderNode(node))
         .slice(0, 5)
         .map(node => node.id),
       ]
     )
-  }, [lastExpandedNodeIds, normalizedGraphData.nodes, nodeDegree])
+  }, [lastExpandedNodeIds, visibleGraphData.nodes, nodeDegree])
 
   const getNodeColor = useCallback((node: GraphNode) => {
     const key = node.community === undefined ? node.label : `community:${node.community}`
@@ -754,8 +878,17 @@ function App() {
 
   const getNodeSize = useCallback((node: GraphNode) => {
     const degree = nodeDegree[node.id] || 0
-    return 4 + (degree / maxDegree) * 12
+    const clusterBoost = node.expansionKind === 'cluster' ? Math.min(10, Math.sqrt(node.hiddenCount || 1)) : 0
+    return 4 + clusterBoost + (degree / maxDegree) * 12
   }, [nodeDegree, maxDegree])
+
+  const handleVisibleNodeClick = useCallback((nodeId: string) => {
+    if (nodeId.startsWith('__cluster__:')) {
+      setClusterCollapsed(false)
+      return
+    }
+    handleNodeClick(nodeId)
+  }, [handleNodeClick])
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
@@ -839,12 +972,36 @@ function App() {
         <div className="header">
           <div className="header-left">
             <span className="graph-stats">
-              {loading ? 'Loading...' : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
+              {loading
+                ? 'Loading...'
+                : clusterCollapsed && selectedCluster
+                  ? `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
+                  : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
             {error && <span className="error-message">{error}</span>}
           </div>
 
           <div className="header-right">
+            {clusterLevels.length > 0 && (
+              <div className="cluster-controls" aria-label="Clusters">
+                <select
+                  value={selectedCluster?.level ?? 0}
+                  onChange={event => setSelectedClusterLevel(Number(event.target.value))}
+                >
+                  {clusterLevels.map(level => (
+                    <option key={level.level} value={level.level}>
+                      Level {level.level}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className={clusterCollapsed ? 'active' : ''}
+                  onClick={() => setClusterCollapsed(value => !value)}
+                >
+                  {clusterCollapsed ? 'Expand' : 'Collapse'}
+                </button>
+              </div>
+            )}
             <div className="renderer-toggle" aria-label="Renderer">
               <button
                 className={renderer === 'sigma' ? 'active' : ''}
@@ -872,13 +1029,13 @@ function App() {
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'sigma' && (
             <SigmaGraphView
               key="sigma"
-              graphData={normalizedGraphData}
+              graphData={visibleGraphData}
               labelNodeIds={topLabelNodeIds}
               newlyExpandedNodeIds={lastExpandedNodeIds}
               darkMode={darkMode}
               getNodeColor={getNodeColor}
               getEdgeColor={getEdgeColor}
-              onNodeClick={handleNodeClick}
+              onNodeClick={handleVisibleNodeClick}
             />
           )}
           {!loading && !error && graphData.nodes.length > 0 && renderer === 'force' && (
@@ -889,7 +1046,7 @@ function App() {
               height={graphSize.height}
               graphData={forceGraphData}
               nodeCanvasObject={paintNode}
-              onNodeClick={(node) => handleNodeClick(String(node.id))}
+              onNodeClick={(node) => handleVisibleNodeClick(String(node.id))}
               nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
               nodeRelSize={1}
               nodeLabel={(node) => `${node.label}: ${node.name}`}

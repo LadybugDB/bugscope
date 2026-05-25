@@ -127,6 +127,51 @@ body {
   gap: 12px;
 }
 
+.cluster-controls {
+  display: inline-flex;
+  align-items: center;
+  height: 34px;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.cluster-controls select {
+  height: 100%;
+  min-width: 92px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text-primary);
+  border: 0;
+  border-right: 1px solid var(--border-color);
+  font-size: 14px;
+}
+
+.cluster-controls select:focus {
+  outline: none;
+}
+
+.cluster-controls button {
+  min-width: 76px;
+  height: 100%;
+  padding: 0 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 0;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.cluster-controls button.active {
+  background-color: var(--accent-color);
+  color: white;
+}
+
+.cluster-controls button:hover:not(.active) {
+  color: var(--text-primary);
+}
+
 .renderer-toggle {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
