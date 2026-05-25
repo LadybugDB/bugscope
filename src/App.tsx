@@ -50,11 +50,23 @@ interface GraphClusterLevel {
   clusters: GraphCluster[]
 }
 
+interface GraphClusterDebug {
+  enabled: boolean
+  status: string
+  message: string
+  nodeCount: number
+  edgeCount: number
+  undirectedEdgeCount: number
+  levels: number
+  clusters: number
+}
+
 interface GraphData {
   nodes: GraphNode[]
   links: GraphLink[]
   csr?: GraphCsr
   clusterLevels?: GraphClusterLevel[]
+  clusterDebug?: GraphClusterDebug
 }
 
 interface NormalizedGraphLink {
@@ -68,6 +80,7 @@ interface NormalizedGraphData {
   links: NormalizedGraphLink[]
   csr?: GraphCsr
   clusterLevels?: GraphClusterLevel[]
+  clusterDebug?: GraphClusterDebug
 }
 
 interface ForceGraphLink {
@@ -139,6 +152,7 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
     })),
     csr: graphData.csr,
     clusterLevels: graphData.clusterLevels,
+    clusterDebug: graphData.clusterDebug,
   }
 }
 
@@ -166,6 +180,7 @@ function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?
   return {
     nodes: [...nodesById.values()],
     links: [...linksByKey.values()],
+    clusterDebug: incoming.clusterDebug || current.clusterDebug,
   }
 }
 
@@ -249,6 +264,7 @@ function collapseGraphByClusterLevel(graphData: NormalizedGraphData, level: Grap
     links,
     csr: buildGraphCsr({ nodes, links }),
     clusterLevels: graphData.clusterLevels,
+    clusterDebug: graphData.clusterDebug,
   }
 }
 
@@ -710,6 +726,7 @@ function App() {
     if (query) {
       invoke<GraphData>('execute_query', { id: selectedId, query })
         .then(data => {
+          console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
           setLoading(false)
@@ -726,6 +743,7 @@ function App() {
     } else {
       invoke<GraphData>('get_graph', { id: selectedId })
         .then(data => {
+          console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
           setLoading(false)
@@ -807,6 +825,10 @@ function App() {
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
   const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
+  const clusterDebug = normalizedGraphData.clusterDebug
+  const clusterDebugText = clusterDebug
+    ? clusterDebug.message
+    : 'Cluster status unavailable: backend did not return cluster diagnostics.'
   const selectedCluster = useMemo(() => (
     clusterLevels.find(level => level.level === selectedClusterLevel) || clusterLevels[0]
   ), [clusterLevels, selectedClusterLevel])
@@ -978,6 +1000,14 @@ function App() {
                   ? `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
                   : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
+            {!loading && (
+              <span
+                className={`cluster-debug cluster-debug-${clusterDebug?.status || 'unknown'}`}
+                title={clusterDebugText}
+              >
+                {clusterDebugText}
+              </span>
+            )}
             {error && <span className="error-message">{error}</span>}
           </div>
 

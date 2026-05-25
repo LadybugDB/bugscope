@@ -74,6 +74,21 @@ struct GraphClusterLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphClusterDebug {
+    enabled: bool,
+    status: String,
+    message: String,
+    #[serde(rename = "nodeCount")]
+    node_count: usize,
+    #[serde(rename = "edgeCount")]
+    edge_count: usize,
+    #[serde(rename = "undirectedEdgeCount")]
+    undirected_edge_count: usize,
+    levels: usize,
+    clusters: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GraphData {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
@@ -81,6 +96,8 @@ struct GraphData {
     csr: Option<GraphCsr>,
     #[serde(rename = "clusterLevels", skip_serializing_if = "Option::is_none")]
     cluster_levels: Option<Vec<GraphClusterLevel>>,
+    #[serde(rename = "clusterDebug")]
+    cluster_debug: GraphClusterDebug,
 }
 
 const SEED_NODE_COUNT: usize = 8;
@@ -423,14 +440,63 @@ fn aggregate_cluster_edges(
     (cluster_count, links_out)
 }
 
+fn cluster_debug(
+    enabled: bool,
+    status: &str,
+    message: String,
+    node_count: usize,
+    edge_count: usize,
+    undirected_edge_count: usize,
+    levels: usize,
+    clusters: usize,
+) -> GraphClusterDebug {
+    GraphClusterDebug {
+        enabled,
+        status: status.to_string(),
+        message,
+        node_count,
+        edge_count,
+        undirected_edge_count,
+        levels,
+        clusters,
+    }
+}
+
 #[cfg(feature = "icebug-analytics")]
 fn compute_cluster_levels(
     nodes: &[GraphNode],
     links: &[GraphLink],
-) -> Option<Vec<GraphClusterLevel>> {
+) -> (Option<Vec<GraphClusterLevel>>, GraphClusterDebug) {
     let node_count = nodes.len();
-    if node_count < 2 || links.is_empty() {
-        return None;
+    if node_count < 2 {
+        return (
+            None,
+            cluster_debug(
+                true,
+                "skipped",
+                "Leiden skipped: fewer than two visible nodes.".to_string(),
+                node_count,
+                links.len(),
+                0,
+                0,
+                0,
+            ),
+        );
+    }
+    if links.is_empty() {
+        return (
+            None,
+            cluster_debug(
+                true,
+                "skipped",
+                "Leiden skipped: the visible graph has no relationships.".to_string(),
+                node_count,
+                links.len(),
+                0,
+                0,
+                0,
+            ),
+        );
     }
 
     let node_index: HashMap<String, usize> = nodes
@@ -440,7 +506,43 @@ fn compute_cluster_levels(
         .collect();
 
     let csr = build_undirected_csr(node_count, links, &node_index);
-    let (level_zero, _) = remap_membership(&leiden_membership(node_count, &csr).ok()?);
+    let undirected_edge_count = csr.indices.len() / 2;
+    if csr.indices.is_empty() {
+        return (
+            None,
+            cluster_debug(
+                true,
+                "skipped",
+                "Leiden skipped: relationships did not connect visible nodes after filtering."
+                    .to_string(),
+                node_count,
+                links.len(),
+                undirected_edge_count,
+                0,
+                0,
+            ),
+        );
+    }
+
+    let level_zero_raw = match leiden_membership(node_count, &csr) {
+        Ok(membership) => membership,
+        Err(err) => {
+            return (
+                None,
+                cluster_debug(
+                    true,
+                    "error",
+                    format!("Leiden failed: {err}"),
+                    node_count,
+                    links.len(),
+                    undirected_edge_count,
+                    0,
+                    0,
+                ),
+            );
+        }
+    };
+    let (level_zero, _) = remap_membership(&level_zero_raw);
     let mut levels = Vec::new();
     levels.push(GraphClusterLevel {
         level: 0,
@@ -484,8 +586,14 @@ fn compute_cluster_levels(
             .collect();
         let cluster_csr =
             build_undirected_csr(cluster_count, &aggregate_links, &cluster_node_index);
-        let (cluster_membership, _) =
-            remap_membership(&leiden_membership(cluster_count, &cluster_csr).ok()?);
+        let cluster_membership_raw = match leiden_membership(cluster_count, &cluster_csr) {
+            Ok(membership) => membership,
+            Err(err) => {
+                eprintln!("Stopping hierarchical Leiden at level {level}: {err}");
+                break;
+            }
+        };
+        let (cluster_membership, _) = remap_membership(&cluster_membership_raw);
         let next_membership: Vec<u64> = node_membership
             .iter()
             .map(|cluster_id| cluster_membership[*cluster_id as usize])
@@ -510,25 +618,61 @@ fn compute_cluster_levels(
         current_node_index = cluster_node_index;
     }
 
-    Some(levels)
+    let level_count = levels.len();
+    let cluster_count = levels
+        .first()
+        .map(|level| level.clusters.len())
+        .unwrap_or_default();
+    let message = format!(
+        "Leiden produced {level_count} level(s), with {cluster_count} cluster(s) at level 0 from {node_count} visible node(s), {edge_count} directed edge(s), {undirected_edge_count} undirected edge(s).",
+        edge_count = links.len(),
+    );
+
+    (
+        Some(levels),
+        cluster_debug(
+            true,
+            "ready",
+            message,
+            node_count,
+            links.len(),
+            undirected_edge_count,
+            level_count,
+            cluster_count,
+        ),
+    )
 }
 
 #[cfg(not(feature = "icebug-analytics"))]
 fn compute_cluster_levels(
     _nodes: &[GraphNode],
-    _links: &[GraphLink],
-) -> Option<Vec<GraphClusterLevel>> {
-    None
+    links: &[GraphLink],
+) -> (Option<Vec<GraphClusterLevel>>, GraphClusterDebug) {
+    (
+        None,
+        cluster_debug(
+            false,
+            "disabled",
+            "Leiden disabled: run with `cargo tauri dev --features icebug-analytics`.".to_string(),
+            _nodes.len(),
+            links.len(),
+            0,
+            0,
+            0,
+        ),
+    )
 }
 
 fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
     let csr = Some(build_csr(&nodes, &links));
-    let cluster_levels = compute_cluster_levels(&nodes, &links);
+    let (cluster_levels, cluster_debug) = compute_cluster_levels(&nodes, &links);
+    eprintln!("Cluster debug: {}", cluster_debug.message);
     GraphData {
         nodes,
         links,
         csr,
         cluster_levels,
+        cluster_debug,
     }
 }
 
