@@ -206,7 +206,8 @@ function collapseGraphByClusterLevel(
   const clusterCounts = new Map<number, number>()
   const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
 
-  level.membership.forEach(clusterId => {
+  level.membership.forEach((clusterId, index) => {
+    if (isExpanderNode(graphData.nodes[index])) return
     clusterCounts.set(clusterId, (clusterCounts.get(clusterId) || 0) + 1)
   })
 
@@ -227,10 +228,19 @@ function collapseGraphByClusterLevel(
 
   const expandedNodes = expandedClusterId === null
     ? []
-    : graphData.nodes.filter((_, index) => level.membership[index] === expandedClusterId)
-  const nodes = [...collapsedNodes, ...expandedNodes]
+    : graphData.nodes.filter((node, index) => (
+      !isExpanderNode(node) && level.membership[index] === expandedClusterId
+    ))
+  const expanderNodes = graphData.nodes.filter(isExpanderNode)
+  const nodes = [...collapsedNodes, ...expandedNodes, ...expanderNodes]
   const visibleNodeIds = new Set(nodes.map(node => node.id))
   const edgeCounts = new Map<string, { source: string; target: string; labels: Map<string, number>; count: number }>()
+
+  const projectEndpoint = (nodeId: string, nodeIndexValue: number, clusterId: number) => {
+    const node = graphData.nodes[nodeIndexValue]
+    if (isExpanderNode(node) || clusterId === expandedClusterId) return nodeId
+    return getClusterNodeId(level.level, clusterId)
+  }
 
   graphData.links.forEach(link => {
     const sourceIndex = nodeIndex.get(link.source)
@@ -240,12 +250,8 @@ function collapseGraphByClusterLevel(
     const sourceCluster = level.membership[sourceIndex]
     const targetCluster = level.membership[targetIndex]
 
-    const source = sourceCluster === expandedClusterId
-      ? link.source
-      : getClusterNodeId(level.level, sourceCluster)
-    const target = targetCluster === expandedClusterId
-      ? link.target
-      : getClusterNodeId(level.level, targetCluster)
+    const source = projectEndpoint(link.source, sourceIndex, sourceCluster)
+    const target = projectEndpoint(link.target, targetIndex, targetCluster)
     if (source === target || !visibleNodeIds.has(source) || !visibleNodeIds.has(target)) return
 
     const key = `${source}\t${target}`
