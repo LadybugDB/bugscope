@@ -21,6 +21,12 @@ struct GraphNode {
     id: String,
     name: String,
     label: String,
+    #[serde(rename = "tableId", skip_serializing_if = "Option::is_none")]
+    table_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rowid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community: Option<u64>,
     #[serde(rename = "expansionKind", skip_serializing_if = "Option::is_none")]
     expansion_kind: Option<String>,
     #[serde(rename = "expandNodeId", skip_serializing_if = "Option::is_none")]
@@ -39,9 +45,19 @@ struct GraphLink {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphCsr {
+    indptr: Vec<u64>,
+    indices: Vec<u64>,
+    #[serde(rename = "edgeIds")]
+    edge_ids: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GraphData {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    csr: Option<GraphCsr>,
 }
 
 const SEED_NODE_COUNT: usize = 8;
@@ -168,6 +184,9 @@ fn make_expander_node(parent_id: &str, hidden_count: usize, offset: usize) -> Gr
         id: format!("{EXPANDER_PREFIX}node:{parent_id}:{offset}"),
         name: format!("+{hidden_count}"),
         label: "More".to_string(),
+        table_id: None,
+        rowid: None,
+        community: None,
         expansion_kind: Some("node".to_string()),
         expand_node_id: Some(parent_id.to_string()),
         offset: Some(offset),
@@ -184,6 +203,49 @@ fn merge_link(links: &mut Vec<GraphLink>, seen: &mut HashSet<(String, String, St
     if seen.insert(key) {
         links.push(link);
     }
+}
+
+fn build_csr(nodes: &[GraphNode], links: &[GraphLink]) -> GraphCsr {
+    let node_index: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let mut outgoing: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nodes.len()];
+
+    for (edge_index, link) in links.iter().enumerate() {
+        let Some(&source) = node_index.get(link.source.as_str()) else {
+            continue;
+        };
+        let Some(&target) = node_index.get(link.target.as_str()) else {
+            continue;
+        };
+        outgoing[source].push((target, edge_index));
+    }
+
+    let mut indptr = Vec::with_capacity(nodes.len() + 1);
+    let mut indices = Vec::new();
+    let mut edge_ids = Vec::new();
+
+    for neighbors in outgoing {
+        indptr.push(indices.len() as u64);
+        for (target, edge_index) in neighbors {
+            indices.push(target as u64);
+            edge_ids.push(edge_index as u64);
+        }
+    }
+    indptr.push(indices.len() as u64);
+
+    GraphCsr {
+        indptr,
+        indices,
+        edge_ids: Some(edge_ids),
+    }
+}
+
+fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
+    let csr = Some(build_csr(&nodes, &links));
+    GraphData { nodes, links, csr }
 }
 
 fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, String> {
@@ -223,6 +285,9 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
                     id: id_to_string(node_val.get_node_id()),
                     name,
                     label: node_val.get_label_name().clone(),
+                    table_id: Some(node_val.get_node_id().table_id),
+                    rowid: Some(node_val.get_node_id().offset),
+                    community: None,
                     expansion_kind: None,
                     expand_node_id: None,
                     offset: None,
@@ -241,10 +306,7 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         );
     }
 
-    Ok(GraphData {
-        nodes: nodes.into_values().collect(),
-        links,
-    })
+    Ok(graph_data(nodes.into_values().collect(), links))
 }
 
 fn add_expanders(graph: &GraphData, visible_ids: &HashSet<String>, nodes: &mut Vec<GraphNode>, links: &mut Vec<GraphLink>) {
@@ -315,7 +377,7 @@ fn seed_graph_from_full(full_graph: GraphData) -> GraphData {
         .collect();
 
     add_expanders(&full_graph, &visible_ids, &mut nodes, &mut links);
-    GraphData { nodes, links }
+    graph_data(nodes, links)
 }
 
 fn expand_node_from_full(full_graph: GraphData, node_id: &str, visible_node_ids: &[String], offset: usize) -> GraphData {
@@ -387,7 +449,7 @@ fn expand_node_from_full(full_graph: GraphData, node_id: &str, visible_node_ids:
         nodes.push(expander);
     }
 
-    GraphData { nodes, links }
+    graph_data(nodes, links)
 }
 
 #[tauri::command]
@@ -566,6 +628,9 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
                             id: node_id,
                             name,
                             label,
+                            table_id: Some(node_val.get_node_id().table_id),
+                            rowid: Some(node_val.get_node_id().offset),
+                            community: None,
                             expansion_kind: None,
                             expand_node_id: None,
                             offset: None,
@@ -595,7 +660,7 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
         .filter(|link| node_id_set.contains(&link.source) && node_id_set.contains(&link.target))
         .collect();
 
-    Ok(GraphData { nodes, links })
+    Ok(graph_data(nodes, links))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
 import type { GraphData as ForceGraphData, NodeObject } from 'react-force-graph-2d'
-import { Sigma } from './vendor/sigma-runtime.js'
+import { IcebugSigmaGraph, Sigma } from './vendor/sigma-runtime.js'
 import './App.css'
 
 interface Database {
@@ -16,6 +16,9 @@ interface GraphNode {
   id: string
   name: string
   label: string
+  tableId?: number
+  rowid?: number
+  community?: number
   expansionKind?: 'node' | 'cluster'
   expandNodeId?: string
   offset?: number
@@ -28,9 +31,16 @@ interface GraphLink {
   label: string
 }
 
+interface GraphCsr {
+  indptr: number[]
+  indices: number[]
+  edgeIds?: number[] | null
+}
+
 interface GraphData {
   nodes: GraphNode[]
   links: GraphLink[]
+  csr?: GraphCsr
 }
 
 interface NormalizedGraphLink {
@@ -42,6 +52,7 @@ interface NormalizedGraphLink {
 interface NormalizedGraphData {
   nodes: GraphNode[]
   links: NormalizedGraphLink[]
+  csr?: GraphCsr
 }
 
 interface ForceGraphLink {
@@ -71,7 +82,7 @@ interface SigmaGraphViewProps {
   labelNodeIds: Set<string>
   newlyExpandedNodeIds: Set<string>
   darkMode: boolean
-  getNodeColor: (label: string) => string
+  getNodeColor: (node: GraphNode) => string
   getEdgeColor: (label: string) => string
   onNodeClick: (nodeId: string) => void
 }
@@ -99,76 +110,6 @@ interface SigmaEdgeLabelNodeData {
   size: number
 }
 
-class SigmaGraph<
-  N extends Record<string, unknown> = Record<string, unknown>,
-  E extends Record<string, unknown> = Record<string, unknown>,
-> {
-  private nodeAttributes = new Map<string, N>()
-  private edgeRecords = new Map<string, { source: string; target: string; attributes: E }>()
-
-  get order() {
-    return this.nodeAttributes.size
-  }
-
-  addNode(key: string, attributes = {} as N): void {
-    if (this.nodeAttributes.has(key)) throw new Error(`SigmaGraph: node "${key}" already exists.`)
-    this.nodeAttributes.set(key, attributes)
-  }
-
-  addEdge(key: string, source: string, target: string, attributes = {} as E): void {
-    if (this.edgeRecords.has(key)) throw new Error(`SigmaGraph: edge "${key}" already exists.`)
-    if (!this.nodeAttributes.has(source)) this.addNode(source)
-    if (!this.nodeAttributes.has(target)) this.addNode(target)
-    this.edgeRecords.set(key, { source, target, attributes })
-  }
-
-  hasNode(key: string): boolean {
-    return this.nodeAttributes.has(key)
-  }
-
-  hasEdge(key: string): boolean {
-    return this.edgeRecords.has(key)
-  }
-
-  nodes(): string[] {
-    return [...this.nodeAttributes.keys()]
-  }
-
-  edges(): string[] {
-    return [...this.edgeRecords.keys()]
-  }
-
-  forEachNode(callback: (key: string, attributes: N) => void): void {
-    this.nodeAttributes.forEach((attributes, key) => callback(key, attributes))
-  }
-
-  forEachEdge(callback: (key: string, attributes: E) => void): void {
-    this.edgeRecords.forEach(({ attributes }, key) => callback(key, attributes))
-  }
-
-  getNodeAttributes(key: string): N {
-    const attributes = this.nodeAttributes.get(key)
-    if (!attributes) throw new Error(`SigmaGraph: node "${key}" not found.`)
-    return attributes
-  }
-
-  getEdgeAttributes(key: string): E {
-    const record = this.edgeRecords.get(key)
-    if (!record) throw new Error(`SigmaGraph: edge "${key}" not found.`)
-    return record.attributes
-  }
-
-  extremities(key: string): [string, string] {
-    const record = this.edgeRecords.get(key)
-    if (!record) throw new Error(`SigmaGraph: edge "${key}" not found.`)
-    return [record.source, record.target]
-  }
-
-  on(): void {}
-
-  removeListener(): void {}
-}
-
 function getEndpointId(endpoint: string | NodeObject): string {
   return typeof endpoint === 'object' ? String(endpoint.id) : endpoint
 }
@@ -181,6 +122,7 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
       target: getEndpointId(link.target),
       label: link.label,
     })),
+    csr: graphData.csr,
   }
 }
 
@@ -209,6 +151,41 @@ function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?
     nodes: [...nodesById.values()],
     links: [...linksByKey.values()],
   }
+}
+
+function buildGraphCsr(graphData: NormalizedGraphData): GraphCsr {
+  if (
+    graphData.csr &&
+    graphData.csr.indptr.length === graphData.nodes.length + 1 &&
+    graphData.csr.indices.length === graphData.links.length
+  ) {
+    return graphData.csr
+  }
+
+  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
+  const outgoing: Array<Array<{ target: number; edgeIndex: number }>> = Array.from({ length: graphData.nodes.length }, () => [])
+
+  graphData.links.forEach((link, edgeIndex) => {
+    const sourceIndex = nodeIndex.get(link.source)
+    const targetIndex = nodeIndex.get(link.target)
+    if (sourceIndex === undefined || targetIndex === undefined) return
+    outgoing[sourceIndex].push({ target: targetIndex, edgeIndex })
+  })
+
+  const indptr: number[] = []
+  const indices: number[] = []
+  const edgeIds: number[] = []
+
+  outgoing.forEach(neighbors => {
+    indptr.push(indices.length)
+    neighbors.forEach(({ target, edgeIndex }) => {
+      indices.push(target)
+      edgeIds.push(edgeIndex)
+    })
+  })
+  indptr.push(indices.length)
+
+  return { indptr, indices, edgeIds }
 }
 
 function realNodeIds(nodes: GraphNode[]): Set<string> {
@@ -399,40 +376,53 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
   const graph = useMemo(() => {
     const { degrees, positions } = createInitialLayout(graphData)
     const maxDegree = Math.max(1, ...Object.values(degrees))
-    const sigmaGraph = new SigmaGraph<SigmaNodeAttributes, SigmaEdgeAttributes>()
-
-    graphData.nodes.forEach(node => {
+    const nodes = graphData.nodes.map(node => {
       const position = positions[node.id] || { x: 0, y: 0 }
       const degree = degrees[node.id] || 0
-      sigmaGraph.addNode(node.id, {
-        x: position.x,
-        y: position.y,
-        size: 4 + (degree / maxDegree) * 14,
-        color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label),
-        label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
-        hoverLabel: node.name || node.id,
-        isNewlyExpanded: newlyExpandedNodeIds.has(node.id),
-        nodeType: node.label,
-      })
+      return {
+        key: node.id,
+        attributes: {
+          x: position.x,
+          y: position.y,
+          size: 4 + (degree / maxDegree) * 14,
+          color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node),
+          label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
+          hoverLabel: node.name || node.id,
+          isNewlyExpanded: newlyExpandedNodeIds.has(node.id),
+          nodeType: node.label,
+        },
+      }
     })
 
     const edgeCounts = new Map<string, number>()
-    graphData.links.forEach((link, index) => {
-      if (!sigmaGraph.hasNode(link.source) || !sigmaGraph.hasNode(link.target)) return
-      const pairKey = `${link.source}->${link.target}`
-      const pairIndex = edgeCounts.get(pairKey) || 0
-      edgeCounts.set(pairKey, pairIndex + 1)
-      const edgeKey = `${pairKey}#${pairIndex}-${index}`
+    const edgeAttributes: SigmaEdgeAttributes[] = graphData.links.map(link => {
       const edgeLabel = link.label === 'more' ? '' : link.label || ''
-      sigmaGraph.addEdge(edgeKey, link.source, link.target, {
+      return {
         size: 1.8,
         color: getEdgeColor(link.label || 'edge'),
         label: edgeLabel,
         forceLabel: Boolean(edgeLabel),
-      })
+      }
     })
+    const edgeKeys: string[] = graphData.links.map((link, index) => {
+      const pairKey = `${link.source}->${link.target}`
+      const pairIndex = edgeCounts.get(pairKey) || 0
+      edgeCounts.set(pairKey, pairIndex + 1)
+      return `${pairKey}#${pairIndex}-${index}`
+    })
+    const csr = buildGraphCsr(graphData)
 
-    return sigmaGraph
+    return new IcebugSigmaGraph<SigmaNodeAttributes, SigmaEdgeAttributes>({
+      directed: true,
+      nodes,
+      csr: {
+        indptr: new BigUint64Array(csr.indptr.map(BigInt)),
+        indices: new BigUint64Array(csr.indices.map(BigInt)),
+        edgeIds: csr.edgeIds ? new BigUint64Array(csr.edgeIds.map(BigInt)) : null,
+      },
+      edgeAttributes,
+      edgeKeys,
+    })
   }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeColor, getEdgeColor])
 
   useEffect(() => {
@@ -745,12 +735,13 @@ function App() {
     )
   }, [lastExpandedNodeIds, normalizedGraphData.nodes, nodeDegree])
 
-  const getNodeColor = useCallback((label: string) => {
-    if (!colorMapRef.current[label]) {
+  const getNodeColor = useCallback((node: GraphNode) => {
+    const key = node.community === undefined ? node.label : `community:${node.community}`
+    if (!colorMapRef.current[key]) {
       const colors = ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab']
-      colorMapRef.current[label] = colors[Object.keys(colorMapRef.current).length % colors.length]
+      colorMapRef.current[key] = colors[Object.keys(colorMapRef.current).length % colors.length]
     }
-    return colorMapRef.current[label]
+    return colorMapRef.current[key]
   }, [])
 
   const getEdgeColor = useCallback((label: string) => {
@@ -769,7 +760,7 @@ function App() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
     const size = getNodeSize(node)
-    const color = isExpanderNode(node) ? '#f59e0b' : getNodeColor(node.label)
+    const color = isExpanderNode(node) ? '#f59e0b' : getNodeColor(node)
     const highlighted = lastExpandedNodeIds.has(node.id)
 
     if (highlighted) {
