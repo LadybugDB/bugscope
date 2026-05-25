@@ -10,12 +10,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+icebug-analytics = ["dep:arrow-array", "dep:icebug"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lbug = { git = "https://github.com/LadybugDB/ladybug-rust", features = ["arrow"] }
-icebug = { git = "https://github.com/Ladybug-Memory/icebug-rust" }
-arrow-array = "56"
+icebug = { git = "https://github.com/Ladybug-Memory/icebug-rust", optional = true }
+arrow-array = { version = "56", optional = true }
 walkdir = "2"
 dirs = "5"

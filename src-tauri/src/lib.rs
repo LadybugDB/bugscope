@@ -1,4 +1,6 @@
+#[cfg(feature = "icebug-analytics")]
 use arrow_array::UInt64Array;
+#[cfg(feature = "icebug-analytics")]
 use icebug::{GraphR, Leiden};
 use lbug::{Connection, Database, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
@@ -84,6 +86,7 @@ struct GraphData {
 const SEED_NODE_COUNT: usize = 8;
 const EXPAND_BATCH_SIZE: usize = 8;
 const EDGE_SCAN_LIMIT: usize = 10_000;
+#[cfg(feature = "icebug-analytics")]
 const CLUSTER_LEVEL_LIMIT: usize = 3;
 const EXPANDER_PREFIX: &str = "__expand__:";
 
@@ -220,7 +223,11 @@ fn merge_node(nodes: &mut HashMap<String, GraphNode>, node: GraphNode) {
     nodes.entry(node.id.clone()).or_insert(node);
 }
 
-fn merge_link(links: &mut Vec<GraphLink>, seen: &mut HashSet<(String, String, String)>, link: GraphLink) {
+fn merge_link(
+    links: &mut Vec<GraphLink>,
+    seen: &mut HashSet<(String, String, String)>,
+    link: GraphLink,
+) {
     let key = (link.source.clone(), link.target.clone(), link.label.clone());
     if seen.insert(key) {
         links.push(link);
@@ -265,7 +272,12 @@ fn build_csr(nodes: &[GraphNode], links: &[GraphLink]) -> GraphCsr {
     }
 }
 
-fn build_undirected_csr(node_count: usize, links: &[GraphLink], node_index: &HashMap<String, usize>) -> GraphCsr {
+#[cfg(feature = "icebug-analytics")]
+fn build_undirected_csr(
+    node_count: usize,
+    links: &[GraphLink],
+    node_index: &HashMap<String, usize>,
+) -> GraphCsr {
     let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); node_count];
     for link in links {
         let Some(&source) = node_index.get(&link.source) else {
@@ -298,6 +310,7 @@ fn build_undirected_csr(node_count: usize, links: &[GraphLink], node_index: &Has
     }
 }
 
+#[cfg(feature = "icebug-analytics")]
 fn leiden_membership(node_count: usize, csr: &GraphCsr) -> Result<Vec<u64>, String> {
     if node_count == 0 {
         return Ok(Vec::new());
@@ -315,13 +328,16 @@ fn leiden_membership(node_count: usize, csr: &GraphCsr) -> Result<Vec<u64>, Stri
     .map_err(|e| format!("Failed to create Icebug CSR graph: {e}"))?;
     let mut leiden = Leiden::new(&graph, 3, true, 1.0)
         .map_err(|e| format!("Failed to create Leiden clustering: {e}"))?;
-    leiden.run().map_err(|e| format!("Leiden clustering failed: {e}"))?;
+    leiden
+        .run()
+        .map_err(|e| format!("Leiden clustering failed: {e}"))?;
     let partition = leiden
         .partition()
         .map_err(|e| format!("Failed to read Leiden partition: {e}"))?;
     Ok(partition.membership)
 }
 
+#[cfg(feature = "icebug-analytics")]
 fn remap_membership(membership: &[u64]) -> (Vec<u64>, HashMap<u64, u64>) {
     let mut ids: Vec<u64> = membership.to_vec();
     ids.sort_unstable();
@@ -338,6 +354,7 @@ fn remap_membership(membership: &[u64]) -> (Vec<u64>, HashMap<u64, u64>) {
     (mapped, remap)
 }
 
+#[cfg(feature = "icebug-analytics")]
 fn cluster_records(membership: &[u64], parent_membership: Option<&[u64]>) -> Vec<GraphCluster> {
     let mut counts: HashMap<u64, usize> = HashMap::new();
     let mut parents: HashMap<u64, u64> = HashMap::new();
@@ -363,8 +380,17 @@ fn cluster_records(membership: &[u64], parent_membership: Option<&[u64]>) -> Vec
     clusters
 }
 
-fn aggregate_cluster_edges(membership: &[u64], links: &[GraphLink], node_index: &HashMap<String, usize>) -> (usize, Vec<GraphLink>) {
-    let cluster_count = membership.iter().max().map(|id| *id as usize + 1).unwrap_or(0);
+#[cfg(feature = "icebug-analytics")]
+fn aggregate_cluster_edges(
+    membership: &[u64],
+    links: &[GraphLink],
+    node_index: &HashMap<String, usize>,
+) -> (usize, Vec<GraphLink>) {
+    let cluster_count = membership
+        .iter()
+        .max()
+        .map(|id| *id as usize + 1)
+        .unwrap_or(0);
     let mut seen = HashSet::new();
     let mut links_out = Vec::new();
 
@@ -380,7 +406,11 @@ fn aggregate_cluster_edges(membership: &[u64], links: &[GraphLink], node_index: 
         if source == target {
             continue;
         }
-        let key = if source < target { (source, target) } else { (target, source) };
+        let key = if source < target {
+            (source, target)
+        } else {
+            (target, source)
+        };
         if seen.insert(key) {
             links_out.push(GraphLink {
                 source: key.0.to_string(),
@@ -393,7 +423,11 @@ fn aggregate_cluster_edges(membership: &[u64], links: &[GraphLink], node_index: 
     (cluster_count, links_out)
 }
 
-fn compute_cluster_levels(nodes: &[GraphNode], links: &[GraphLink]) -> Option<Vec<GraphClusterLevel>> {
+#[cfg(feature = "icebug-analytics")]
+fn compute_cluster_levels(
+    nodes: &[GraphNode],
+    links: &[GraphLink],
+) -> Option<Vec<GraphClusterLevel>> {
     let node_count = nodes.len();
     if node_count < 2 || links.is_empty() {
         return None;
@@ -420,8 +454,12 @@ fn compute_cluster_levels(nodes: &[GraphNode], links: &[GraphLink]) -> Option<Ve
     let mut current_node_index = node_index;
 
     for level in 1..CLUSTER_LEVEL_LIMIT {
-        let (cluster_count, aggregate_links) = aggregate_cluster_edges(&graph_membership, &current_links, &current_node_index);
-        if cluster_count < 2 || aggregate_links.is_empty() || cluster_count >= graph_membership.len() {
+        let (cluster_count, aggregate_links) =
+            aggregate_cluster_edges(&graph_membership, &current_links, &current_node_index);
+        if cluster_count < 2
+            || aggregate_links.is_empty()
+            || cluster_count >= graph_membership.len()
+        {
             break;
         }
 
@@ -444,8 +482,10 @@ fn compute_cluster_levels(nodes: &[GraphNode], links: &[GraphLink]) -> Option<Ve
             .enumerate()
             .map(|(index, node)| (node.id.clone(), index))
             .collect();
-        let cluster_csr = build_undirected_csr(cluster_count, &aggregate_links, &cluster_node_index);
-        let (cluster_membership, _) = remap_membership(&leiden_membership(cluster_count, &cluster_csr).ok()?);
+        let cluster_csr =
+            build_undirected_csr(cluster_count, &aggregate_links, &cluster_node_index);
+        let (cluster_membership, _) =
+            remap_membership(&leiden_membership(cluster_count, &cluster_csr).ok()?);
         let next_membership: Vec<u64> = node_membership
             .iter()
             .map(|cluster_id| cluster_membership[*cluster_id as usize])
@@ -471,6 +511,14 @@ fn compute_cluster_levels(nodes: &[GraphNode], links: &[GraphLink]) -> Option<Ve
     }
 
     Some(levels)
+}
+
+#[cfg(not(feature = "icebug-analytics"))]
+fn compute_cluster_levels(
+    _nodes: &[GraphNode],
+    _links: &[GraphLink],
+) -> Option<Vec<GraphClusterLevel>> {
+    None
 }
 
 fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
@@ -545,7 +593,12 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
     Ok(graph_data(nodes.into_values().collect(), links))
 }
 
-fn add_expanders(graph: &GraphData, visible_ids: &HashSet<String>, nodes: &mut Vec<GraphNode>, links: &mut Vec<GraphLink>) {
+fn add_expanders(
+    graph: &GraphData,
+    visible_ids: &HashSet<String>,
+    nodes: &mut Vec<GraphNode>,
+    links: &mut Vec<GraphLink>,
+) {
     let known_ids: HashSet<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
     let mut neighbors: HashMap<String, HashSet<String>> = HashMap::new();
     for link in &graph.links {
@@ -565,7 +618,9 @@ fn add_expanders(graph: &GraphData, visible_ids: &HashSet<String>, nodes: &mut V
             .map(|items| {
                 items
                     .iter()
-                    .filter(|neighbor_id| !visible_ids.contains(*neighbor_id) && known_ids.contains(*neighbor_id))
+                    .filter(|neighbor_id| {
+                        !visible_ids.contains(*neighbor_id) && known_ids.contains(*neighbor_id)
+                    })
                     .count()
             })
             .unwrap_or(0);
@@ -616,7 +671,12 @@ fn seed_graph_from_full(full_graph: GraphData) -> GraphData {
     graph_data(nodes, links)
 }
 
-fn expand_node_from_full(full_graph: GraphData, node_id: &str, visible_node_ids: &[String], offset: usize) -> GraphData {
+fn expand_node_from_full(
+    full_graph: GraphData,
+    node_id: &str,
+    visible_node_ids: &[String],
+    offset: usize,
+) -> GraphData {
     let visible_ids: HashSet<String> = visible_node_ids
         .iter()
         .filter(|id| !id.starts_with(EXPANDER_PREFIX))
