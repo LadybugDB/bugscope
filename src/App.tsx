@@ -159,7 +159,11 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
 const EXPANDER_PREFIX = '__expand__:'
 
 function isExpanderNode(node: GraphNode) {
-  return Boolean(node.expansionKind) || node.id.startsWith(EXPANDER_PREFIX)
+  return node.expansionKind === 'node' || node.id.startsWith(EXPANDER_PREFIX)
+}
+
+function isClusterNode(node: GraphNode) {
+  return node.expansionKind === 'cluster'
 }
 
 function buildCommunityClusterLevels(graphData: NormalizedGraphData): GraphClusterLevel[] {
@@ -313,7 +317,7 @@ function buildGraphCsr(graphData: NormalizedGraphData): GraphCsr {
 }
 
 function realNodeIds(nodes: GraphNode[]): Set<string> {
-  return new Set(nodes.filter(node => !isExpanderNode(node)).map(node => node.id))
+  return new Set(nodes.filter(node => !isExpanderNode(node) && !isClusterNode(node)).map(node => node.id))
 }
 
 function drawRoundedRect(
