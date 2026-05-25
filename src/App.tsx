@@ -162,28 +162,6 @@ function isExpanderNode(node: GraphNode) {
   return Boolean(node.expansionKind) || node.id.startsWith(EXPANDER_PREFIX)
 }
 
-function mergeGraphData(current: GraphData, incoming: GraphData, expandedNodeId?: string): GraphData {
-  const nodesById = new Map<string, GraphNode>()
-  current.nodes
-    .filter(node => node.id !== expandedNodeId)
-    .forEach(node => nodesById.set(node.id, { ...node }))
-  incoming.nodes.forEach(node => nodesById.set(node.id, { ...node }))
-
-  const linksByKey = new Map<string, GraphLink>()
-  current.links
-    .filter(link => getEndpointId(link.source) !== expandedNodeId && getEndpointId(link.target) !== expandedNodeId)
-    .forEach(link => linksByKey.set(`${getEndpointId(link.source)}\t${getEndpointId(link.target)}\t${link.label}`, { ...link }))
-  incoming.links.forEach(link => {
-    linksByKey.set(`${getEndpointId(link.source)}\t${getEndpointId(link.target)}\t${link.label}`, { ...link })
-  })
-
-  return {
-    nodes: [...nodesById.values()],
-    links: [...linksByKey.values()],
-    clusterDebug: incoming.clusterDebug || current.clusterDebug,
-  }
-}
-
 function buildCommunityClusterLevels(graphData: NormalizedGraphData): GraphClusterLevel[] {
   if (graphData.clusterLevels?.length) return graphData.clusterLevels
 
@@ -834,14 +812,12 @@ function App() {
     })
       .then(data => {
         const beforeNodeIds = realNodeIds(graphData.nodes)
-        const returnedNodeIds = realNodeIds(data.nodes)
-        const merged = mergeGraphData(graphData, data, node.id)
-        const highlightedNodeIds = realNodeIds(merged.nodes)
+        const highlightedNodeIds = realNodeIds(data.nodes)
 
         beforeNodeIds.forEach(id => {
-          if (!returnedNodeIds.has(id)) highlightedNodeIds.delete(id)
+          highlightedNodeIds.delete(id)
         })
-        setGraphData(merged)
+        setGraphData(data)
         setLastExpandedNodeIds(highlightedNodeIds)
         setExpandedClusterId(null)
         setLoading(false)
@@ -854,10 +830,6 @@ function App() {
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
   const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
-  const clusterDebug = normalizedGraphData.clusterDebug
-  const clusterDebugText = clusterDebug
-    ? clusterDebug.message
-    : 'Cluster status unavailable: backend did not return cluster diagnostics.'
   const selectedCluster = useMemo(() => (
     clusterLevels.find(level => level.level === selectedClusterLevel) || clusterLevels[0]
   ), [clusterLevels, selectedClusterLevel])
@@ -1041,14 +1013,6 @@ function App() {
                     : `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
                   : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
-            {!loading && (
-              <span
-                className={`cluster-debug cluster-debug-${clusterDebug?.status || 'unknown'}`}
-                title={clusterDebugText}
-              >
-                {clusterDebugText}
-              </span>
-            )}
             {error && <span className="error-message">{error}</span>}
           </div>
 
