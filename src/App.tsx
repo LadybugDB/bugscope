@@ -206,20 +206,39 @@ function buildCommunityClusterLevels(graphData: NormalizedGraphData): GraphClust
   }]
 }
 
-function collapseGraphByClusterLevel(graphData: NormalizedGraphData, level: GraphClusterLevel): NormalizedGraphData {
+function getClusterNodeId(level: number, clusterId: number) {
+  return `__cluster__:${level}:${clusterId}`
+}
+
+function parseClusterNodeId(nodeId: string): { level: number; clusterId: number } | null {
+  const match = /^__cluster__:(\d+):(\d+)$/.exec(nodeId)
+  if (!match) return null
+  return {
+    level: Number(match[1]),
+    clusterId: Number(match[2]),
+  }
+}
+
+function collapseGraphByClusterLevel(
+  graphData: NormalizedGraphData,
+  level: GraphClusterLevel,
+  expandedClusterId: number | null = null,
+): NormalizedGraphData {
   const clusterById = new Map(level.clusters.map(cluster => [cluster.clusterId, cluster]))
   const clusterCounts = new Map<number, number>()
+  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
 
   level.membership.forEach(clusterId => {
     clusterCounts.set(clusterId, (clusterCounts.get(clusterId) || 0) + 1)
   })
 
-  const nodes: GraphNode[] = [...clusterCounts.entries()]
+  const collapsedNodes: GraphNode[] = [...clusterCounts.entries()]
+    .filter(([clusterId]) => clusterId !== expandedClusterId)
     .sort(([a], [b]) => a - b)
     .map(([clusterId, size]) => {
       const cluster = clusterById.get(clusterId)
       return {
-        id: `__cluster__:${level.level}:${clusterId}`,
+        id: getClusterNodeId(level.level, clusterId),
         name: cluster?.label || `Cluster ${clusterId}`,
         label: `Cluster L${level.level}`,
         community: clusterId,
@@ -228,9 +247,12 @@ function collapseGraphByClusterLevel(graphData: NormalizedGraphData, level: Grap
       }
     })
 
-  const clusterNodeId = new Map(nodes.map(node => [node.community ?? 0, node.id]))
+  const expandedNodes = expandedClusterId === null
+    ? []
+    : graphData.nodes.filter((_, index) => level.membership[index] === expandedClusterId)
+  const nodes = [...collapsedNodes, ...expandedNodes]
+  const visibleNodeIds = new Set(nodes.map(node => node.id))
   const edgeCounts = new Map<string, { source: string; target: string; labels: Map<string, number>; count: number }>()
-  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
 
   graphData.links.forEach(link => {
     const sourceIndex = nodeIndex.get(link.source)
@@ -239,11 +261,14 @@ function collapseGraphByClusterLevel(graphData: NormalizedGraphData, level: Grap
 
     const sourceCluster = level.membership[sourceIndex]
     const targetCluster = level.membership[targetIndex]
-    if (sourceCluster === targetCluster) return
 
-    const source = clusterNodeId.get(sourceCluster)
-    const target = clusterNodeId.get(targetCluster)
-    if (!source || !target) return
+    const source = sourceCluster === expandedClusterId
+      ? link.source
+      : getClusterNodeId(level.level, sourceCluster)
+    const target = targetCluster === expandedClusterId
+      ? link.target
+      : getClusterNodeId(level.level, targetCluster)
+    if (source === target || !visibleNodeIds.has(source) || !visibleNodeIds.has(target)) return
 
     const key = `${source}\t${target}`
     const record = edgeCounts.get(key) || { source, target, labels: new Map<string, number>(), count: 0 }
@@ -641,6 +666,7 @@ function App() {
   const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
   const [clusterCollapsed, setClusterCollapsed] = useState(false)
   const [selectedClusterLevel, setSelectedClusterLevel] = useState(0)
+  const [expandedClusterId, setExpandedClusterId] = useState<number | null>(null)
   const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
@@ -729,6 +755,7 @@ function App() {
           console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
+          setExpandedClusterId(null)
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -746,6 +773,7 @@ function App() {
           console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
+          setExpandedClusterId(null)
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -815,6 +843,7 @@ function App() {
         })
         setGraphData(merged)
         setLastExpandedNodeIds(highlightedNodeIds)
+        setExpandedClusterId(null)
         setLoading(false)
       })
       .catch(err => {
@@ -832,21 +861,28 @@ function App() {
   const selectedCluster = useMemo(() => (
     clusterLevels.find(level => level.level === selectedClusterLevel) || clusterLevels[0]
   ), [clusterLevels, selectedClusterLevel])
+  const expandedCluster = useMemo(() => (
+    expandedClusterId === null
+      ? null
+      : selectedCluster?.clusters.find(cluster => cluster.clusterId === expandedClusterId) || null
+  ), [expandedClusterId, selectedCluster])
   const visibleGraphData = useMemo(() => (
     clusterCollapsed && selectedCluster
-      ? collapseGraphByClusterLevel(normalizedGraphData, selectedCluster)
+      ? collapseGraphByClusterLevel(normalizedGraphData, selectedCluster, expandedClusterId)
       : normalizedGraphData
-  ), [clusterCollapsed, normalizedGraphData, selectedCluster])
+  ), [clusterCollapsed, expandedClusterId, normalizedGraphData, selectedCluster])
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!selectedCluster) {
       setClusterCollapsed(false)
       setSelectedClusterLevel(0)
+      setExpandedClusterId(null)
       return
     }
     if (!clusterLevels.some(level => level.level === selectedClusterLevel)) {
       setSelectedClusterLevel(selectedCluster.level)
+      setExpandedClusterId(null)
     }
   }, [clusterLevels, selectedCluster, selectedClusterLevel])
   /* eslint-enable react-hooks/set-state-in-effect */
@@ -905,8 +941,11 @@ function App() {
   }, [nodeDegree, maxDegree])
 
   const handleVisibleNodeClick = useCallback((nodeId: string) => {
-    if (nodeId.startsWith('__cluster__:')) {
-      setClusterCollapsed(false)
+    const clusterNode = parseClusterNodeId(nodeId)
+    if (clusterNode) {
+      setSelectedClusterLevel(clusterNode.level)
+      setExpandedClusterId(clusterNode.clusterId)
+      setClusterCollapsed(true)
       return
     }
     handleNodeClick(nodeId)
@@ -997,7 +1036,9 @@ function App() {
               {loading
                 ? 'Loading...'
                 : clusterCollapsed && selectedCluster
-                  ? `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
+                  ? expandedCluster
+                    ? `${expandedCluster.label} expanded, ${visibleGraphData.nodes.length} visible nodes, ${visibleGraphData.links.length} visible edges`
+                    : `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
                   : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
             {!loading && (
@@ -1016,7 +1057,10 @@ function App() {
               <div className="cluster-controls" aria-label="Clusters">
                 <select
                   value={selectedCluster?.level ?? 0}
-                  onChange={event => setSelectedClusterLevel(Number(event.target.value))}
+                  onChange={event => {
+                    setSelectedClusterLevel(Number(event.target.value))
+                    setExpandedClusterId(null)
+                  }}
                 >
                   {clusterLevels.map(level => (
                     <option key={level.level} value={level.level}>
@@ -1026,9 +1070,12 @@ function App() {
                 </select>
                 <button
                   className={clusterCollapsed ? 'active' : ''}
-                  onClick={() => setClusterCollapsed(value => !value)}
+                  onClick={() => {
+                    setExpandedClusterId(null)
+                    setClusterCollapsed(value => !value)
+                  }}
                 >
-                  {clusterCollapsed ? 'Expand' : 'Collapse'}
+                  {clusterCollapsed ? 'Expand All' : 'Collapse'}
                 </button>
               </div>
             )}
