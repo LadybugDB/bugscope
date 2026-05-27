@@ -25,3 +25,5 @@ arrow-ipc = { version = "56" }
 arrow-schema = { version = "56" }
 walkdir = "2"
 dirs = "5"
+fastrand = "2"
+reqwest = { version = "0.13.3", features = ["blocking", "json"] }

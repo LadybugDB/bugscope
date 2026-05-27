@@ -77,6 +77,25 @@ interface GraphData {
   clusterDebug?: GraphClusterDebug
 }
 
+interface LlmClusterNamingConfig {
+  accessToken: string
+  endpoint?: string
+  model?: string
+  sampleSize: number
+}
+
+interface LlmClusterNameRequest {
+  key: string
+  clusterId: number
+  labels: string[]
+}
+
+interface LlmClusterNameResult {
+  key: string
+  name?: string | null
+  error?: string | null
+}
+
 interface NormalizedGraphLink {
   source: string
   target: string
@@ -159,6 +178,36 @@ function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<
     return Promise.reject(new Error('Native app bridge is unavailable. Open this screen through the Tauri desktop app.'))
   }
   return invoke<T>(cmd, args)
+}
+
+function buildLlmClusterConfig(config: LlmClusterNamingConfig): LlmClusterNamingConfig | null {
+  const accessToken = config.accessToken.trim()
+  if (!accessToken) return null
+  const endpoint = config.endpoint?.trim()
+  const model = config.model?.trim()
+  return {
+    accessToken,
+    sampleSize: config.sampleSize,
+    ...(endpoint ? { endpoint } : {}),
+    ...(model ? { model } : {}),
+  }
+}
+
+function getNodeClusterLabel(node: GraphNode) {
+  const label = node.label.trim()
+  const name = node.name.trim()
+  return !name || name === label ? label : `${label}: ${name}`
+}
+
+function sampleLabels(labels: string[], sampleSize: number) {
+  const unique = [...new Set(labels)].filter(Boolean)
+  for (let index = unique.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1))
+    const value = unique[index]
+    unique[index] = unique[swapIndex]
+    unique[swapIndex] = value
+  }
+  return unique.slice(0, sampleSize)
 }
 
 function getEndpointId(endpoint: string | NodeObject): string {
@@ -812,12 +861,36 @@ function App() {
   const [searchError, setSearchError] = useState<string | null>(null)
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null)
   const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
+  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false)
+  const [llmClusterConfig, setLlmClusterConfig] = useState<LlmClusterNamingConfig>({
+    accessToken: '',
+    endpoint: 'https://openrouter.ai',
+    model: 'deepseek-v4-flash',
+    sampleSize: 15,
+  })
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
   const graphContainerRef = useRef<HTMLDivElement | null>(null)
   const [graphSize, setGraphSize] = useState({ width: 1, height: 1 })
   const customQueryRef = useRef<string>('')
+  const llmClusterConfigRef = useRef<LlmClusterNamingConfig>(llmClusterConfig)
+  const graphRequestInFlightRef = useRef<string | null>(null)
+  const requestedClusterNameKeysRef = useRef<Set<string>>(new Set())
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const updateLlmClusterConfig = (patch: Partial<LlmClusterNamingConfig>) => {
+    setLlmClusterConfig(current => {
+      const next = { ...current, ...patch }
+      llmClusterConfigRef.current = next
+      return next
+    })
+  }
+
+  const currentLlmClusterConfig = useCallback(() => buildLlmClusterConfig(llmClusterConfigRef.current), [])
+
+  const resetClusterNameRequests = useCallback(() => {
+    requestedClusterNameKeysRef.current.clear()
+  }, [])
 
   const fetchDatabases = () => {
     Promise.all([
@@ -886,6 +959,7 @@ function App() {
 
   const fetchGraphData = useCallback(() => {
     if (databases.length === 0) {
+      resetClusterNameRequests()
       setGraphData({ nodes: [], links: [] })
       return
     }
@@ -893,15 +967,46 @@ function App() {
     setError(null)
 
     const query = customQueryRef.current.trim()
+    const llmConfig = currentLlmClusterConfig()
+    const requestKey = JSON.stringify({
+      id: selectedId,
+      query,
+      llmConfig,
+    })
+    if (graphRequestInFlightRef.current === requestKey) {
+      console.info('Graph fetch skipped: identical request is already in flight', {
+        id: selectedId,
+        queryMode: query ? 'custom' : 'default',
+        llmClusterNaming: Boolean(llmConfig),
+        model: llmConfig?.model,
+        endpoint: llmConfig?.endpoint,
+      })
+      return
+    }
+    graphRequestInFlightRef.current = requestKey
+    const finishGraphFetch = () => {
+      if (graphRequestInFlightRef.current === requestKey) {
+        graphRequestInFlightRef.current = null
+      }
+      setLoading(false)
+    }
+    console.info('Graph fetch started', {
+      id: selectedId,
+      queryMode: query ? 'custom' : 'default',
+      llmClusterNaming: Boolean(llmConfig),
+      model: llmConfig?.model,
+      endpoint: llmConfig?.endpoint,
+    })
     if (query) {
-      invokeCommand<GraphData>('execute_query', { id: selectedId, query })
+      invokeCommand<GraphData>('execute_query', { id: selectedId, query, llmConfig })
         .then(data => {
           console.info('Graph cluster debug:', data.clusterDebug)
+          resetClusterNameRequests()
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
           setClusterPath([])
           setFocusedNodeId(null)
-          setLoading(false)
+          finishGraphFetch()
           setTimeout(() => {
             if (graphRef.current) {
               graphRef.current.zoomToFit(400)
@@ -909,18 +1014,20 @@ function App() {
           }, 500)
         })
         .catch(err => {
+          console.error('Graph fetch failed', err)
           setError(String(err))
-          setLoading(false)
+          finishGraphFetch()
         })
     } else {
-      invokeCommand<GraphData>('get_graph', { id: selectedId })
+      invokeCommand<GraphData>('get_graph', { id: selectedId, llmConfig })
         .then(data => {
           console.info('Graph cluster debug:', data.clusterDebug)
+          resetClusterNameRequests()
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
           setClusterPath([])
           setFocusedNodeId(null)
-          setLoading(false)
+          finishGraphFetch()
           setTimeout(() => {
             if (graphRef.current) {
               graphRef.current.zoomToFit(400)
@@ -928,11 +1035,12 @@ function App() {
           }, 500)
         })
         .catch(err => {
+          console.error('Graph fetch failed', err)
           setError(String(err))
-          setLoading(false)
+          finishGraphFetch()
         })
     }
-  }, [selectedId, databases.length])
+  }, [selectedId, databases.length, currentLlmClusterConfig, resetClusterNameRequests])
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -989,10 +1097,15 @@ function App() {
     setLoading(true)
     setError(null)
     setSearchError(null)
-    invokeCommand<GraphData>('get_node_neighborhood', { id: selectedId, nodeId: node.id })
+    invokeCommand<GraphData>('get_node_neighborhood', {
+      id: selectedId,
+      nodeId: node.id,
+      llmConfig: currentLlmClusterConfig(),
+    })
       .then(data => {
         const normalized = normalizeGraphData(data)
         const levels = buildCommunityClusterLevels(normalized)
+        resetClusterNameRequests()
         setGraphData(data)
         setClusterViewEnabled(levels.length > 0)
         setClusterPath(getClusterPathForNode(normalized, levels, node.id))
@@ -1004,7 +1117,7 @@ function App() {
         setError(String(err))
         setLoading(false)
       })
-  }, [selectedId])
+  }, [selectedId, currentLlmClusterConfig, resetClusterNameRequests])
 
   const colorMapRef = useRef<Record<string, string>>({})
   const edgeColorMapRef = useRef<Record<string, string>>({})
@@ -1021,6 +1134,7 @@ function App() {
       nodeId: expandedNodeId,
       visibleNodeIds: graphData.nodes.map(item => item.id),
       offset: node.offset ?? 0,
+      llmConfig: currentLlmClusterConfig(),
     })
       .then(data => {
         const beforeNodeIds = realNodeIds(graphData.nodes)
@@ -1031,6 +1145,7 @@ function App() {
         beforeNodeIds.forEach(id => {
           highlightedNodeIds.delete(id)
         })
+        resetClusterNameRequests()
         setGraphData(data)
         setLastExpandedNodeIds(highlightedNodeIds)
         setClusterPath(getClusterPathForNode(normalized, levels, expandedNodeId))
@@ -1041,7 +1156,7 @@ function App() {
         setError(String(err))
         setLoading(false)
       })
-  }, [graphData, selectedId])
+  }, [graphData, selectedId, currentLlmClusterConfig, resetClusterNameRequests])
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
   const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
@@ -1068,6 +1183,100 @@ function App() {
       ? buildClusterDrillGraph(normalizedGraphData, clusterLevels, visibleClusterPath)
       : normalizedGraphData
   ), [clusterViewEnabled, clusterLevels, normalizedGraphData, visibleClusterPath])
+
+  useEffect(() => {
+    const llmConfig = currentLlmClusterConfig()
+    if (!llmConfig || !clusterViewEnabled || !currentClusterLevel) return
+
+    const visibleClusterIds = visibleGraphData.nodes
+      .filter(isClusterNode)
+      .map(node => node.community)
+      .filter((clusterId): clusterId is number => clusterId !== undefined)
+    if (visibleClusterIds.length === 0) return
+
+    const requests: LlmClusterNameRequest[] = []
+    const currentPathKey = visibleClusterPath.map(item => `${item.level}:${item.clusterId}`).join('/')
+
+    visibleClusterIds.forEach(clusterId => {
+      const key = `${currentClusterLevel.level}:${clusterId}:${currentPathKey}`
+      if (requestedClusterNameKeysRef.current.has(key)) return
+
+      const labels = normalizedGraphData.nodes
+        .filter((node, index) => (
+          !isExpanderNode(node)
+          && currentClusterLevel.membership[index] === clusterId
+          && nodeMatchesClusterPath(clusterLevels, index, visibleClusterPath)
+        ))
+        .map(getNodeClusterLabel)
+      const sampledLabels = sampleLabels(labels, llmConfig.sampleSize)
+      if (sampledLabels.length === 0) return
+
+      requests.push({
+        key,
+        clusterId,
+        labels: sampledLabels,
+      })
+    })
+
+    if (requests.length === 0) return
+    const cappedRequests = requests.slice(0, 24)
+    requests.forEach(request => {
+      requestedClusterNameKeysRef.current.add(request.key)
+    })
+    console.info('Visible cluster naming started', {
+      requested: requests.length,
+      sent: cappedRequests.length,
+      level: currentClusterLevel.level,
+      path: currentPathKey || 'root',
+      model: llmConfig.model,
+      endpoint: llmConfig.endpoint,
+    })
+
+    invokeCommand<LlmClusterNameResult[]>('name_visible_clusters', {
+      llmConfig,
+      clusters: cappedRequests,
+    })
+      .then(results => {
+        const namesByKey = new Map(
+          results
+            .filter(result => result.name)
+            .map(result => [result.key, result.name as string]),
+        )
+        console.info('Visible cluster naming finished', {
+          requested: cappedRequests.length,
+          named: namesByKey.size,
+          errors: results.filter(result => result.error).length,
+        })
+        if (namesByKey.size === 0) return
+
+        setGraphData(current => ({
+          ...current,
+          clusterLevels: current.clusterLevels?.map(level => (
+            level.level !== currentClusterLevel.level
+              ? level
+              : {
+                  ...level,
+                  clusters: level.clusters.map(cluster => {
+                    const key = `${level.level}:${cluster.clusterId}:${currentPathKey}`
+                    const name = namesByKey.get(key)
+                    return name ? { ...cluster, label: name } : cluster
+                  }),
+                }
+          )),
+        }))
+      })
+      .catch(err => {
+        console.error('Visible cluster naming failed', err)
+      })
+  }, [
+    clusterLevels,
+    clusterViewEnabled,
+    currentClusterLevel,
+    currentLlmClusterConfig,
+    normalizedGraphData,
+    visibleClusterPath,
+    visibleGraphData.nodes,
+  ])
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -1263,6 +1472,53 @@ function App() {
                 ))}
               </div>
             )}
+          </div>
+          <div className="llm-cluster-settings">
+            <button
+              className="llm-cluster-summary"
+              onClick={() => setLlmSettingsOpen(open => !open)}
+            >
+              <span>Cluster Names</span>
+              <small>{llmClusterConfig.accessToken.trim() ? 'LLM on' : 'Local'}</small>
+            </button>
+            {llmSettingsOpen && (
+              <div className="llm-cluster-fields">
+                <input
+                  type="password"
+                  value={llmClusterConfig.accessToken}
+                  placeholder="LLM access token"
+                  autoComplete="off"
+                  onChange={event => updateLlmClusterConfig({ accessToken: event.target.value })}
+                />
+                <input
+                  value={llmClusterConfig.model || ''}
+                  placeholder="Model"
+                  onChange={event => updateLlmClusterConfig({ model: event.target.value })}
+                />
+                <input
+                  value={llmClusterConfig.endpoint || ''}
+                  placeholder="OpenAI-compatible endpoint"
+                  onChange={event => updateLlmClusterConfig({ endpoint: event.target.value })}
+                />
+              </div>
+            )}
+            <div className="llm-cluster-actions">
+              <span>{llmClusterConfig.accessToken.trim() ? 'Visible only' : 'Using local names'}</span>
+              <button
+                onClick={() => {
+                  const config = currentLlmClusterConfig()
+                  console.info('Cluster naming apply clicked', {
+                    llmClusterNaming: Boolean(config),
+                    model: config?.model,
+                    endpoint: config?.endpoint,
+                  })
+                  fetchGraphData()
+                }}
+                disabled={loading || databases.length === 0}
+              >
+                Apply
+              </button>
+            </div>
           </div>
         </div>
       </div>
