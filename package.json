@@ -4,7 +4,7 @@
   "version": "0.15.1",
   "type": "module",
   "scripts": {
-    "setup": "bash scripts/download-liblbug.sh",
+    "setup": "bash scripts/download-liblbug.sh && bash scripts/download_icebug.sh && bash scripts/stage_macos_frameworks.sh",
     "dev:frontend": "vite",
     "build:frontend": "tsc -b && vite build",
     "tauri": "cargo tauri",

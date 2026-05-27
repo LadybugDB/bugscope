@@ -7,7 +7,8 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev:frontend",
-    "beforeBuildCommand": "npm run build:frontend"
+    "beforeBuildCommand": "npm run build:frontend && bash scripts/stage_macos_frameworks.sh",
+    "beforeBundleCommand": "bash scripts/patch_macos_bundle_dylibs.sh"
   },
   "app": {
     "windows": [
@@ -32,7 +33,13 @@
       "icons/icon.png"
     ],
     "macOS": {
-      "frameworks": ["liblbug/liblbug.dylib"],
+      "frameworks": [
+        "macos-frameworks/liblbug.0.dylib",
+        "macos-frameworks/liblbug.dylib",
+        "macos-frameworks/libnetworkit.dylib",
+        "macos-frameworks/libarrow.icebug.dylib",
+        "macos-frameworks/libomp.dylib"
+      ],
       "minimumSystemVersion": "13.3"
     }
   }

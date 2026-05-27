@@ -5,6 +5,7 @@
 LBUG_LIBRARY_DIR = { value = "liblbug", relative = true }
 LBUG_INCLUDE_DIR = { value = "liblbug", relative = true }
 LBUG_SHARED = "1"
+ICEBUG_DIR = { value = "icebug", relative = true }
 
 # Embed rpath so the binary can find liblbug.dylib at runtime.
 # First rpath: for production .app bundles (Contents/Frameworks/)

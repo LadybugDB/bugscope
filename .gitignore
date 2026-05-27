@@ -32,4 +32,6 @@ pnpm-lock.yaml
 # Tauri
 src-tauri/target/
 src-tauri/liblbug/
+src-tauri/icebug/
+src-tauri/macos-frameworks/
 src-tauri/gen/

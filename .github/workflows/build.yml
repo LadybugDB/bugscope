@@ -106,7 +106,7 @@ jobs:
       - name: Install dependencies (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
-          brew install create-dmg
+          brew install apache-arrow create-dmg libomp
 
       - name: Install dependencies (Linux)
         if: matrix.platform == 'ubuntu-latest' || matrix.platform == 'ubuntu-24.04-arm'
@@ -171,6 +171,15 @@ jobs:
           LBUG_TARGET_DIR: ${{ github.workspace }}/src-tauri/liblbug
         run: bash scripts/download-liblbug.sh
 
+      - name: Download icebug
+        env:
+          ICEBUG_TARGET_DIR: ${{ github.workspace }}/src-tauri/icebug
+        run: bash scripts/download_icebug.sh
+
+      - name: Stage macOS dylibs
+        if: matrix.platform == 'macos-latest'
+        run: bash scripts/stage_macos_frameworks.sh
+
       - name: Build Tauri app (Linux)
         if: matrix.platform == 'ubuntu-latest' || matrix.platform == 'ubuntu-24.04-arm'
         run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
@@ -183,7 +192,7 @@ jobs:
 
       - name: Build Tauri app (macOS/Windows)
         if: matrix.platform == 'macos-latest' || matrix.platform == 'windows-latest'
-        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ matrix.platform == 'macos-latest' && '--features icebug-analytics' || '' }} --verbose
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
