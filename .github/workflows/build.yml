@@ -94,14 +94,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri*
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-tauri-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
 
       - name: Install Tauri CLI (cargo plugin)
-        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
-        run: cargo install tauri-cli --locked
+        shell: bash
+        run: cargo tauri --version || cargo install tauri-cli --locked
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'macos-latest'
