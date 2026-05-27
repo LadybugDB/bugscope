@@ -24,6 +24,7 @@ interface GraphNode {
   expandNodeId?: string
   offset?: number
   hiddenCount?: number
+  colorKey?: string
 }
 
 interface GraphLink {
@@ -125,6 +126,7 @@ interface SigmaGraphViewProps {
   newlyExpandedNodeIds: Set<string>
   darkMode: boolean
   getNodeColor: (node: GraphNode) => string
+  getNodeSize: (node: GraphNode) => number
   getEdgeColor: (label: string) => string
   onNodeClick: (nodeId: string) => void
 }
@@ -283,6 +285,7 @@ function buildClusterDrillGraph(
   })
 
   if (currentLevelNumber < 0) {
+    const finestLevel = getClusterLevel(clusterLevels, 0)
     const nodes = graphData.nodes.filter((node, index) => {
       if (isExpanderNode(node)) {
         return graphData.links.some(link => (
@@ -291,6 +294,13 @@ function buildClusterDrillGraph(
         ))
       }
       return eligibleNodeIndexes.has(index)
+    }).map((node, index) => {
+      if (isExpanderNode(node)) return node
+      const sourceIndex = nodeIndex.get(node.id) ?? index
+      const clusterId = finestLevel?.membership[sourceIndex]
+      return clusterId === undefined
+        ? node
+        : { ...node, community: clusterId, colorKey: `cluster:0:${clusterId}` }
     })
     const visibleNodeIds = new Set(nodes.map(node => node.id))
     const links = graphData.links.filter(link => (
@@ -324,6 +334,7 @@ function buildClusterDrillGraph(
       name: cluster.label || `Cluster ${cluster.clusterId}`,
       label: currentLevel.level === coarsestLevel.level ? 'Cluster' : `Cluster L${currentLevel.level}`,
       community: cluster.clusterId,
+      colorKey: `cluster:${currentLevel.level}:${cluster.clusterId}`,
       expansionKind: 'cluster',
       hiddenCount: clusterCounts.get(cluster.clusterId) ?? cluster.size,
     }))
@@ -639,23 +650,21 @@ function createInitialLayout(graphData: NormalizedGraphData) {
   return { degrees, positions }
 }
 
-function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeColor, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
+function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeColor, getNodeSize, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
   const hoveredEdgeRef = useRef<string | null>(null)
 
   const graph = useMemo(() => {
-    const { degrees, positions } = createInitialLayout(graphData)
-    const maxDegree = Math.max(1, ...Object.values(degrees))
+    const { positions } = createInitialLayout(graphData)
     const nodes = graphData.nodes.map(node => {
       const position = positions[node.id] || { x: 0, y: 0 }
-      const degree = degrees[node.id] || 0
       return {
         key: node.id,
         attributes: {
           x: position.x,
           y: position.y,
-          size: 4 + (degree / maxDegree) * 14,
+          size: getNodeSize(node),
           color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node),
           label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
           hoverLabel: node.name || node.id,
@@ -694,7 +703,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
       edgeAttributes,
       edgeKeys,
     })
-  }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeColor, getEdgeColor])
+  }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeColor, getNodeSize, getEdgeColor])
 
   useEffect(() => {
     const container = containerRef.current
@@ -1003,26 +1012,29 @@ function App() {
   const handleNodeClick = useCallback((nodeId: string) => {
     const node = graphData.nodes.find(item => item.id === nodeId)
     if (!node?.expansionKind || node.expansionKind !== 'node' || !node.expandNodeId) return
+    const expandedNodeId = node.expandNodeId
 
     setLoading(true)
     setError(null)
     invokeCommand<GraphData>('expand_node', {
       id: selectedId,
-      nodeId: node.expandNodeId,
+      nodeId: expandedNodeId,
       visibleNodeIds: graphData.nodes.map(item => item.id),
       offset: node.offset ?? 0,
     })
       .then(data => {
         const beforeNodeIds = realNodeIds(graphData.nodes)
         const highlightedNodeIds = realNodeIds(data.nodes)
+        const normalized = normalizeGraphData(data)
+        const levels = buildCommunityClusterLevels(normalized)
 
         beforeNodeIds.forEach(id => {
           highlightedNodeIds.delete(id)
         })
         setGraphData(data)
         setLastExpandedNodeIds(highlightedNodeIds)
-        setClusterPath([])
-        setFocusedNodeId(null)
+        setClusterPath(getClusterPathForNode(normalized, levels, expandedNodeId))
+        setFocusedNodeId(expandedNodeId)
         setLoading(false)
       })
       .catch(err => {
@@ -1101,7 +1113,7 @@ function App() {
   }, [lastExpandedNodeIds, visibleGraphData.nodes, nodeDegree, focusedNodeId])
 
   const getNodeColor = useCallback((node: GraphNode) => {
-    const key = node.community === undefined ? node.label : `community:${node.community}`
+    const key = node.colorKey || (node.community === undefined ? node.label : `${node.label}:${node.community}`)
     if (!colorMapRef.current[key]) {
       const colors = ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab']
       colorMapRef.current[key] = colors[Object.keys(colorMapRef.current).length % colors.length]
@@ -1118,9 +1130,11 @@ function App() {
   }, [])
 
   const getNodeSize = useCallback((node: GraphNode) => {
+    if (node.expansionKind === 'cluster') {
+      return Math.min(34, 5 + Math.sqrt(node.hiddenCount || 1) * 3)
+    }
     const degree = nodeDegree[node.id] || 0
-    const clusterBoost = node.expansionKind === 'cluster' ? Math.min(10, Math.sqrt(node.hiddenCount || 1)) : 0
-    return 4 + clusterBoost + (degree / maxDegree) * 12
+    return 4 + (degree / maxDegree) * 12
   }, [nodeDegree, maxDegree])
 
   const handleVisibleNodeClick = useCallback((nodeId: string) => {
@@ -1336,6 +1350,7 @@ function App() {
               newlyExpandedNodeIds={lastExpandedNodeIds}
               darkMode={darkMode}
               getNodeColor={getNodeColor}
+              getNodeSize={getNodeSize}
               getEdgeColor={getEdgeColor}
               onNodeClick={handleVisibleNodeClick}
             />
