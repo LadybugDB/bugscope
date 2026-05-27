@@ -103,6 +103,9 @@ struct GraphData {
 const SEED_NODE_COUNT: usize = 8;
 const EXPAND_BATCH_SIZE: usize = 8;
 const EDGE_SCAN_LIMIT: usize = 10_000;
+const NODE_SEARCH_SCAN_LIMIT: usize = 10_000;
+const SEARCH_RESULT_LIMIT: usize = 30;
+const SEARCH_NEIGHBOR_LIMIT: usize = 24;
 #[cfg(feature = "icebug-analytics")]
 const CLUSTER_LEVEL_LIMIT: usize = 3;
 const EXPANDER_PREFIX: &str = "__expand__:";
@@ -215,6 +218,50 @@ fn value_to_string(val: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         _ => format!("{}", val),
     }
+}
+
+fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
+    let Value::Node(node_val) = val else {
+        return None;
+    };
+
+    let props = node_val.get_properties();
+    let name = props
+        .iter()
+        .find(|(key, _)| key == "name")
+        .or_else(|| props.iter().find(|(key, _)| key == "id"))
+        .or_else(|| props.iter().find(|(key, _)| key == "title"))
+        .map(|(_, prop_val)| value_to_string(prop_val))
+        .unwrap_or_else(|| "Node".to_string());
+
+    Some(GraphNode {
+        id: id_to_string(node_val.get_node_id()),
+        name,
+        label: node_val.get_label_name().clone(),
+        table_id: Some(node_val.get_node_id().table_id),
+        rowid: Some(node_val.get_node_id().offset),
+        community: None,
+        expansion_kind: None,
+        expand_node_id: None,
+        offset: None,
+        hidden_count: None,
+    })
+}
+
+fn node_value_matches_query(val: &Value, query: &str) -> bool {
+    let Value::Node(node_val) = val else {
+        return false;
+    };
+
+    let node_id = id_to_string(node_val.get_node_id());
+    let label = node_val.get_label_name();
+    let props = node_val.get_properties();
+    node_id.to_lowercase().contains(query)
+        || label.to_lowercase().contains(query)
+        || props.iter().any(|(key, prop_val)| {
+            key.to_lowercase().contains(query)
+                || value_to_string(prop_val).to_lowercase().contains(query)
+        })
 }
 
 fn id_to_string(id: &lbug::InternalID) -> String {
@@ -1019,6 +1066,128 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
 }
 
 #[tauri::command]
+fn search_nodes(
+    state: State<AppState>,
+    id: usize,
+    query: String,
+) -> Result<Vec<GraphNode>, String> {
+    let query_text = query.trim();
+    if query_text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = query_text.to_lowercase();
+
+    let databases = get_all_databases(&state);
+    let db_info = databases.get(id).ok_or("Database not found")?;
+
+    let db = Database::new(&db_info.path, SystemConfig::default())
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
+
+    let mut result = conn
+        .query(&format!(
+            "MATCH (n) RETURN n LIMIT {NODE_SEARCH_SCAN_LIMIT}"
+        ))
+        .map_err(|e| format!("Node search query failed: {}", e))?;
+
+    let mut matches = Vec::new();
+    for row in &mut result {
+        for val in row.iter() {
+            if node_value_matches_query(val, &query) {
+                if let Some(node) = graph_node_from_value(val) {
+                    matches.push(node);
+                }
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| {
+        let a_exact =
+            a.name.eq_ignore_ascii_case(query_text) || a.id.eq_ignore_ascii_case(query_text);
+        let b_exact =
+            b.name.eq_ignore_ascii_case(query_text) || b.id.eq_ignore_ascii_case(query_text);
+        b_exact
+            .cmp(&a_exact)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    matches.truncate(SEARCH_RESULT_LIMIT);
+    Ok(matches)
+}
+
+#[tauri::command]
+fn get_node_neighborhood(
+    state: State<AppState>,
+    id: usize,
+    node_id: String,
+) -> Result<GraphData, String> {
+    let focus_node_id = node_id;
+    let databases = get_all_databases(&state);
+    let db_info = databases.get(id).ok_or("Database not found")?;
+
+    let db = Database::new(&db_info.path, SystemConfig::default())
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
+    let full_graph = collect_edge_graph(&conn, EDGE_SCAN_LIMIT)?;
+
+    let mut degrees: HashMap<String, usize> = HashMap::new();
+    for link in &full_graph.links {
+        *degrees.entry(link.source.clone()).or_insert(0) += 1;
+        *degrees.entry(link.target.clone()).or_insert(0) += 1;
+    }
+
+    let mut neighbor_ids: Vec<String> = full_graph
+        .links
+        .iter()
+        .filter_map(|link| {
+            if link.source == focus_node_id {
+                Some(link.target.clone())
+            } else if link.target == focus_node_id {
+                Some(link.source.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    neighbor_ids.sort();
+    neighbor_ids.dedup();
+    neighbor_ids.sort_by_key(|id| std::cmp::Reverse(*degrees.get(id).unwrap_or(&0)));
+
+    let mut visible_ids: HashSet<String> = neighbor_ids
+        .into_iter()
+        .take(SEARCH_NEIGHBOR_LIMIT)
+        .collect();
+    visible_ids.insert(focus_node_id.clone());
+
+    let full_node_by_id: HashMap<String, GraphNode> = full_graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect();
+    let mut nodes: Vec<GraphNode> = visible_ids
+        .iter()
+        .filter_map(|id| full_node_by_id.get(id).cloned())
+        .collect();
+    nodes.sort_by_key(|node| {
+        (
+            node.id != focus_node_id,
+            std::cmp::Reverse(*degrees.get(&node.id).unwrap_or(&0)),
+            node.name.clone(),
+        )
+    });
+
+    let mut links: Vec<GraphLink> = full_graph
+        .links
+        .iter()
+        .filter(|link| visible_ids.contains(&link.source) && visible_ids.contains(&link.target))
+        .cloned()
+        .collect();
+
+    add_expanders(&full_graph, &visible_ids, &mut nodes, &mut links);
+    Ok(graph_data(nodes, links))
+}
+
+#[tauri::command]
 fn expand_node(
     state: State<AppState>,
     id: usize,
@@ -1151,6 +1320,8 @@ pub fn run() {
             add_database,
             get_directories,
             get_graph,
+            search_nodes,
+            get_node_neighborhood,
             expand_node,
             execute_query,
         ])

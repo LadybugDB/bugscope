@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import ForceGraph2D from 'react-force-graph-2d'
 import type { GraphData as ForceGraphData, NodeObject } from 'react-force-graph-2d'
 import { IcebugSigmaGraph, Sigma } from './vendor/sigma-runtime.js'
@@ -48,6 +48,11 @@ interface GraphClusterLevel {
   level: number
   membership: number[]
   clusters: GraphCluster[]
+}
+
+interface ClusterPathItem {
+  level: number
+  clusterId: number
 }
 
 interface GraphClusterDebug {
@@ -138,6 +143,13 @@ interface SigmaEdgeLabelNodeData {
   size: number
 }
 
+function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauri()) {
+    return Promise.reject(new Error('Native app bridge is unavailable. Open this screen through the Tauri desktop app.'))
+  }
+  return invoke<T>(cmd, args)
+}
+
 function getEndpointId(endpoint: string | NodeObject): string {
   return typeof endpoint === 'object' ? String(endpoint.id) : endpoint
 }
@@ -201,62 +213,128 @@ function parseClusterNodeId(nodeId: string): { level: number; clusterId: number 
   }
 }
 
-function collapseGraphByClusterLevel(
-  graphData: NormalizedGraphData,
-  level: GraphClusterLevel,
-  expandedClusterId: number | null = null,
-): NormalizedGraphData {
-  const clusterById = new Map(level.clusters.map(cluster => [cluster.clusterId, cluster]))
-  const clusterCounts = new Map<number, number>()
-  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
+function getCoarsestClusterLevel(clusterLevels: GraphClusterLevel[]) {
+  return clusterLevels.reduce<GraphClusterLevel | null>((coarsest, level) => (
+    !coarsest || level.level > coarsest.level ? level : coarsest
+  ), null)
+}
 
-  level.membership.forEach((clusterId, index) => {
-    if (isExpanderNode(graphData.nodes[index])) return
+function getClusterLevel(clusterLevels: GraphClusterLevel[], level: number) {
+  return clusterLevels.find(item => item.level === level) || null
+}
+
+function nodeMatchesClusterPath(
+  clusterLevels: GraphClusterLevel[],
+  nodeIndex: number,
+  clusterPath: ClusterPathItem[],
+) {
+  return clusterPath.every(pathItem => (
+    getClusterLevel(clusterLevels, pathItem.level)?.membership[nodeIndex] === pathItem.clusterId
+  ))
+}
+
+function clusterBelongsToPath(cluster: GraphCluster, clusterPath: ClusterPathItem[]) {
+  const parent = clusterPath[clusterPath.length - 1]
+  return !parent || cluster.parentClusterId === parent.clusterId
+}
+
+function getClusterPathForNode(
+  graphData: NormalizedGraphData,
+  clusterLevels: GraphClusterLevel[],
+  nodeId: string,
+): ClusterPathItem[] {
+  const nodeIndex = graphData.nodes.findIndex(node => node.id === nodeId)
+  if (nodeIndex < 0) return []
+
+  return [...clusterLevels]
+    .sort((a, b) => b.level - a.level)
+    .map(level => ({ level: level.level, clusterId: level.membership[nodeIndex] }))
+    .filter(item => item.clusterId !== undefined)
+}
+
+function buildClusterDrillGraph(
+  graphData: NormalizedGraphData,
+  clusterLevels: GraphClusterLevel[],
+  clusterPath: ClusterPathItem[],
+): NormalizedGraphData {
+  const coarsestLevel = getCoarsestClusterLevel(clusterLevels)
+  if (!coarsestLevel) return graphData
+
+  const parent = clusterPath[clusterPath.length - 1]
+  const currentLevelNumber = parent ? parent.level - 1 : coarsestLevel.level
+  const nodeIndex = new Map(graphData.nodes.map((node, index) => [node.id, index]))
+  const eligibleNodeIndexes = new Set<number>()
+
+  graphData.nodes.forEach((node, index) => {
+    if (isExpanderNode(node)) return
+    if (nodeMatchesClusterPath(clusterLevels, index, clusterPath)) {
+      eligibleNodeIndexes.add(index)
+    }
+  })
+
+  if (currentLevelNumber < 0) {
+    const nodes = graphData.nodes.filter((node, index) => {
+      if (isExpanderNode(node)) {
+        return graphData.links.some(link => (
+          (link.source === node.id && eligibleNodeIndexes.has(nodeIndex.get(link.target) ?? -1))
+          || (link.target === node.id && eligibleNodeIndexes.has(nodeIndex.get(link.source) ?? -1))
+        ))
+      }
+      return eligibleNodeIndexes.has(index)
+    })
+    const visibleNodeIds = new Set(nodes.map(node => node.id))
+    const links = graphData.links.filter(link => (
+      visibleNodeIds.has(link.source) && visibleNodeIds.has(link.target)
+    ))
+
+    return {
+      nodes,
+      links,
+      csr: buildGraphCsr({ nodes, links }),
+      clusterLevels: graphData.clusterLevels,
+      clusterDebug: graphData.clusterDebug,
+    }
+  }
+
+  const currentLevel = getClusterLevel(clusterLevels, currentLevelNumber)
+  if (!currentLevel) return graphData
+
+  const clusterCounts = new Map<number, number>()
+  eligibleNodeIndexes.forEach(index => {
+    const clusterId = currentLevel.membership[index]
     clusterCounts.set(clusterId, (clusterCounts.get(clusterId) || 0) + 1)
   })
 
-  const collapsedNodes: GraphNode[] = [...clusterCounts.entries()]
-    .filter(([clusterId]) => clusterId !== expandedClusterId)
-    .sort(([a], [b]) => a - b)
-    .map(([clusterId, size]) => {
-      const cluster = clusterById.get(clusterId)
-      return {
-        id: getClusterNodeId(level.level, clusterId),
-        name: cluster?.label || `Cluster ${clusterId}`,
-        label: `Cluster L${level.level}`,
-        community: clusterId,
-        expansionKind: 'cluster',
-        hiddenCount: cluster?.size ?? size,
-      }
-    })
-
-  const expandedNodes = expandedClusterId === null
-    ? []
-    : graphData.nodes.filter((node, index) => (
-      !isExpanderNode(node) && level.membership[index] === expandedClusterId
-    ))
-  const expanderNodes = graphData.nodes.filter(isExpanderNode)
-  const nodes = [...collapsedNodes, ...expandedNodes, ...expanderNodes]
+  const nodes: GraphNode[] = currentLevel.clusters
+    .filter(cluster => clusterCounts.has(cluster.clusterId))
+    .filter(cluster => clusterBelongsToPath(cluster, clusterPath))
+    .sort((a, b) => b.size - a.size || a.clusterId - b.clusterId)
+    .map(cluster => ({
+      id: getClusterNodeId(currentLevel.level, cluster.clusterId),
+      name: cluster.label || `Cluster ${cluster.clusterId}`,
+      label: currentLevel.level === coarsestLevel.level ? 'Cluster' : `Cluster L${currentLevel.level}`,
+      community: cluster.clusterId,
+      expansionKind: 'cluster',
+      hiddenCount: clusterCounts.get(cluster.clusterId) ?? cluster.size,
+    }))
+  const visibleClusterIds = new Set(nodes.map(node => node.community).filter(id => id !== undefined))
   const visibleNodeIds = new Set(nodes.map(node => node.id))
   const edgeCounts = new Map<string, { source: string; target: string; labels: Map<string, number>; count: number }>()
-
-  const projectEndpoint = (nodeId: string, nodeIndexValue: number, clusterId: number) => {
-    const node = graphData.nodes[nodeIndexValue]
-    if (isExpanderNode(node) || clusterId === expandedClusterId) return nodeId
-    return getClusterNodeId(level.level, clusterId)
-  }
 
   graphData.links.forEach(link => {
     const sourceIndex = nodeIndex.get(link.source)
     const targetIndex = nodeIndex.get(link.target)
     if (sourceIndex === undefined || targetIndex === undefined) return
+    if (!eligibleNodeIndexes.has(sourceIndex) || !eligibleNodeIndexes.has(targetIndex)) return
 
-    const sourceCluster = level.membership[sourceIndex]
-    const targetCluster = level.membership[targetIndex]
+    const sourceCluster = currentLevel.membership[sourceIndex]
+    const targetCluster = currentLevel.membership[targetIndex]
+    if (sourceCluster === targetCluster) return
+    if (!visibleClusterIds.has(sourceCluster) || !visibleClusterIds.has(targetCluster)) return
 
-    const source = projectEndpoint(link.source, sourceIndex, sourceCluster)
-    const target = projectEndpoint(link.target, targetIndex, targetCluster)
-    if (source === target || !visibleNodeIds.has(source) || !visibleNodeIds.has(target)) return
+    const source = getClusterNodeId(currentLevel.level, sourceCluster)
+    const target = getClusterNodeId(currentLevel.level, targetCluster)
+    if (!visibleNodeIds.has(source) || !visibleNodeIds.has(target)) return
 
     const key = `${source}\t${target}`
     const record = edgeCounts.get(key) || { source, target, labels: new Map<string, number>(), count: 0 }
@@ -265,12 +343,11 @@ function collapseGraphByClusterLevel(
     edgeCounts.set(key, record)
   })
 
-  const links = [...edgeCounts.values()].map(record => {
-    const label = record.count === 1
-      ? [...record.labels.keys()][0] || 'edge'
-      : `${record.count} edges`
-    return { source: record.source, target: record.target, label }
-  })
+  const links = [...edgeCounts.values()].map(record => ({
+    source: record.source,
+    target: record.target,
+    label: record.count === 1 ? [...record.labels.keys()][0] || 'edge' : `${record.count} edges`,
+  }))
 
   return {
     nodes,
@@ -652,9 +729,13 @@ function App() {
   const [isCustomQuery, setIsCustomQuery] = useState(false)
   const [queryActivated, setQueryActivated] = useState(false)
   const [renderer, setRenderer] = useState<'sigma' | 'force'>('sigma')
-  const [clusterCollapsed, setClusterCollapsed] = useState(false)
-  const [selectedClusterLevel, setSelectedClusterLevel] = useState(0)
-  const [expandedClusterId, setExpandedClusterId] = useState<number | null>(null)
+  const [clusterPath, setClusterPath] = useState<ClusterPathItem[]>([])
+  const [clusterViewEnabled, setClusterViewEnabled] = useState(true)
+  const [nodeSearch, setNodeSearch] = useState('')
+  const [searchResults, setSearchResults] = useState<GraphNode[]>([])
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null)
   const [lastExpandedNodeIds, setLastExpandedNodeIds] = useState<Set<string>>(() => new Set())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null)
@@ -665,8 +746,8 @@ function App() {
 
   const fetchDatabases = () => {
     Promise.all([
-      invoke<Database[]>('get_databases'),
-      invoke<number | null>('get_initial_database_id'),
+      invokeCommand<Database[]>('get_databases'),
+      invokeCommand<number | null>('get_initial_database_id'),
     ])
       .then(([items, initialId]) => {
         setDatabases(items)
@@ -679,7 +760,7 @@ function App() {
 
   const fetchDirectories = (dir: string) => {
     setPickerError(null)
-    invoke<{ current: string; parent: string; directories: { name: string; path: string; type: string }[]; files: { name: string; path: string; type: string }[] }>('get_directories', { path: dir || null })
+    invokeCommand<{ current: string; parent: string; directories: { name: string; path: string; type: string }[]; files: { name: string; path: string; type: string }[] }>('get_directories', { path: dir || null })
       .then(data => {
         setCurrentDir(data.current || dir || '')
         setParentDir(data.parent || '')
@@ -738,12 +819,13 @@ function App() {
 
     const query = customQueryRef.current.trim()
     if (query) {
-      invoke<GraphData>('execute_query', { id: selectedId, query })
+      invokeCommand<GraphData>('execute_query', { id: selectedId, query })
         .then(data => {
           console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
-          setExpandedClusterId(null)
+          setClusterPath([])
+          setFocusedNodeId(null)
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -756,12 +838,13 @@ function App() {
           setLoading(false)
         })
     } else {
-      invoke<GraphData>('get_graph', { id: selectedId })
+      invokeCommand<GraphData>('get_graph', { id: selectedId })
         .then(data => {
           console.info('Graph cluster debug:', data.clusterDebug)
           setGraphData(data)
           setLastExpandedNodeIds(new Set())
-          setExpandedClusterId(null)
+          setClusterPath([])
+          setFocusedNodeId(null)
           setLoading(false)
           setTimeout(() => {
             if (graphRef.current) {
@@ -795,7 +878,7 @@ function App() {
 
   const addDatabase = async (filePath: string) => {
     try {
-      await invoke('add_database', { filePath })
+      await invokeCommand('add_database', { filePath })
       fetchDatabases()
       setFilePickerOpen(false)
       setPickerError(null)
@@ -804,6 +887,49 @@ function App() {
       setPickerError(String(err))
     }
   }
+
+  const runNodeSearch = useCallback(() => {
+    const query = nodeSearch.trim()
+    if (!query) {
+      setSearchResults([])
+      setSearchError(null)
+      return
+    }
+
+    setSearching(true)
+    setSearchError(null)
+    invokeCommand<GraphNode[]>('search_nodes', { id: selectedId, query })
+      .then(results => {
+        setSearchResults(results)
+        setSearching(false)
+      })
+      .catch(err => {
+        setSearchError(String(err))
+        setSearchResults([])
+        setSearching(false)
+      })
+  }, [nodeSearch, selectedId])
+
+  const exploreSearchResult = useCallback((node: GraphNode) => {
+    setLoading(true)
+    setError(null)
+    setSearchError(null)
+    invokeCommand<GraphData>('get_node_neighborhood', { id: selectedId, nodeId: node.id })
+      .then(data => {
+        const normalized = normalizeGraphData(data)
+        const levels = buildCommunityClusterLevels(normalized)
+        setGraphData(data)
+        setClusterViewEnabled(levels.length > 0)
+        setClusterPath(getClusterPathForNode(normalized, levels, node.id))
+        setFocusedNodeId(node.id)
+        setLastExpandedNodeIds(new Set([node.id]))
+        setLoading(false)
+      })
+      .catch(err => {
+        setError(String(err))
+        setLoading(false)
+      })
+  }, [selectedId])
 
   const colorMapRef = useRef<Record<string, string>>({})
   const edgeColorMapRef = useRef<Record<string, string>>({})
@@ -814,7 +940,7 @@ function App() {
 
     setLoading(true)
     setError(null)
-    invoke<GraphData>('expand_node', {
+    invokeCommand<GraphData>('expand_node', {
       id: selectedId,
       nodeId: node.expandNodeId,
       visibleNodeIds: graphData.nodes.map(item => item.id),
@@ -829,7 +955,8 @@ function App() {
         })
         setGraphData(data)
         setLastExpandedNodeIds(highlightedNodeIds)
-        setExpandedClusterId(null)
+        setClusterPath([])
+        setFocusedNodeId(null)
         setLoading(false)
       })
       .catch(err => {
@@ -840,33 +967,40 @@ function App() {
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
   const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
-  const selectedCluster = useMemo(() => (
-    clusterLevels.find(level => level.level === selectedClusterLevel) || clusterLevels[0]
-  ), [clusterLevels, selectedClusterLevel])
-  const expandedCluster = useMemo(() => (
-    expandedClusterId === null
-      ? null
-      : selectedCluster?.clusters.find(cluster => cluster.clusterId === expandedClusterId) || null
-  ), [expandedClusterId, selectedCluster])
+  const coarsestClusterLevel = useMemo(() => getCoarsestClusterLevel(clusterLevels), [clusterLevels])
+  const currentClusterLevel = useMemo(() => {
+    const parent = clusterPath[clusterPath.length - 1]
+    const currentLevelNumber = parent ? parent.level - 1 : coarsestClusterLevel?.level
+    return currentLevelNumber === undefined ? null : getClusterLevel(clusterLevels, currentLevelNumber)
+  }, [clusterLevels, clusterPath, coarsestClusterLevel])
+  const clusterBreadcrumbs = useMemo(() => clusterPath.map(pathItem => {
+    const level = getClusterLevel(clusterLevels, pathItem.level)
+    const cluster = level?.clusters.find(item => item.clusterId === pathItem.clusterId)
+    return {
+      ...pathItem,
+      label: cluster?.label || `Cluster ${pathItem.clusterId}`,
+      size: cluster?.size,
+    }
+  }), [clusterLevels, clusterPath])
+  const visibleClusterPath = useMemo(() => (
+    clusterPath.filter(pathItem => getClusterLevel(clusterLevels, pathItem.level))
+  ), [clusterLevels, clusterPath])
   const visibleGraphData = useMemo(() => (
-    clusterCollapsed && selectedCluster
-      ? collapseGraphByClusterLevel(normalizedGraphData, selectedCluster, expandedClusterId)
+    clusterViewEnabled && clusterLevels.length > 0
+      ? buildClusterDrillGraph(normalizedGraphData, clusterLevels, visibleClusterPath)
       : normalizedGraphData
-  ), [clusterCollapsed, expandedClusterId, normalizedGraphData, selectedCluster])
+  ), [clusterViewEnabled, clusterLevels, normalizedGraphData, visibleClusterPath])
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    if (!selectedCluster) {
-      setClusterCollapsed(false)
-      setSelectedClusterLevel(0)
-      setExpandedClusterId(null)
+    if (clusterLevels.length === 0) {
+      setClusterPath([])
       return
     }
-    if (!clusterLevels.some(level => level.level === selectedClusterLevel)) {
-      setSelectedClusterLevel(selectedCluster.level)
-      setExpandedClusterId(null)
+    if (visibleClusterPath.length !== clusterPath.length) {
+      setClusterPath(visibleClusterPath)
     }
-  }, [clusterLevels, selectedCluster, selectedClusterLevel])
+  }, [clusterLevels.length, clusterPath, visibleClusterPath])
   /* eslint-enable react-hooks/set-state-in-effect */
 
   const forceGraphData = useMemo<ForceGraphData<GraphNode, ForceGraphLink>>(() => ({
@@ -895,9 +1029,10 @@ function App() {
         .filter(node => !isExpanderNode(node))
         .slice(0, 5)
         .map(node => node.id),
+        ...(focusedNodeId ? [focusedNodeId] : []),
       ]
     )
-  }, [lastExpandedNodeIds, visibleGraphData.nodes, nodeDegree])
+  }, [lastExpandedNodeIds, visibleGraphData.nodes, nodeDegree, focusedNodeId])
 
   const getNodeColor = useCallback((node: GraphNode) => {
     const key = node.community === undefined ? node.label : `community:${node.community}`
@@ -925,9 +1060,12 @@ function App() {
   const handleVisibleNodeClick = useCallback((nodeId: string) => {
     const clusterNode = parseClusterNodeId(nodeId)
     if (clusterNode) {
-      setSelectedClusterLevel(clusterNode.level)
-      setExpandedClusterId(clusterNode.clusterId)
-      setClusterCollapsed(true)
+      setClusterViewEnabled(true)
+      setClusterPath(path => {
+        const parentIndex = path.findIndex(item => item.level <= clusterNode.level)
+        const basePath = parentIndex === -1 ? path : path.slice(0, parentIndex)
+        return [...basePath, clusterNode]
+      })
       return
     }
     handleNodeClick(nodeId)
@@ -1000,6 +1138,10 @@ function App() {
                   className={`file-item ${selectedId === db.id ? 'active' : ''}`}
                   onClick={() => {
                     setSelectedId(db.id)
+                    setNodeSearch('')
+                    setSearchResults([])
+                    setSearchError(null)
+                    setFocusedNodeId(null)
                   }}
                   title={db.relativePath}
                 >
@@ -1008,6 +1150,40 @@ function App() {
               ))}
             </ul>
           )}
+          <div className="node-search">
+            <div className="panel-title">Find Node</div>
+            <div className="node-search-row">
+              <input
+                value={nodeSearch}
+                placeholder="Search name, label, or id"
+                onChange={event => setNodeSearch(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') {
+                    runNodeSearch()
+                  }
+                }}
+              />
+              <button onClick={runNodeSearch} disabled={searching || !nodeSearch.trim()}>
+                {searching ? '...' : 'Go'}
+              </button>
+            </div>
+            {searchError && <div className="search-error">{searchError}</div>}
+            {searchResults.length > 0 && (
+              <div className="search-results">
+                {searchResults.map(result => (
+                  <button
+                    key={result.id}
+                    className="search-result"
+                    onClick={() => exploreSearchResult(result)}
+                    title={`${result.label}: ${result.name}`}
+                  >
+                    <span>{result.name}</span>
+                    <small>{result.label} · {result.id}</small>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1017,39 +1193,48 @@ function App() {
             <span className="graph-stats">
               {loading
                 ? 'Loading...'
-                : clusterCollapsed && selectedCluster
-                  ? expandedCluster
-                    ? `${expandedCluster.label} expanded, ${visibleGraphData.nodes.length} visible nodes, ${visibleGraphData.links.length} visible edges`
-                    : `${visibleGraphData.nodes.length} clusters, ${visibleGraphData.links.length} aggregate edges`
+                : clusterViewEnabled && clusterLevels.length > 0
+                  ? currentClusterLevel
+                    ? `${visibleGraphData.nodes.length} clusters at level ${currentClusterLevel.level}, ${visibleGraphData.links.length} aggregate edges`
+                    : `${visibleGraphData.nodes.length} nodes in cluster, ${visibleGraphData.links.length} edges`
                   : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
+            {focusedNodeId && <span className="focus-chip">Focused node {focusedNodeId}</span>}
             {error && <span className="error-message">{error}</span>}
           </div>
 
           <div className="header-right">
             {clusterLevels.length > 0 && (
               <div className="cluster-controls" aria-label="Clusters">
-                <select
-                  value={selectedCluster?.level ?? 0}
-                  onChange={event => {
-                    setSelectedClusterLevel(Number(event.target.value))
-                    setExpandedClusterId(null)
-                  }}
-                >
-                  {clusterLevels.map(level => (
-                    <option key={level.level} value={level.level}>
-                      Level {level.level}
-                    </option>
-                  ))}
-                </select>
                 <button
-                  className={clusterCollapsed ? 'active' : ''}
+                  className={clusterViewEnabled && clusterPath.length === 0 ? 'active' : ''}
                   onClick={() => {
-                    setExpandedClusterId(null)
-                    setClusterCollapsed(value => !value)
+                    setClusterViewEnabled(true)
+                    setClusterPath([])
                   }}
                 >
-                  {clusterCollapsed ? 'Expand All' : 'Collapse'}
+                  Clusters
+                </button>
+                {clusterBreadcrumbs.map((item, index) => (
+                  <button
+                    key={`${item.level}:${item.clusterId}`}
+                    className="breadcrumb-btn"
+                    onClick={() => {
+                      setClusterViewEnabled(true)
+                      setClusterPath(clusterPath.slice(0, index + 1))
+                    }}
+                    title={item.size === undefined ? item.label : `${item.label}, ${item.size} nodes`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+                <button
+                  className={!clusterViewEnabled ? 'active' : ''}
+                  onClick={() => {
+                    setClusterViewEnabled(value => !value)
+                  }}
+                >
+                  {clusterViewEnabled ? 'All Nodes' : 'Cluster View'}
                 </button>
               </div>
             )}
