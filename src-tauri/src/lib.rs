@@ -5,12 +5,14 @@ use arrow_schema::{DataType, Field, Schema};
 use icebug::{GraphR, Leiden};
 use lbug::{Connection, Database, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{Manager, State};
 use walkdir::WalkDir;
 
@@ -105,6 +107,70 @@ struct GraphData {
     cluster_debug: GraphClusterDebug,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct LlmClusterNamingConfig {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    endpoint: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "sampleSize")]
+    sample_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LlmClusterNameRequest {
+    key: String,
+    #[serde(rename = "clusterId")]
+    cluster_id: u64,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LlmClusterNameResult {
+    key: String,
+    name: Option<String>,
+    error: Option<String>,
+}
+
+impl LlmClusterNamingConfig {
+    fn enabled(&self) -> bool {
+        !self.access_token.trim().is_empty()
+    }
+
+    fn endpoint(&self) -> String {
+        let endpoint = self
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("https://openrouter.ai")
+            .trim_end_matches('/')
+            .to_string();
+
+        if endpoint.ends_with("/chat/completions") {
+            endpoint
+        } else if endpoint.ends_with("/v1") || endpoint.ends_with("/api/v1") {
+            format!("{endpoint}/chat/completions")
+        } else {
+            format!("{endpoint}/api/v1/chat/completions")
+        }
+    }
+
+    fn model(&self) -> String {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("deepseek-v4-flash")
+            .to_string()
+    }
+
+    fn sample_size(&self) -> usize {
+        self.sample_size.unwrap_or(LLM_CLUSTER_SAMPLE_SIZE).max(1)
+    }
+}
+
 const SEED_NODE_COUNT: usize = 8;
 const EXPAND_BATCH_SIZE: usize = 8;
 const EDGE_SCAN_LIMIT: usize = 10_000;
@@ -113,6 +179,8 @@ const SEARCH_RESULT_LIMIT: usize = 30;
 const SEARCH_NEIGHBOR_LIMIT: usize = 24;
 #[cfg(feature = "icebug-analytics")]
 const CLUSTER_LEVEL_LIMIT: usize = 3;
+const LLM_CLUSTER_SAMPLE_SIZE: usize = 15;
+const LLM_CLUSTER_NAME_LIMIT: usize = 24;
 const EXPANDER_PREFIX: &str = "__expand__:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,9 +629,95 @@ fn remap_membership(membership: &[u64]) -> (Vec<u64>, HashMap<u64, u64>) {
 }
 
 #[cfg(feature = "icebug-analytics")]
-fn cluster_records(membership: &[u64], parent_membership: Option<&[u64]>) -> Vec<GraphCluster> {
+fn node_cluster_label(node: &GraphNode) -> String {
+    let label = node.label.trim();
+    let name = node.name.trim();
+    if name.is_empty() || name == label {
+        label.to_string()
+    } else {
+        format!("{label}: {name}")
+    }
+}
+
+fn clean_llm_cluster_name(value: &str) -> Option<String> {
+    let name = value
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(['"', '\'', '.', ':', '-'])
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.chars().take(80).collect())
+}
+
+fn llm_cluster_name(
+    config: &LlmClusterNamingConfig,
+    cluster_id: u64,
+    sample_labels: &[String],
+) -> Result<Option<String>, String> {
+    if !config.enabled() || sample_labels.is_empty() {
+        return Ok(None);
+    }
+
+    let label_list = sample_labels
+        .iter()
+        .map(|label| format!("- {label}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = json!({
+        "model": config.model(),
+        "messages": [
+            {
+                "role": "system",
+                "content": "Name a graph cluster from sampled node labels. Return only a concise 2-5 word name, with no punctuation, quotes, or explanation."
+            },
+            {
+                "role": "user",
+                "content": format!("Cluster {cluster_id} sample labels:\n{label_list}")
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 24
+    });
+
+    let response: serde_json::Value = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| format!("Failed to create LLM client: {err}"))?
+        .post(config.endpoint())
+        .bearer_auth(config.access_token.trim())
+        .json(&body)
+        .send()
+        .map_err(|err| format!("LLM request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("LLM request returned an error: {err}"))?
+        .json()
+        .map_err(|err| format!("LLM response was not valid JSON: {err}"))?;
+
+    let content = response
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .and_then(clean_llm_cluster_name);
+    Ok(content)
+}
+
+#[cfg(feature = "icebug-analytics")]
+fn cluster_records(
+    membership: &[u64],
+    parent_membership: Option<&[u64]>,
+    nodes: &[GraphNode],
+    llm_config: Option<&LlmClusterNamingConfig>,
+    llm_name_budget: &mut usize,
+) -> Vec<GraphCluster> {
     let mut counts: HashMap<u64, usize> = HashMap::new();
     let mut parents: HashMap<u64, u64> = HashMap::new();
+    let mut labels_by_cluster: HashMap<u64, Vec<String>> = HashMap::new();
     for (index, cluster_id) in membership.iter().enumerate() {
         *counts.entry(*cluster_id).or_insert(0) += 1;
         if let Some(parent_ids) = parent_membership {
@@ -571,15 +725,86 @@ fn cluster_records(membership: &[u64], parent_membership: Option<&[u64]>) -> Vec
                 parents.entry(*cluster_id).or_insert(*parent_id);
             }
         }
+        if let Some(node) = nodes.get(index) {
+            labels_by_cluster
+                .entry(*cluster_id)
+                .or_default()
+                .push(node_cluster_label(node));
+        }
+    }
+
+    let llm_enabled = llm_config.filter(|config| config.enabled()).is_some();
+    let mut llm_cluster_ids = HashSet::new();
+    if llm_enabled && *llm_name_budget > 0 {
+        let mut candidates: Vec<(u64, usize)> = counts
+            .iter()
+            .filter_map(|(cluster_id, size)| (*size > 1).then_some((*cluster_id, *size)))
+            .collect();
+        candidates.sort_by_key(|(cluster_id, size)| (std::cmp::Reverse(*size), *cluster_id));
+        let take_count = candidates.len().min(*llm_name_budget);
+        llm_cluster_ids.extend(
+            candidates
+                .into_iter()
+                .take(take_count)
+                .map(|(cluster_id, _)| cluster_id),
+        );
+        eprintln!(
+            "LLM cluster naming: naming {} cluster(s), {} budgeted call(s) remaining before this level.",
+            llm_cluster_ids.len(),
+            *llm_name_budget,
+        );
+    } else if llm_enabled {
+        eprintln!("LLM cluster naming: budget exhausted; using fallback names for this level.");
     }
 
     let mut clusters: Vec<GraphCluster> = counts
         .into_iter()
-        .map(|(cluster_id, size)| GraphCluster {
-            cluster_id,
-            label: format!("Cluster {cluster_id}"),
-            size,
-            parent_cluster_id: parents.get(&cluster_id).copied(),
+        .map(|(cluster_id, size)| {
+            let fallback_label = format!("Cluster {cluster_id}");
+            let label = llm_config
+                .filter(|config| config.enabled())
+                .filter(|_| llm_cluster_ids.contains(&cluster_id))
+                .and_then(|config| {
+                    let mut sample = labels_by_cluster
+                        .get(&cluster_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    sample.sort();
+                    sample.dedup();
+                    fastrand::shuffle(&mut sample);
+                    sample.truncate(config.sample_size());
+                    eprintln!(
+                        "LLM cluster naming: requesting name for cluster {cluster_id} with {} sampled label(s).",
+                        sample.len(),
+                    );
+                    *llm_name_budget = llm_name_budget.saturating_sub(1);
+                    match llm_cluster_name(config, cluster_id, &sample) {
+                        Ok(name) => {
+                            if let Some(name) = &name {
+                                eprintln!(
+                                    "LLM cluster naming: cluster {cluster_id} named {name:?}."
+                                );
+                            } else {
+                                eprintln!(
+                                    "LLM cluster naming: cluster {cluster_id} returned no usable name; using fallback."
+                                );
+                            }
+                            name
+                        }
+                        Err(err) => {
+                            eprintln!("Cluster {cluster_id} LLM naming failed: {err}");
+                            None
+                        }
+                    }
+                })
+                .unwrap_or(fallback_label);
+
+            GraphCluster {
+                cluster_id,
+                label,
+                size,
+                parent_cluster_id: parents.get(&cluster_id).copied(),
+            }
         })
         .collect();
     clusters.sort_by_key(|cluster| cluster.cluster_id);
@@ -655,6 +880,8 @@ fn cluster_debug(
 fn compute_cluster_levels(
     nodes: &[GraphNode],
     links: &[GraphLink],
+    llm_config: Option<&LlmClusterNamingConfig>,
+    llm_name_budget: &mut usize,
 ) -> (Option<Vec<GraphClusterLevel>>, GraphClusterDebug) {
     let node_count = nodes.len();
     if node_count < 2 {
@@ -736,7 +963,7 @@ fn compute_cluster_levels(
     levels.push(GraphClusterLevel {
         level: 0,
         membership: level_zero.clone(),
-        clusters: cluster_records(&level_zero, None),
+        clusters: cluster_records(&level_zero, None, nodes, llm_config, llm_name_budget),
     });
 
     let mut node_membership = level_zero.clone();
@@ -793,12 +1020,18 @@ fn compute_cluster_levels(
         }
 
         if let Some(previous) = levels.last_mut() {
-            previous.clusters = cluster_records(&node_membership, Some(&next_membership));
+            previous.clusters = cluster_records(
+                &node_membership,
+                Some(&next_membership),
+                nodes,
+                llm_config,
+                llm_name_budget,
+            );
         }
         levels.push(GraphClusterLevel {
             level,
             membership: next_membership.clone(),
-            clusters: cluster_records(&next_membership, None),
+            clusters: cluster_records(&next_membership, None, nodes, llm_config, llm_name_budget),
         });
 
         node_membership = next_membership;
@@ -836,6 +1069,8 @@ fn compute_cluster_levels(
 fn compute_cluster_levels(
     _nodes: &[GraphNode],
     links: &[GraphLink],
+    _llm_config: Option<&LlmClusterNamingConfig>,
+    _llm_name_budget: &mut usize,
 ) -> (Option<Vec<GraphClusterLevel>>, GraphClusterDebug) {
     (
         None,
@@ -852,7 +1087,34 @@ fn compute_cluster_levels(
     )
 }
 
-fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
+fn graph_data(
+    nodes: Vec<GraphNode>,
+    links: Vec<GraphLink>,
+    llm_config: Option<&LlmClusterNamingConfig>,
+    context: &str,
+) -> GraphData {
+    eprintln!(
+        "Graph data [{context}]: building response for {} node(s), {} edge(s); visible LLM cluster naming {}.",
+        nodes.len(),
+        links.len(),
+        if llm_config
+            .filter(|config| config.enabled())
+            .is_some()
+        {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(config) = llm_config.filter(|config| config.enabled()) {
+        eprintln!(
+            "Graph data [{context}]: LLM model={}, endpoint={}, sample_size={}, max_visible_cluster_name_calls={}; naming is deferred until clusters are visible.",
+            config.model(),
+            config.endpoint(),
+            config.sample_size(),
+            LLM_CLUSTER_NAME_LIMIT,
+        );
+    }
     let csr = build_csr(&nodes, &links);
     let csr_arrow_ipc = csr_to_arrow_ipc(&csr)
         .map_err(|err| {
@@ -860,8 +1122,10 @@ fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
             err
         })
         .ok();
-    let (cluster_levels, cluster_debug) = compute_cluster_levels(&nodes, &links);
-    eprintln!("Cluster debug: {}", cluster_debug.message);
+    let mut llm_name_budget = LLM_CLUSTER_NAME_LIMIT;
+    let (cluster_levels, cluster_debug) =
+        compute_cluster_levels(&nodes, &links, None, &mut llm_name_budget);
+    eprintln!("Cluster debug [{context}]: {}", cluster_debug.message);
     GraphData {
         nodes,
         links,
@@ -873,6 +1137,46 @@ fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
         csr_arrow_ipc,
         cluster_levels,
         cluster_debug,
+    }
+}
+
+fn graph_data_without_clusters(
+    nodes: Vec<GraphNode>,
+    links: Vec<GraphLink>,
+    context: &str,
+) -> GraphData {
+    eprintln!(
+        "Graph data [{context}]: building internal graph for {} node(s), {} edge(s); clustering deferred.",
+        nodes.len(),
+        links.len(),
+    );
+    let csr = build_csr(&nodes, &links);
+    let csr_arrow_ipc = csr_to_arrow_ipc(&csr)
+        .map_err(|err| {
+            eprintln!("{err}");
+            err
+        })
+        .ok();
+    GraphData {
+        nodes,
+        links,
+        csr: if csr_arrow_ipc.is_some() {
+            None
+        } else {
+            Some(csr)
+        },
+        csr_arrow_ipc,
+        cluster_levels: None,
+        cluster_debug: cluster_debug(
+            false,
+            "deferred",
+            "Cluster computation deferred for internal full graph.".to_string(),
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
     }
 }
 
@@ -934,7 +1238,11 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         );
     }
 
-    Ok(graph_data(nodes.into_values().collect(), links))
+    Ok(graph_data_without_clusters(
+        nodes.into_values().collect(),
+        links,
+        "collect_edge_graph",
+    ))
 }
 
 fn add_expanders(
@@ -982,7 +1290,10 @@ fn add_expanders(
     }
 }
 
-fn seed_graph_from_full(full_graph: GraphData) -> GraphData {
+fn seed_graph_from_full(
+    full_graph: GraphData,
+    llm_config: Option<&LlmClusterNamingConfig>,
+) -> GraphData {
     let mut degrees: HashMap<String, usize> = HashMap::new();
     for node in &full_graph.nodes {
         degrees.entry(node.id.clone()).or_insert(0);
@@ -1012,7 +1323,7 @@ fn seed_graph_from_full(full_graph: GraphData) -> GraphData {
         .collect();
 
     add_expanders(&full_graph, &visible_ids, &mut nodes, &mut links);
-    graph_data(nodes, links)
+    graph_data(nodes, links, llm_config, "seed_graph_from_full")
 }
 
 fn expand_node_from_full(
@@ -1020,6 +1331,7 @@ fn expand_node_from_full(
     node_id: &str,
     visible_node_ids: &[String],
     offset: usize,
+    llm_config: Option<&LlmClusterNamingConfig>,
 ) -> GraphData {
     let visible_order: Vec<String> = visible_node_ids
         .iter()
@@ -1098,7 +1410,7 @@ fn expand_node_from_full(
         nodes.push(expander);
     }
 
-    graph_data(nodes, links)
+    graph_data(nodes, links, llm_config, "expand_node_from_full")
 }
 
 #[tauri::command]
@@ -1113,6 +1425,75 @@ fn get_initial_database_id(state: State<AppState>) -> Option<usize> {
         .iter()
         .find(|db| db.path == *initial_path)
         .map(|db| db.id)
+}
+
+#[tauri::command]
+fn name_visible_clusters(
+    llm_config: LlmClusterNamingConfig,
+    clusters: Vec<LlmClusterNameRequest>,
+) -> Vec<LlmClusterNameResult> {
+    if !llm_config.enabled() {
+        eprintln!("Visible cluster naming skipped: LLM config is disabled.");
+        return Vec::new();
+    }
+
+    let request_count = clusters.len().min(LLM_CLUSTER_NAME_LIMIT);
+    eprintln!(
+        "Visible cluster naming: naming {} visible cluster(s), capped from {} requested cluster(s); model={}, endpoint={}.",
+        request_count,
+        clusters.len(),
+        llm_config.model(),
+        llm_config.endpoint(),
+    );
+
+    clusters
+        .into_iter()
+        .take(LLM_CLUSTER_NAME_LIMIT)
+        .map(|cluster| {
+            let mut sample = cluster.labels;
+            sample.sort();
+            sample.dedup();
+            fastrand::shuffle(&mut sample);
+            sample.truncate(llm_config.sample_size());
+            eprintln!(
+                "Visible cluster naming: requesting name for {} with {} sampled label(s).",
+                cluster.key,
+                sample.len(),
+            );
+
+            match llm_cluster_name(&llm_config, cluster.cluster_id, &sample) {
+                Ok(name) => {
+                    if let Some(name) = &name {
+                        eprintln!(
+                            "Visible cluster naming: cluster {} named {name:?}.",
+                            cluster.key
+                        );
+                    } else {
+                        eprintln!(
+                            "Visible cluster naming: cluster {} returned no usable name.",
+                            cluster.key
+                        );
+                    }
+                    LlmClusterNameResult {
+                        key: cluster.key,
+                        name,
+                        error: None,
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Visible cluster naming: cluster {} failed: {err}",
+                        cluster.key
+                    );
+                    LlmClusterNameResult {
+                        key: cluster.key,
+                        name: None,
+                        error: Some(err),
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 fn add_database_info(state: &AppState, db_info: DatabaseInfo) -> Result<DatabaseInfo, String> {
@@ -1207,7 +1588,11 @@ fn get_directories(
 }
 
 #[tauri::command]
-fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
+fn get_graph(
+    state: State<AppState>,
+    id: usize,
+    llm_config: Option<LlmClusterNamingConfig>,
+) -> Result<GraphData, String> {
     let databases = get_all_databases(&state);
     let db_info = databases.get(id).ok_or("Database not found")?;
 
@@ -1215,7 +1600,8 @@ fn get_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
         .map_err(|e| format!("Failed to open database: {}", e))?;
     let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
 
-    collect_edge_graph(&conn, EDGE_SCAN_LIMIT).map(seed_graph_from_full)
+    collect_edge_graph(&conn, EDGE_SCAN_LIMIT)
+        .map(|full_graph| seed_graph_from_full(full_graph, llm_config.as_ref()))
 }
 
 #[tauri::command]
@@ -1277,6 +1663,7 @@ fn get_node_neighborhood(
     state: State<AppState>,
     id: usize,
     node_id: String,
+    llm_config: Option<LlmClusterNamingConfig>,
 ) -> Result<GraphData, String> {
     let focus_node_id = node_id;
     let databases = get_all_databases(&state);
@@ -1341,7 +1728,12 @@ fn get_node_neighborhood(
         .collect();
 
     add_expanders(&full_graph, &visible_ids, &mut nodes, &mut links);
-    Ok(graph_data(nodes, links))
+    Ok(graph_data(
+        nodes,
+        links,
+        llm_config.as_ref(),
+        "get_node_neighborhood",
+    ))
 }
 
 #[tauri::command]
@@ -1351,6 +1743,7 @@ fn expand_node(
     node_id: String,
     visible_node_ids: Vec<String>,
     offset: Option<usize>,
+    llm_config: Option<LlmClusterNamingConfig>,
 ) -> Result<GraphData, String> {
     let databases = get_all_databases(&state);
     let db_info = databases.get(id).ok_or("Database not found")?;
@@ -1365,11 +1758,17 @@ fn expand_node(
         &node_id,
         &visible_node_ids,
         offset.unwrap_or(0),
+        llm_config.as_ref(),
     ))
 }
 
 #[tauri::command]
-fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<GraphData, String> {
+fn execute_query(
+    state: State<AppState>,
+    id: usize,
+    query: String,
+    llm_config: Option<LlmClusterNamingConfig>,
+) -> Result<GraphData, String> {
     let databases = get_all_databases(&state);
     let db_info = databases.get(id).ok_or("Database not found")?;
 
@@ -1441,7 +1840,12 @@ fn execute_query(state: State<AppState>, id: usize, query: String) -> Result<Gra
         .filter(|link| node_id_set.contains(&link.source) && node_id_set.contains(&link.target))
         .collect();
 
-    Ok(graph_data(nodes, links))
+    Ok(graph_data(
+        nodes,
+        links,
+        llm_config.as_ref(),
+        "execute_query",
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1474,6 +1878,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_databases,
             get_initial_database_id,
+            name_visible_clusters,
             add_database,
             get_directories,
             get_graph,

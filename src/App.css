@@ -87,6 +87,15 @@ body {
   border-top: 1px solid var(--border-color);
 }
 
+.llm-cluster-settings {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .panel-title {
   margin-bottom: 8px;
   color: var(--text-secondary);
@@ -114,6 +123,72 @@ body {
 .node-search-row input:focus {
   outline: none;
   border-color: var(--accent-color);
+}
+
+.llm-cluster-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+}
+
+.llm-cluster-summary small {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.llm-cluster-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.llm-cluster-fields input {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.llm-cluster-fields input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.llm-cluster-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.llm-cluster-actions button {
+  padding: 6px 10px;
+  background-color: var(--accent-color);
+  color: white;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.llm-cluster-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .node-search-row button,

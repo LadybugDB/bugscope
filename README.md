@@ -9,6 +9,7 @@ An interactive graph visualization tool for ladybugdb. Explore relationships bet
 - **Visual Encoding** - Node size reflects connection count (more connections = larger nodes), and colors differentiate entity types.
 - **Dark/Light Mode** - Toggle between dark and light themes for comfortable viewing.
 - **Relationship Labels** - Hover over edges to see the type of relationship between connected nodes.
+- **Optional LLM Cluster Names** - Provide an LLM access token to name Leiden clusters from a random sample of 15 node labels in each cluster.
 
 ## Getting Started
 
@@ -19,13 +20,10 @@ An interactive graph visualization tool for ladybugdb. Explore relationships bet
 
 2. **Start the application**
    ```bash
-   npm run dev
+   cargo tauri dev --features=icebug-analytics -- -- ../test.lbdb
    ```
 
-3. **Open in browser**
-   Navigate to `http://localhost:5173` to view the visualizer.
-
-The application will automatically connect to the backend API at `http://localhost:3001` to fetch available databases and graph data. It will scan for databases starting from the parent directory looking for files with `.lbdb` extension.
+The application opens as a Tauri desktop app. Pass a `.lbdb` path after `-- --` to load that database at startup.
 
 ## Usage
 
@@ -36,6 +34,12 @@ The application will automatically connect to the backend API at `http://localho
 5. Hover over nodes to see their labels
 6. Hover over edges to see relationship types
 7. Use the theme toggle button to switch between dark and light modes
+
+## Optional LLM Cluster Naming
+
+Cluster naming is disabled by default. To enable it, expand the sidebar's Cluster Names section, enter an LLM access token, and click Apply. Cluster computation still starts with local fallback names; the backend only sends a random sample of 15 labels for clusters that are currently visible in the drill view, then falls back to `Cluster N` if a request fails.
+
+The endpoint defaults to `https://openrouter.ai`, and the model field defaults to `deepseek-v4-flash`. Base endpoints are sent through their `/api/v1/chat/completions` path, and both fields can be changed in the sidebar before applying.
 
 ## Requirements
 
