@@ -937,6 +937,12 @@ fn add_database(state: State<AppState>, file_path: String) -> Result<DatabaseInf
     add_database_info(&state, db_info)
 }
 
+fn default_file_picker_dir(state: &AppState) -> PathBuf {
+    dirs::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| state.data_dir.clone())
+}
+
 #[tauri::command]
 fn get_directories(
     state: State<AppState>,
@@ -953,7 +959,7 @@ fn get_directories(
                     .join(p)
             }
         }
-        _ => std::env::current_dir().unwrap_or_else(|_| state.data_dir.clone()),
+        _ => default_file_picker_dir(&state),
     };
 
     let entries = fs::read_dir(&dir).map_err(|e| e.to_string())?;
