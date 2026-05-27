@@ -1,12 +1,15 @@
-#[cfg(feature = "icebug-analytics")]
-use arrow_array::UInt64Array;
+use arrow_array::{builder::UInt64Builder, RecordBatch, UInt64Array};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema};
 #[cfg(feature = "icebug-analytics")]
 use icebug::{GraphR, Leiden};
 use lbug::{Connection, Database, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{Manager, State};
 use walkdir::WalkDir;
@@ -94,6 +97,8 @@ struct GraphData {
     links: Vec<GraphLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     csr: Option<GraphCsr>,
+    #[serde(rename = "csrArrowIpc", skip_serializing_if = "Option::is_none")]
+    csr_arrow_ipc: Option<Vec<u8>>,
     #[serde(rename = "clusterLevels", skip_serializing_if = "Option::is_none")]
     cluster_levels: Option<Vec<GraphClusterLevel>>,
     #[serde(rename = "clusterDebug")]
@@ -420,6 +425,57 @@ fn build_csr(nodes: &[GraphNode], links: &[GraphLink]) -> GraphCsr {
         indices,
         edge_ids: Some(edge_ids),
     }
+}
+
+fn nullable_u64_column(values: &[u64], row_count: usize) -> UInt64Array {
+    let mut builder = UInt64Builder::with_capacity(row_count);
+    for index in 0..row_count {
+        if let Some(value) = values.get(index) {
+            builder.append_value(*value);
+        } else {
+            builder.append_null();
+        }
+    }
+    builder.finish()
+}
+
+fn csr_to_arrow_ipc(csr: &GraphCsr) -> Result<Vec<u8>, String> {
+    let row_count = [
+        csr.indptr.len(),
+        csr.indices.len(),
+        csr.edge_ids.as_ref().map(|items| items.len()).unwrap_or(0),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let edge_ids = csr.edge_ids.as_deref().unwrap_or(&[]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("indptr", DataType::UInt64, true),
+        Field::new("indices", DataType::UInt64, true),
+        Field::new("edge_ids", DataType::UInt64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(nullable_u64_column(&csr.indptr, row_count)),
+            Arc::new(nullable_u64_column(&csr.indices, row_count)),
+            Arc::new(nullable_u64_column(edge_ids, row_count)),
+        ],
+    )
+    .map_err(|e| format!("Failed to build Arrow CSR batch: {e}"))?;
+
+    let mut output = Cursor::new(Vec::new());
+    {
+        let mut writer = StreamWriter::try_new(&mut output, &schema)
+            .map_err(|e| format!("Failed to create Arrow CSR writer: {e}"))?;
+        writer
+            .write(&batch)
+            .map_err(|e| format!("Failed to write Arrow CSR batch: {e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("Failed to finish Arrow CSR stream: {e}"))?;
+    }
+    Ok(output.into_inner())
 }
 
 #[cfg(feature = "icebug-analytics")]
@@ -797,13 +853,24 @@ fn compute_cluster_levels(
 }
 
 fn graph_data(nodes: Vec<GraphNode>, links: Vec<GraphLink>) -> GraphData {
-    let csr = Some(build_csr(&nodes, &links));
+    let csr = build_csr(&nodes, &links);
+    let csr_arrow_ipc = csr_to_arrow_ipc(&csr)
+        .map_err(|err| {
+            eprintln!("{err}");
+            err
+        })
+        .ok();
     let (cluster_levels, cluster_debug) = compute_cluster_levels(&nodes, &links);
     eprintln!("Cluster debug: {}", cluster_debug.message);
     GraphData {
         nodes,
         links,
-        csr,
+        csr: if csr_arrow_ipc.is_some() {
+            None
+        } else {
+            Some(csr)
+        },
+        csr_arrow_ipc,
         cluster_levels,
         cluster_debug,
     }

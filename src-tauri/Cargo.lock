@@ -87,7 +87,7 @@ dependencies = [
  "arrow-ord",
  "arrow-row",
  "arrow-schema 55.2.0",
- "arrow-select",
+ "arrow-select 55.2.0",
  "arrow-string",
 ]
 
@@ -169,7 +169,7 @@ dependencies = [
  "arrow-buffer 55.2.0",
  "arrow-data 55.2.0",
  "arrow-schema 55.2.0",
- "arrow-select",
+ "arrow-select 55.2.0",
  "atoi",
  "base64 0.22.1",
  "chrono",
@@ -204,6 +204,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-ipc"
+version = "56.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f88b0fbb33af28089ccd3e4dcd0ff09de46842168d00220b920f7231feddf5"
+dependencies = [
+ "arrow-array 56.2.1",
+ "arrow-buffer 56.2.1",
+ "arrow-data 56.2.1",
+ "arrow-schema 56.2.1",
+ "arrow-select 56.2.1",
+ "flatbuffers",
+]
+
+[[package]]
 name = "arrow-ord"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -213,7 +227,7 @@ dependencies = [
  "arrow-buffer 55.2.0",
  "arrow-data 55.2.0",
  "arrow-schema 55.2.0",
- "arrow-select",
+ "arrow-select 55.2.0",
 ]
 
 [[package]]
@@ -259,6 +273,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-select"
+version = "56.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2368a78bd32902dba39d52519d70f63799c8b5dc8a9477129a30c2fd3dc70c19"
+dependencies = [
+ "ahash",
+ "arrow-array 56.2.1",
+ "arrow-buffer 56.2.1",
+ "arrow-data 56.2.1",
+ "arrow-schema 56.2.1",
+ "num",
+]
+
+[[package]]
 name = "arrow-string"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,7 +296,7 @@ dependencies = [
  "arrow-buffer 55.2.0",
  "arrow-data 55.2.0",
  "arrow-schema 55.2.0",
- "arrow-select",
+ "arrow-select 55.2.0",
  "memchr",
  "num",
  "regex",
@@ -414,6 +442,8 @@ name = "bugscope"
 version = "0.15.1"
 dependencies = [
  "arrow-array 56.2.1",
+ "arrow-ipc",
+ "arrow-schema 56.2.1",
  "dirs 5.0.1",
  "icebug",
  "lbug",
@@ -1152,6 +1182,16 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.11.1",
+ "rustc_version",
+]
 
 [[package]]
 name = "flate2"

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "apache-arrow": "^21.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-force-graph-2d": "^1.29.1",

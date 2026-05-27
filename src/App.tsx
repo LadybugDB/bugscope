@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke, isTauri } from '@tauri-apps/api/core'
+import { tableFromIPC } from 'apache-arrow'
 import ForceGraph2D from 'react-force-graph-2d'
 import type { GraphData as ForceGraphData, NodeObject } from 'react-force-graph-2d'
 import { IcebugSigmaGraph, Sigma } from './vendor/sigma-runtime.js'
@@ -70,6 +71,7 @@ interface GraphData {
   nodes: GraphNode[]
   links: GraphLink[]
   csr?: GraphCsr
+  csrArrowIpc?: number[] | Uint8Array
   clusterLevels?: GraphClusterLevel[]
   clusterDebug?: GraphClusterDebug
 }
@@ -84,8 +86,15 @@ interface NormalizedGraphData {
   nodes: GraphNode[]
   links: NormalizedGraphLink[]
   csr?: GraphCsr
+  csrArrowIpc?: number[] | Uint8Array
   clusterLevels?: GraphClusterLevel[]
   clusterDebug?: GraphClusterDebug
+}
+
+interface GraphCsrArrays {
+  indptr: BigUint64Array
+  indices: BigUint64Array
+  edgeIds: BigUint64Array | null
 }
 
 interface ForceGraphLink {
@@ -163,6 +172,7 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
       label: link.label,
     })),
     csr: graphData.csr,
+    csrArrowIpc: graphData.csrArrowIpc,
     clusterLevels: graphData.clusterLevels,
     clusterDebug: graphData.clusterDebug,
   }
@@ -393,6 +403,62 @@ function buildGraphCsr(graphData: NormalizedGraphData): GraphCsr {
   return { indptr, indices, edgeIds }
 }
 
+function ipcBytesToUint8Array(bytes: number[] | Uint8Array) {
+  return bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes)
+}
+
+function arrowColumnToBigUint64Array(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  table: any,
+  columnName: string,
+): BigUint64Array {
+  const column = table.getChild(columnName)
+  if (!column) return new BigUint64Array()
+
+  const values: bigint[] = []
+  for (let index = 0; index < column.length; index += 1) {
+    const value = column.get(index)
+    if (value !== null && value !== undefined) {
+      values.push(BigInt(value))
+    }
+  }
+  return new BigUint64Array(values)
+}
+
+function decodeArrowCsr(graphData: NormalizedGraphData): GraphCsrArrays | null {
+  if (!graphData.csrArrowIpc) return null
+
+  try {
+    const table = tableFromIPC(ipcBytesToUint8Array(graphData.csrArrowIpc))
+    const indptr = arrowColumnToBigUint64Array(table, 'indptr')
+    const indices = arrowColumnToBigUint64Array(table, 'indices')
+    const edgeIds = arrowColumnToBigUint64Array(table, 'edge_ids')
+    if (indptr.length === graphData.nodes.length + 1 && indices.length === graphData.links.length) {
+      return {
+        indptr,
+        indices,
+        edgeIds: edgeIds.length === graphData.links.length ? edgeIds : null,
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to decode Arrow CSR, falling back to JSON CSR', err)
+  }
+
+  return null
+}
+
+function graphCsrArrays(graphData: NormalizedGraphData): GraphCsrArrays {
+  const arrowCsr = decodeArrowCsr(graphData)
+  if (arrowCsr) return arrowCsr
+
+  const csr = buildGraphCsr(graphData)
+  return {
+    indptr: new BigUint64Array(csr.indptr.map(BigInt)),
+    indices: new BigUint64Array(csr.indices.map(BigInt)),
+    edgeIds: csr.edgeIds ? new BigUint64Array(csr.edgeIds.map(BigInt)) : null,
+  }
+}
+
 function realNodeIds(nodes: GraphNode[]): Set<string> {
   return new Set(nodes.filter(node => !isExpanderNode(node) && !isClusterNode(node)).map(node => node.id))
 }
@@ -615,15 +681,15 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
       edgeCounts.set(pairKey, pairIndex + 1)
       return `${pairKey}#${pairIndex}-${index}`
     })
-    const csr = buildGraphCsr(graphData)
+    const csr = graphCsrArrays(graphData)
 
     return new IcebugSigmaGraph<SigmaNodeAttributes, SigmaEdgeAttributes>({
       directed: true,
       nodes,
       csr: {
-        indptr: new BigUint64Array(csr.indptr.map(BigInt)),
-        indices: new BigUint64Array(csr.indices.map(BigInt)),
-        edgeIds: csr.edgeIds ? new BigUint64Array(csr.edgeIds.map(BigInt)) : null,
+        indptr: csr.indptr,
+        indices: csr.indices,
+        edgeIds: csr.edgeIds,
       },
       edgeAttributes,
       edgeKeys,
