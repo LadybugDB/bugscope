@@ -190,9 +190,15 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/liblbug
           NO_STRIP: "true"  # https://github.com/tauri-apps/tauri/issues/14796
 
-      - name: Build Tauri app (macOS/Windows)
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'windows-latest'
-        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ matrix.platform == 'macos-latest' && '--features icebug-analytics' || '' }} --verbose
+      - name: Build Tauri app (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --features icebug-analytics --verbose
+        env:
+          CXXFLAGS: -I/opt/homebrew/opt/libomp/include
+
+      - name: Build Tauri app (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --verbose
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
