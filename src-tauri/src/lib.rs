@@ -220,6 +220,22 @@ fn value_to_string(val: &Value) -> String {
     }
 }
 
+fn value_to_score(val: &Value) -> f64 {
+    match val {
+        Value::Double(n) => *n,
+        Value::Float(n) => *n as f64,
+        Value::Int64(n) => *n as f64,
+        Value::Int32(n) => *n as f64,
+        Value::Int16(n) => *n as f64,
+        Value::Int8(n) => *n as f64,
+        _ => value_to_string(val).parse().unwrap_or(0.0),
+    }
+}
+
+fn cypher_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
     let Value::Node(node_val) = val else {
         return None;
@@ -262,6 +278,76 @@ fn node_value_matches_query(val: &Value, query: &str) -> bool {
             key.to_lowercase().contains(query)
                 || value_to_string(prop_val).to_lowercase().contains(query)
         })
+}
+
+fn available_fts_indexes(conn: &Connection) -> Vec<(String, String)> {
+    let Ok(mut result) = conn.query("CALL SHOW_INDEXES() RETURN *") else {
+        return Vec::new();
+    };
+
+    let mut indexes = Vec::new();
+    for row in &mut result {
+        if row.len() < 3 {
+            continue;
+        }
+
+        let table_name = value_to_string(&row[0]);
+        let index_name = value_to_string(&row[1]);
+        let index_type = value_to_string(&row[2]);
+        let extension_loaded = row
+            .get(4)
+            .map(|val| matches!(val, Value::Bool(true)))
+            .unwrap_or(true);
+
+        if index_type.eq_ignore_ascii_case("FTS") && extension_loaded {
+            indexes.push((table_name, index_name));
+        }
+    }
+    indexes
+}
+
+fn search_nodes_with_fts(conn: &Connection, query: &str) -> Option<Vec<GraphNode>> {
+    let indexes = available_fts_indexes(conn);
+    if indexes.is_empty() {
+        return None;
+    }
+
+    let query_literal = cypher_string(query);
+    let mut scored_nodes: Vec<(GraphNode, f64)> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (table_name, index_name) in indexes {
+        let cypher = format!(
+            "CALL QUERY_FTS_INDEX({}, {}, {}, top := {}) RETURN node, score ORDER BY score DESC",
+            cypher_string(&table_name),
+            cypher_string(&index_name),
+            query_literal,
+            SEARCH_RESULT_LIMIT,
+        );
+        let Ok(mut result) = conn.query(&cypher) else {
+            continue;
+        };
+
+        for row in &mut result {
+            let Some(node) = row.first().and_then(graph_node_from_value) else {
+                continue;
+            };
+            if !seen.insert(node.id.clone()) {
+                continue;
+            }
+            let score = row.get(1).map(value_to_score).unwrap_or(0.0);
+            scored_nodes.push((node, score));
+        }
+    }
+
+    scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Some(
+        scored_nodes
+            .into_iter()
+            .map(|(node, _)| node)
+            .take(SEARCH_RESULT_LIMIT)
+            .collect(),
+    )
 }
 
 fn id_to_string(id: &lbug::InternalID) -> String {
@@ -1083,6 +1169,10 @@ fn search_nodes(
     let db = Database::new(&db_info.path, SystemConfig::default())
         .map_err(|e| format!("Failed to open database: {}", e))?;
     let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
+
+    if let Some(fts_matches) = search_nodes_with_fts(&conn, query_text) {
+        return Ok(fts_matches);
+    }
 
     let mut result = conn
         .query(&format!(
