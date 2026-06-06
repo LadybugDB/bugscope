@@ -286,11 +286,80 @@ fn value_to_string(val: &Value) -> String {
         Value::Int32(n) => n.to_string(),
         Value::Int16(n) => n.to_string(),
         Value::Int8(n) => n.to_string(),
+        Value::UInt64(n) => n.to_string(),
+        Value::UInt32(n) => n.to_string(),
+        Value::UInt16(n) => n.to_string(),
+        Value::UInt8(n) => n.to_string(),
         Value::Double(n) => n.to_string(),
         Value::Float(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         _ => format!("{}", val),
     }
+}
+
+fn non_empty_value_to_string(val: &Value) -> Option<String> {
+    let value = value_to_string(val);
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn node_display_name(props: &[(String, Value)]) -> String {
+    const PREFERRED_KEYS: &[&str] = &[
+        "name",
+        "title",
+        "display_name",
+        "displayname",
+        "label",
+        "summary",
+        "subject",
+        "key",
+        "slug",
+        "path",
+        "filename",
+        "file",
+        "url",
+        "uri",
+        "email",
+        "username",
+        "user_name",
+    ];
+
+    for preferred_key in PREFERRED_KEYS {
+        if let Some((_, value)) = props
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(preferred_key))
+        {
+            if let Some(name) = non_empty_value_to_string(value) {
+                return name;
+            }
+        }
+    }
+
+    if let Some((_, value)) = props
+        .iter()
+        .find(|(key, value)| !key.eq_ignore_ascii_case("id") && matches!(value, Value::String(_)))
+    {
+        if let Some(name) = non_empty_value_to_string(value) {
+            return name;
+        }
+    }
+
+    if let Some((_, value)) = props
+        .iter()
+        .find(|(key, value)| key.eq_ignore_ascii_case("id") && matches!(value, Value::String(_)))
+    {
+        if let Some(name) = non_empty_value_to_string(value) {
+            return name;
+        }
+    }
+
+    props
+        .iter()
+        .find_map(|(_, value)| non_empty_value_to_string(value))
+        .unwrap_or_else(|| "Node".to_string())
 }
 
 fn value_to_score(val: &Value) -> f64 {
@@ -315,13 +384,7 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
     };
 
     let props = node_val.get_properties();
-    let name = props
-        .iter()
-        .find(|(key, _)| key == "name")
-        .or_else(|| props.iter().find(|(key, _)| key == "id"))
-        .or_else(|| props.iter().find(|(key, _)| key == "title"))
-        .map(|(_, prop_val)| value_to_string(prop_val))
-        .unwrap_or_else(|| "Node".to_string());
+    let name = node_display_name(props);
 
     Some(GraphNode {
         id: id_to_string(node_val.get_node_id()),
@@ -1204,13 +1267,7 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         let target = id_to_string(rel.get_dst_node());
         for node_val in [source_node, target_node] {
             let props = node_val.get_properties();
-            let name = props
-                .iter()
-                .find(|(k, _)| k == "name")
-                .or_else(|| props.iter().find(|(k, _)| k == "id"))
-                .or_else(|| props.iter().find(|(k, _)| k == "title"))
-                .map(|(_, val)| value_to_string(val))
-                .unwrap_or_else(|| "Node".to_string());
+            let name = node_display_name(props);
             merge_node(
                 &mut nodes,
                 GraphNode {
@@ -1794,13 +1851,7 @@ fn execute_query(
                     if !node_id_set.contains(&node_id) {
                         node_id_set.insert(node_id.clone());
                         let props = node_val.get_properties();
-                        let name = props
-                            .iter()
-                            .find(|(k, _)| k == "name")
-                            .or_else(|| props.iter().find(|(k, _)| k == "id"))
-                            .or_else(|| props.iter().find(|(k, _)| k == "title"))
-                            .map(|(_, v)| value_to_string(v))
-                            .unwrap_or_else(|| "Node".to_string());
+                        let name = node_display_name(props);
 
                         let label = node_val.get_label_name().clone();
 
@@ -1889,4 +1940,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_display_name_prefers_non_id_string_over_integer_id() {
+        let props = vec![
+            ("id".to_string(), Value::Int64(42)),
+            ("bug_key".to_string(), Value::String("BUG-42".to_string())),
+        ];
+
+        assert_eq!(node_display_name(&props), "BUG-42");
+    }
+
+    #[test]
+    fn node_display_name_prefers_named_columns_before_id() {
+        let props = vec![
+            ("id".to_string(), Value::String("42".to_string())),
+            (
+                "title".to_string(),
+                Value::String("Crash on launch".to_string()),
+            ),
+        ];
+
+        assert_eq!(node_display_name(&props), "Crash on launch");
+    }
+
+    #[test]
+    fn node_display_name_uses_string_id_when_it_is_best_available_name() {
+        let props = vec![("id".to_string(), Value::String("BUG-42".to_string()))];
+
+        assert_eq!(node_display_name(&props), "BUG-42");
+    }
 }
