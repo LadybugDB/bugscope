@@ -87,6 +87,49 @@ body {
   border-top: 1px solid var(--border-color);
 }
 
+.display-column-settings {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.display-column-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.display-column-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.display-column-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.display-column-row select {
+  min-width: 0;
+  width: 100%;
+  padding: 7px 8px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.display-column-row select:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
 .llm-cluster-settings {
   margin-top: 20px;
   padding-top: 16px;

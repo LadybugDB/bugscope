@@ -17,6 +17,7 @@ interface GraphNode {
   id: string
   name: string
   label: string
+  properties?: Record<string, string>
   tableId?: number
   rowid?: number
   community?: number
@@ -144,6 +145,7 @@ interface SigmaGraphViewProps {
   labelNodeIds: Set<string>
   newlyExpandedNodeIds: Set<string>
   darkMode: boolean
+  getNodeDisplayName: (node: GraphNode) => string
   getNodeColor: (node: GraphNode) => string
   getNodeSize: (node: GraphNode) => number
   getEdgeColor: (label: string) => string
@@ -193,9 +195,23 @@ function buildLlmClusterConfig(config: LlmClusterNamingConfig): LlmClusterNaming
   }
 }
 
-function getNodeClusterLabel(node: GraphNode) {
+const AUTO_DISPLAY_COLUMN = '__auto__'
+
+function getNodeDisplayName(node: GraphNode, displayColumns: Record<string, string>) {
+  if (isExpanderNode(node) || isClusterNode(node)) return node.name || node.id
+
+  const selectedColumn = displayColumns[node.label]
+  if (selectedColumn && selectedColumn !== AUTO_DISPLAY_COLUMN) {
+    const selectedValue = node.properties?.[selectedColumn]
+    if (selectedValue?.trim()) return selectedValue
+  }
+
+  return node.name || node.id
+}
+
+function getNodeClusterLabel(node: GraphNode, displayColumns: Record<string, string>) {
   const label = node.label.trim()
-  const name = node.name.trim()
+  const name = getNodeDisplayName(node, displayColumns).trim()
   return !name || name === label ? label : `${label}: ${name}`
 }
 
@@ -699,7 +715,7 @@ function createInitialLayout(graphData: NormalizedGraphData) {
   return { degrees, positions }
 }
 
-function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeColor, getNodeSize, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
+function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeDisplayName, getNodeColor, getNodeSize, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
   const hoveredEdgeRef = useRef<string | null>(null)
@@ -708,6 +724,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
     const { positions } = createInitialLayout(graphData)
     const nodes = graphData.nodes.map(node => {
       const position = positions[node.id] || { x: 0, y: 0 }
+      const displayName = getNodeDisplayName(node)
       return {
         key: node.id,
         attributes: {
@@ -715,8 +732,8 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
           y: position.y,
           size: getNodeSize(node),
           color: isExpanderNode(node) ? '#f59e0b' : getNodeColor(node),
-          label: isExpanderNode(node) || labelNodeIds.has(node.id) ? node.name || node.id : '',
-          hoverLabel: node.name || node.id,
+          label: isExpanderNode(node) || labelNodeIds.has(node.id) ? displayName : '',
+          hoverLabel: displayName,
           isNewlyExpanded: newlyExpandedNodeIds.has(node.id),
           nodeType: node.label,
         },
@@ -752,7 +769,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
       edgeAttributes,
       edgeKeys,
     })
-  }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeColor, getNodeSize, getEdgeColor])
+  }, [graphData, labelNodeIds, newlyExpandedNodeIds, getNodeDisplayName, getNodeColor, getNodeSize, getEdgeColor])
 
   useEffect(() => {
     const container = containerRef.current
@@ -857,6 +874,7 @@ function App() {
   const [clusterViewEnabled, setClusterViewEnabled] = useState(true)
   const [nodeSearch, setNodeSearch] = useState('')
   const [searchResults, setSearchResults] = useState<GraphNode[]>([])
+  const [displayColumnsByLabel, setDisplayColumnsByLabel] = useState<Record<string, string>>({})
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null)
@@ -1159,6 +1177,27 @@ function App() {
   }, [graphData, selectedId, currentLlmClusterConfig, resetClusterNameRequests])
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
+  const displayColumnOptions = useMemo(() => {
+    const columnsByLabel = new Map<string, Set<string>>()
+    graphData.nodes.forEach(node => {
+      if (isExpanderNode(node) || isClusterNode(node)) return
+      const propertyNames = Object.keys(node.properties || {})
+      if (propertyNames.length === 0) return
+      const columns = columnsByLabel.get(node.label) || new Set<string>()
+      propertyNames.forEach(name => columns.add(name))
+      columnsByLabel.set(node.label, columns)
+    })
+
+    return [...columnsByLabel.entries()]
+      .map(([label, columns]) => ({
+        label,
+        columns: [...columns].sort((a, b) => a.localeCompare(b)),
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+  }, [graphData.nodes])
+  const getDisplayName = useCallback((node: GraphNode) => (
+    getNodeDisplayName(node, displayColumnsByLabel)
+  ), [displayColumnsByLabel])
   const clusterLevels = useMemo(() => buildCommunityClusterLevels(normalizedGraphData), [normalizedGraphData])
   const coarsestClusterLevel = useMemo(() => getCoarsestClusterLevel(clusterLevels), [clusterLevels])
   const currentClusterLevel = useMemo(() => {
@@ -1185,6 +1224,10 @@ function App() {
   ), [clusterViewEnabled, clusterLevels, normalizedGraphData, visibleClusterPath])
 
   useEffect(() => {
+    resetClusterNameRequests()
+  }, [displayColumnsByLabel, resetClusterNameRequests])
+
+  useEffect(() => {
     const llmConfig = currentLlmClusterConfig()
     if (!llmConfig || !clusterViewEnabled || !currentClusterLevel) return
 
@@ -1207,7 +1250,7 @@ function App() {
           && currentClusterLevel.membership[index] === clusterId
           && nodeMatchesClusterPath(clusterLevels, index, visibleClusterPath)
         ))
-        .map(getNodeClusterLabel)
+        .map(node => getNodeClusterLabel(node, displayColumnsByLabel))
       const sampledLabels = sampleLabels(labels, llmConfig.sampleSize)
       if (sampledLabels.length === 0) return
 
@@ -1273,6 +1316,7 @@ function App() {
     clusterViewEnabled,
     currentClusterLevel,
     currentLlmClusterConfig,
+    displayColumnsByLabel,
     normalizedGraphData,
     visibleClusterPath,
     visibleGraphData.nodes,
@@ -1382,7 +1426,8 @@ function App() {
     ctx.lineWidth = highlighted ? 3 : 1
     ctx.stroke()
 
-    if ((isExpanderNode(node) || topLabelNodeIds.has(node.id)) && node.name) {
+    const displayName = getDisplayName(node)
+    if ((isExpanderNode(node) || topLabelNodeIds.has(node.id)) && displayName) {
       const fontSize = 3
       ctx.font = `${fontSize}px Sans-Serif`
       ctx.textAlign = 'center'
@@ -1390,7 +1435,7 @@ function App() {
       ctx.fillStyle = highlighted ? '#f59e0b' : '#fff'
 
       const maxWidth = size * 1.6
-      let label = node.name
+      let label = displayName
       const measured = ctx.measureText(label)
       if (measured.width > maxWidth) {
         while (label.length > 1 && ctx.measureText(label + '\u2026').width > maxWidth) {
@@ -1400,7 +1445,7 @@ function App() {
       }
       ctx.fillText(label, node.x, node.y)
     }
-  }, [getNodeSize, getNodeColor, darkMode, topLabelNodeIds, lastExpandedNodeIds])
+  }, [getNodeSize, getNodeColor, getDisplayName, darkMode, topLabelNodeIds, lastExpandedNodeIds])
 
   return (
     <div className="app-container">
@@ -1439,6 +1484,40 @@ function App() {
               ))}
             </ul>
           )}
+          {displayColumnOptions.length > 0 && (
+            <div className="display-column-settings">
+              <div className="panel-title">Node Labels</div>
+              <div className="display-column-list">
+                {displayColumnOptions.map(({ label, columns }) => {
+                  const selectedColumn = displayColumnsByLabel[label]
+                  const selectedValue = selectedColumn && columns.includes(selectedColumn)
+                    ? selectedColumn
+                    : AUTO_DISPLAY_COLUMN
+
+                  return (
+                    <label className="display-column-row" key={label}>
+                      <span title={label}>{label}</span>
+                      <select
+                        value={selectedValue}
+                        onChange={event => {
+                          const value = event.target.value
+                          setDisplayColumnsByLabel(current => ({
+                            ...current,
+                            [label]: value,
+                          }))
+                        }}
+                      >
+                        <option value={AUTO_DISPLAY_COLUMN}>Auto</option>
+                        {columns.map(column => (
+                          <option key={column} value={column}>{column}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
           <div className="node-search">
             <div className="panel-title">Find Node</div>
             <div className="node-search-row">
@@ -1464,9 +1543,9 @@ function App() {
                     key={result.id}
                     className="search-result"
                     onClick={() => exploreSearchResult(result)}
-                    title={`${result.label}: ${result.name}`}
+                    title={`${result.label}: ${getDisplayName(result)}`}
                   >
-                    <span>{result.name}</span>
+                    <span>{getDisplayName(result)}</span>
                     <small>{result.label} · {result.id}</small>
                   </button>
                 ))}
@@ -1605,6 +1684,7 @@ function App() {
               labelNodeIds={topLabelNodeIds}
               newlyExpandedNodeIds={lastExpandedNodeIds}
               darkMode={darkMode}
+              getNodeDisplayName={getDisplayName}
               getNodeColor={getNodeColor}
               getNodeSize={getNodeSize}
               getEdgeColor={getEdgeColor}
@@ -1622,7 +1702,7 @@ function App() {
               onNodeClick={(node) => handleVisibleNodeClick(String(node.id))}
               nodeVal={(node) => { const s = getNodeSize(node); return s * s; }}
               nodeRelSize={1}
-              nodeLabel={(node) => `${node.label}: ${node.name}`}
+              nodeLabel={(node) => `${node.label}: ${getDisplayName(node)}`}
               linkLabel={(link) => link.label}
               linkColor={(link) => getEdgeColor(link.label)}
               linkWidth={2.5}

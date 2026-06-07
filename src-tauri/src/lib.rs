@@ -30,6 +30,8 @@ struct GraphNode {
     id: String,
     name: String,
     label: String,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    properties: HashMap<String, String>,
     #[serde(rename = "tableId", skip_serializing_if = "Option::is_none")]
     table_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,6 +364,15 @@ fn node_display_name(props: &[(String, Value)]) -> String {
         .unwrap_or_else(|| "Node".to_string())
 }
 
+fn node_display_properties(props: &[(String, Value)]) -> HashMap<String, String> {
+    props
+        .iter()
+        .filter_map(|(key, value)| {
+            non_empty_value_to_string(value).map(|value| (key.clone(), value))
+        })
+        .collect()
+}
+
 fn value_to_score(val: &Value) -> f64 {
     match val {
         Value::Double(n) => *n,
@@ -385,11 +396,13 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
 
     let props = node_val.get_properties();
     let name = node_display_name(props);
+    let properties = node_display_properties(props);
 
     Some(GraphNode {
         id: id_to_string(node_val.get_node_id()),
         name,
         label: node_val.get_label_name().clone(),
+        properties,
         table_id: Some(node_val.get_node_id().table_id),
         rowid: Some(node_val.get_node_id().offset),
         community: None,
@@ -495,6 +508,7 @@ fn make_expander_node(parent_id: &str, hidden_count: usize, offset: usize) -> Gr
         id: format!("{EXPANDER_PREFIX}node:{parent_id}:{offset}"),
         name: format!("+{hidden_count}"),
         label: "More".to_string(),
+        properties: HashMap::new(),
         table_id: None,
         rowid: None,
         community: None,
@@ -1049,6 +1063,7 @@ fn compute_cluster_levels(
                 id: index.to_string(),
                 name: format!("Cluster {index}"),
                 label: "Cluster".to_string(),
+                properties: HashMap::new(),
                 table_id: None,
                 rowid: None,
                 community: Some(index as u64),
@@ -1268,12 +1283,14 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         for node_val in [source_node, target_node] {
             let props = node_val.get_properties();
             let name = node_display_name(props);
+            let properties = node_display_properties(props);
             merge_node(
                 &mut nodes,
                 GraphNode {
                     id: id_to_string(node_val.get_node_id()),
                     name,
                     label: node_val.get_label_name().clone(),
+                    properties,
                     table_id: Some(node_val.get_node_id().table_id),
                     rowid: Some(node_val.get_node_id().offset),
                     community: None,
@@ -1852,6 +1869,7 @@ fn execute_query(
                         node_id_set.insert(node_id.clone());
                         let props = node_val.get_properties();
                         let name = node_display_name(props);
+                        let properties = node_display_properties(props);
 
                         let label = node_val.get_label_name().clone();
 
@@ -1859,6 +1877,7 @@ fn execute_query(
                             id: node_id,
                             name,
                             label,
+                            properties,
                             table_id: Some(node_val.get_node_id().table_id),
                             rowid: Some(node_val.get_node_id().offset),
                             community: None,
