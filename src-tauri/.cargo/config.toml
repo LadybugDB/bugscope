@@ -21,3 +21,15 @@ rustflags = [
   "-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks",
   "-C", "link-arg=-Wl,-rpath,@executable_path/../../liblbug",
 ]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../liblbug",
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../icebug/lib",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../liblbug",
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../icebug/lib",
+]
