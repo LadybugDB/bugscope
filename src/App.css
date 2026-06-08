@@ -374,6 +374,11 @@ body {
   color: white;
 }
 
+.cluster-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .cluster-controls button:hover:not(.active) {
   color: var(--text-primary);
 }
