@@ -97,6 +97,8 @@ interface LlmClusterNameResult {
   error?: string | null
 }
 
+type GraphViewMode = 'data' | 'schema'
+
 interface NormalizedGraphLink {
   source: string
   target: string
@@ -122,6 +124,21 @@ interface ForceGraphLink {
   label: string
 }
 
+type ForceGraphNodeObject = GraphNode & {
+  x?: number
+  y?: number
+}
+
+type ForceGraphPosition = ForceGraphNodeObject & {
+  x: number
+  y: number
+}
+
+type ForceGraphLinkObject = ForceGraphLink & {
+  source?: string | number | ForceGraphNodeObject
+  target?: string | number | ForceGraphNodeObject
+}
+
 interface SigmaNodeAttributes extends Record<string, unknown> {
   x: number
   y: number
@@ -145,6 +162,7 @@ interface SigmaGraphViewProps {
   labelNodeIds: Set<string>
   newlyExpandedNodeIds: Set<string>
   darkMode: boolean
+  alwaysShowEdgeLabels: boolean
   getNodeDisplayName: (node: GraphNode) => string
   getNodeColor: (node: GraphNode) => string
   getNodeSize: (node: GraphNode) => number
@@ -242,6 +260,43 @@ function normalizeGraphData(graphData: GraphData): NormalizedGraphData {
     csrArrowIpc: graphData.csrArrowIpc,
     clusterLevels: graphData.clusterLevels,
     clusterDebug: graphData.clusterDebug,
+  }
+}
+
+function expandSchemaSelfLinks(graphData: NormalizedGraphData): NormalizedGraphData {
+  const nodes = graphData.nodes.map(node => ({ ...node }))
+  const nodeById = new Map(nodes.map(node => [node.id, node]))
+  const links: NormalizedGraphLink[] = []
+
+  graphData.links.forEach((link, index) => {
+    if (link.source !== link.target) {
+      links.push({ ...link })
+      return
+    }
+
+    const sourceNode = nodeById.get(link.source)
+    const duplicateId = `__schema_self_target__:${link.label}:${link.target}:${index}`
+    nodes.push({
+      ...(sourceNode || {
+        id: link.target,
+        name: link.target,
+        label: 'Node Table',
+      }),
+      id: duplicateId,
+      properties: {},
+    })
+    links.push({
+      ...link,
+      target: duplicateId,
+    })
+  })
+
+  return {
+    ...graphData,
+    nodes,
+    links,
+    csr: buildGraphCsr({ ...graphData, nodes, links }),
+    csrArrowIpc: undefined,
   }
 }
 
@@ -635,15 +690,25 @@ function drawSigmaEdgeLabel(
   sourceData: SigmaEdgeLabelNodeData,
   targetData: SigmaEdgeLabelNodeData,
   hoveredEdgeId: string | null,
+  alwaysShow: boolean,
   textColor: string,
   backgroundColor: string,
 ) {
-  if (edgeData.key !== hoveredEdgeId) return
+  if (!alwaysShow && edgeData.key !== hoveredEdgeId) return
   if (!edgeData.label) return
 
   const dx = targetData.x - sourceData.x
   const dy = targetData.y - sourceData.y
   const distance = Math.hypot(dx, dy)
+
+  if (distance < 1) {
+    const loopRadius = sourceData.size + 18
+    const labelX = sourceData.x
+    const labelY = sourceData.y - loopRadius - 8
+    drawSigmaEdgeLabelBox(context, edgeData.label, labelX, labelY, 96, textColor, backgroundColor)
+    return
+  }
+
   if (distance < sourceData.size + targetData.size + 18) return
 
   const fontSize = 11
@@ -686,6 +751,89 @@ function drawSigmaEdgeLabel(
   context.restore()
 }
 
+function drawSigmaEdgeLabelBox(
+  context: CanvasRenderingContext2D,
+  text: string,
+  centerX: number,
+  centerY: number,
+  maxWidth: number,
+  textColor: string,
+  backgroundColor: string,
+) {
+  const fontSize = 11
+  const paddingX = 5
+  const paddingY = 3
+
+  context.save()
+  context.font = `600 ${fontSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.textBaseline = 'middle'
+
+  let label = text
+  let textWidth = context.measureText(label).width
+  if (textWidth > maxWidth) {
+    while (label.length > 1 && context.measureText(`${label}...`).width > maxWidth) {
+      label = label.slice(0, -1)
+    }
+    label = `${label}...`
+    textWidth = context.measureText(label).width
+  }
+
+  const boxWidth = textWidth + paddingX * 2
+  const boxHeight = fontSize + paddingY * 2
+  const boxX = centerX - boxWidth / 2
+  const boxY = centerY - boxHeight / 2
+
+  context.fillStyle = backgroundColor
+  drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, 4)
+  context.fill()
+  context.fillStyle = textColor
+  context.fillText(label, boxX + paddingX, centerY)
+  context.restore()
+}
+
+function getForceEndpointPosition(endpoint: ForceGraphLinkObject['source']): ForceGraphPosition | null {
+  if (!endpoint || typeof endpoint !== 'object') return null
+  if (typeof endpoint.x !== 'number' || typeof endpoint.y !== 'number') return null
+  return endpoint as ForceGraphPosition
+}
+
+function drawForceSchemaLinkLabel(
+  link: ForceGraphLinkObject,
+  context: CanvasRenderingContext2D,
+  globalScale: number,
+  textColor: string,
+  backgroundColor: string,
+) {
+  if (!link.label) return
+  const source = getForceEndpointPosition(link.source)
+  const target = getForceEndpointPosition(link.target)
+  if (!source || !target) return
+
+  const midX = (source.x + target.x) / 2
+  const midY = (source.y + target.y) / 2
+  const fontSize = Math.max(2.5, 12 / globalScale)
+  const paddingX = 5 / globalScale
+  const paddingY = 3 / globalScale
+
+  context.save()
+  context.font = `600 ${fontSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.textAlign = 'center'
+  context.textBaseline = 'middle'
+
+  const textWidth = context.measureText(link.label).width
+  const boxWidth = textWidth + paddingX * 2
+  const boxHeight = fontSize + paddingY * 2
+  const boxX = midX - boxWidth / 2
+  const boxY = midY - boxHeight / 2
+
+  context.fillStyle = backgroundColor
+  drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, 4 / globalScale)
+  context.fill()
+  context.fillStyle = textColor
+  context.fillText(link.label, midX, midY)
+  context.restore()
+}
+
 function createInitialLayout(graphData: NormalizedGraphData) {
   const nodeCount = Math.max(1, graphData.nodes.length)
   const degrees: Record<string, number> = {}
@@ -715,7 +863,7 @@ function createInitialLayout(graphData: NormalizedGraphData) {
   return { degrees, positions }
 }
 
-function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, getNodeDisplayName, getNodeColor, getNodeSize, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
+function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMode, alwaysShowEdgeLabels, getNodeDisplayName, getNodeColor, getNodeSize, getEdgeColor, onNodeClick }: SigmaGraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma | null>(null)
   const hoveredEdgeRef = useRef<string | null>(null)
@@ -804,6 +952,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
           sourceData,
           targetData,
           hoveredEdgeRef.current,
+          alwaysShowEdgeLabels,
           edgeLabelTextColor,
           edgeLabelBackgroundColor,
         )
@@ -846,7 +995,7 @@ function SigmaGraphView({ graphData, labelNodeIds, newlyExpandedNodeIds, darkMod
       rendererRef.current?.kill()
       rendererRef.current = null
     }
-  }, [graph, darkMode, onNodeClick])
+  }, [graph, darkMode, alwaysShowEdgeLabels, onNodeClick])
 
   return <div ref={containerRef} className="sigma-canvas" />
 }
@@ -855,8 +1004,13 @@ function App() {
   const [databases, setDatabases] = useState<Database[]>([])
   const [selectedId, setSelectedId] = useState(0)
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] })
+  const [schemaGraphData, setSchemaGraphData] = useState<GraphData>({ nodes: [], links: [] })
+  const [schemaGraphDatabaseId, setSchemaGraphDatabaseId] = useState<number | null>(null)
+  const [graphViewMode, setGraphViewMode] = useState<GraphViewMode>('data')
   const [loading, setLoading] = useState(false)
+  const [schemaLoading, setSchemaLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [schemaError, setSchemaError] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
   const [filePickerOpen, setFilePickerOpen] = useState(false)
@@ -1060,6 +1214,32 @@ function App() {
     }
   }, [selectedId, databases.length, currentLlmClusterConfig, resetClusterNameRequests])
 
+  const fetchSchemaGraphData = useCallback((force = false) => {
+    if (databases.length === 0) {
+      setSchemaGraphData({ nodes: [], links: [] })
+      setSchemaGraphDatabaseId(null)
+      return
+    }
+    if (!force && schemaGraphDatabaseId === selectedId && schemaGraphData.nodes.length > 0) {
+      return
+    }
+
+    setSchemaLoading(true)
+    setSchemaError(null)
+    invokeCommand<GraphData>('get_schema_graph', { id: selectedId })
+      .then(data => {
+        setSchemaGraphData(data)
+        setSchemaGraphDatabaseId(selectedId)
+        setSchemaLoading(false)
+      })
+      .catch(err => {
+        setSchemaError(String(err))
+        setSchemaGraphData({ nodes: [], links: [] })
+        setSchemaGraphDatabaseId(null)
+        setSchemaLoading(false)
+      })
+  }, [databases.length, schemaGraphData.nodes.length, schemaGraphDatabaseId, selectedId])
+
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     fetchGraphData()
@@ -1177,6 +1357,7 @@ function App() {
   }, [graphData, selectedId, currentLlmClusterConfig, resetClusterNameRequests])
 
   const normalizedGraphData = useMemo(() => normalizeGraphData(graphData), [graphData])
+  const normalizedSchemaGraphData = useMemo(() => normalizeGraphData(schemaGraphData), [schemaGraphData])
   const displayColumnOptions = useMemo(() => {
     const columnsByLabel = new Map<string, Set<string>>()
     graphData.nodes.forEach(node => {
@@ -1222,6 +1403,13 @@ function App() {
       ? buildClusterDrillGraph(normalizedGraphData, clusterLevels, visibleClusterPath)
       : normalizedGraphData
   ), [clusterViewEnabled, clusterLevels, normalizedGraphData, visibleClusterPath])
+  const visibleSchemaGraphData = useMemo(() => (
+    expandSchemaSelfLinks(normalizedSchemaGraphData)
+  ), [normalizedSchemaGraphData])
+  const displayedGraphData = graphViewMode === 'schema' ? visibleSchemaGraphData : visibleGraphData
+  const displayedGraphSourceData = graphViewMode === 'schema' ? schemaGraphData : graphData
+  const displayedLoading = graphViewMode === 'schema' ? schemaLoading : loading
+  const displayedError = graphViewMode === 'schema' ? schemaError : error
 
   useEffect(() => {
     resetClusterNameRequests()
@@ -1335,19 +1523,28 @@ function App() {
   /* eslint-enable react-hooks/set-state-in-effect */
 
   const forceGraphData = useMemo<ForceGraphData<GraphNode, ForceGraphLink>>(() => ({
-    nodes: visibleGraphData.nodes.map(node => ({ ...node })),
-    links: visibleGraphData.links.map(link => ({ ...link })),
-  }), [visibleGraphData])
+    nodes: displayedGraphData.nodes.map(node => ({ ...node })),
+    links: displayedGraphData.links.map(link => ({ ...link })),
+  }), [displayedGraphData])
+
+  useEffect(() => {
+    if (renderer !== 'force' || !graphRef.current) return
+    const linkForce = graphRef.current.d3Force('link') as {
+      distance?: (distance: number | ((link: ForceGraphLinkObject) => number)) => unknown
+    } | undefined
+    linkForce?.distance?.(graphViewMode === 'schema' ? 150 : 40)
+    graphRef.current.d3ReheatSimulation?.()
+  }, [renderer, graphViewMode, forceGraphData])
 
   const nodeDegree = useMemo(() => {
     const degrees: Record<string, number> = {}
-    visibleGraphData.nodes.forEach(n => degrees[n.id] = 0)
-    visibleGraphData.links.forEach(link => {
+    displayedGraphData.nodes.forEach(n => degrees[n.id] = 0)
+    displayedGraphData.links.forEach(link => {
       degrees[link.source] = (degrees[link.source] || 0) + 1
       degrees[link.target] = (degrees[link.target] || 0) + 1
     })
     return degrees
-  }, [visibleGraphData])
+  }, [displayedGraphData])
 
   const maxDegree = useMemo(() => Math.max(1, ...Object.values(nodeDegree)), [nodeDegree])
 
@@ -1355,15 +1552,15 @@ function App() {
     return new Set(
       [
         ...lastExpandedNodeIds,
-        ...[...visibleGraphData.nodes]
+        ...[...displayedGraphData.nodes]
         .sort((a, b) => (nodeDegree[b.id] || 0) - (nodeDegree[a.id] || 0))
         .filter(node => !isExpanderNode(node))
-        .slice(0, 5)
+        .slice(0, graphViewMode === 'schema' ? 12 : 5)
         .map(node => node.id),
         ...(focusedNodeId ? [focusedNodeId] : []),
       ]
     )
-  }, [lastExpandedNodeIds, visibleGraphData.nodes, nodeDegree, focusedNodeId])
+  }, [lastExpandedNodeIds, displayedGraphData.nodes, nodeDegree, focusedNodeId, graphViewMode])
 
   const getNodeColor = useCallback((node: GraphNode) => {
     const key = node.colorKey || (node.community === undefined ? node.label : `${node.label}:${node.community}`)
@@ -1391,6 +1588,7 @@ function App() {
   }, [nodeDegree, maxDegree])
 
   const handleVisibleNodeClick = useCallback((nodeId: string) => {
+    if (graphViewMode === 'schema') return
     const clusterNode = parseClusterNodeId(nodeId)
     if (clusterNode) {
       setClusterViewEnabled(true)
@@ -1402,7 +1600,7 @@ function App() {
       return
     }
     handleNodeClick(nodeId)
-  }, [handleNodeClick])
+  }, [graphViewMode, handleNodeClick])
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D) => {
@@ -1472,6 +1670,8 @@ function App() {
                   className={`file-item ${selectedId === db.id ? 'active' : ''}`}
                   onClick={() => {
                     setSelectedId(db.id)
+                    setGraphViewMode('data')
+                    setSchemaError(null)
                     setNodeSearch('')
                     setSearchResults([])
                     setSearchError(null)
@@ -1606,50 +1806,69 @@ function App() {
         <div className="header">
           <div className="header-left">
             <span className="graph-stats">
-              {loading
+              {displayedLoading
                 ? 'Loading...'
+                : graphViewMode === 'schema'
+                  ? `${schemaGraphData.nodes.length} schema tables, ${schemaGraphData.links.length} relationships`
                 : clusterViewEnabled && clusterLevels.length > 0
                   ? currentClusterLevel
                     ? `${visibleGraphData.nodes.length} clusters at level ${currentClusterLevel.level}, ${visibleGraphData.links.length} aggregate edges`
                     : `${visibleGraphData.nodes.length} nodes in cluster, ${visibleGraphData.links.length} edges`
                   : `${graphData.nodes.length} nodes, ${graphData.links.length} edges`}
             </span>
-            {focusedNodeId && <span className="focus-chip">Focused node {focusedNodeId}</span>}
-            {error && <span className="error-message">{error}</span>}
+            {graphViewMode === 'data' && focusedNodeId && <span className="focus-chip">Focused node {focusedNodeId}</span>}
+            {displayedError && <span className="error-message">{displayedError}</span>}
           </div>
 
           <div className="header-right">
-            {clusterLevels.length > 0 && (
+            {(clusterLevels.length > 0 || databases.length > 0) && (
               <div className="cluster-controls" aria-label="Clusters">
+                {clusterLevels.length > 0 && (
+                  <>
+                    <button
+                      className={graphViewMode === 'data' && clusterViewEnabled && clusterPath.length === 0 ? 'active' : ''}
+                      onClick={() => {
+                        setGraphViewMode('data')
+                        setClusterViewEnabled(true)
+                        setClusterPath([])
+                      }}
+                    >
+                      Clusters
+                    </button>
+                    {clusterBreadcrumbs.map((item, index) => (
+                      <button
+                        key={`${item.level}:${item.clusterId}`}
+                        className="breadcrumb-btn"
+                        onClick={() => {
+                          setGraphViewMode('data')
+                          setClusterViewEnabled(true)
+                          setClusterPath(clusterPath.slice(0, index + 1))
+                        }}
+                        title={item.size === undefined ? item.label : `${item.label}, ${item.size} nodes`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                    <button
+                      className={graphViewMode === 'data' && !clusterViewEnabled ? 'active' : ''}
+                      onClick={() => {
+                        setGraphViewMode('data')
+                        setClusterViewEnabled(value => !value)
+                      }}
+                    >
+                      {clusterViewEnabled ? 'All Nodes' : 'Cluster View'}
+                    </button>
+                  </>
+                )}
                 <button
-                  className={clusterViewEnabled && clusterPath.length === 0 ? 'active' : ''}
+                  className={graphViewMode === 'schema' ? 'active' : ''}
                   onClick={() => {
-                    setClusterViewEnabled(true)
-                    setClusterPath([])
+                    setGraphViewMode('schema')
+                    fetchSchemaGraphData()
                   }}
+                  disabled={schemaLoading || databases.length === 0}
                 >
-                  Clusters
-                </button>
-                {clusterBreadcrumbs.map((item, index) => (
-                  <button
-                    key={`${item.level}:${item.clusterId}`}
-                    className="breadcrumb-btn"
-                    onClick={() => {
-                      setClusterViewEnabled(true)
-                      setClusterPath(clusterPath.slice(0, index + 1))
-                    }}
-                    title={item.size === undefined ? item.label : `${item.label}, ${item.size} nodes`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-                <button
-                  className={!clusterViewEnabled ? 'active' : ''}
-                  onClick={() => {
-                    setClusterViewEnabled(value => !value)
-                  }}
-                >
-                  {clusterViewEnabled ? 'All Nodes' : 'Cluster View'}
+                  Schema
                 </button>
               </div>
             )}
@@ -1677,13 +1896,14 @@ function App() {
         </div>
 
         <div className="graph-container" ref={graphContainerRef}>
-          {!loading && !error && graphData.nodes.length > 0 && renderer === 'sigma' && (
+          {!displayedLoading && !displayedError && displayedGraphSourceData.nodes.length > 0 && renderer === 'sigma' && (
             <SigmaGraphView
-              key="sigma"
-              graphData={visibleGraphData}
+              key={`${graphViewMode}-sigma`}
+              graphData={displayedGraphData}
               labelNodeIds={topLabelNodeIds}
-              newlyExpandedNodeIds={lastExpandedNodeIds}
+              newlyExpandedNodeIds={graphViewMode === 'schema' ? new Set() : lastExpandedNodeIds}
               darkMode={darkMode}
+              alwaysShowEdgeLabels={graphViewMode === 'schema'}
               getNodeDisplayName={getDisplayName}
               getNodeColor={getNodeColor}
               getNodeSize={getNodeSize}
@@ -1691,9 +1911,9 @@ function App() {
               onNodeClick={handleVisibleNodeClick}
             />
           )}
-          {!loading && !error && graphData.nodes.length > 0 && renderer === 'force' && (
+          {!displayedLoading && !displayedError && displayedGraphSourceData.nodes.length > 0 && renderer === 'force' && (
             <ForceGraph2D
-              key="force"
+              key={`${graphViewMode}-force`}
               ref={graphRef}
               width={graphSize.width}
               height={graphSize.height}
@@ -1705,6 +1925,17 @@ function App() {
               nodeLabel={(node) => `${node.label}: ${getDisplayName(node)}`}
               linkLabel={(link) => link.label}
               linkColor={(link) => getEdgeColor(link.label)}
+              linkCanvasObjectMode={() => graphViewMode === 'schema' ? 'after' : 'replace'}
+              linkCanvasObject={(link, context, globalScale) => {
+                if (graphViewMode !== 'schema') return
+                drawForceSchemaLinkLabel(
+                  link,
+                  context,
+                  globalScale,
+                  '#111827',
+                  darkMode ? 'rgba(248, 250, 252, 0.92)' : 'rgba(255, 255, 255, 0.92)',
+                )
+              }}
               linkWidth={2.5}
               linkDirectionalArrowLength={6}
               linkDirectionalArrowRelPos={1}

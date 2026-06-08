@@ -46,6 +46,8 @@ struct GraphNode {
     offset: Option<usize>,
     #[serde(rename = "hiddenCount", skip_serializing_if = "Option::is_none")]
     hidden_count: Option<usize>,
+    #[serde(rename = "colorKey", skip_serializing_if = "Option::is_none")]
+    color_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +412,7 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
         expand_node_id: None,
         offset: None,
         hidden_count: None,
+        color_key: None,
     })
 }
 
@@ -516,6 +519,7 @@ fn make_expander_node(parent_id: &str, hidden_count: usize, offset: usize) -> Gr
         expand_node_id: Some(parent_id.to_string()),
         offset: Some(offset),
         hidden_count: Some(hidden_count),
+        color_key: None,
     }
 }
 
@@ -1071,6 +1075,7 @@ fn compute_cluster_levels(
                 expand_node_id: None,
                 offset: None,
                 hidden_count: None,
+                color_key: None,
             })
             .collect();
         let cluster_node_index: HashMap<String, usize> = cluster_nodes
@@ -1298,6 +1303,7 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
                     expand_node_id: None,
                     offset: None,
                     hidden_count: None,
+                    color_key: None,
                 },
             );
         }
@@ -1317,6 +1323,133 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         links,
         "collect_edge_graph",
     ))
+}
+
+fn escaped_identifier(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn table_properties(conn: &Connection, table_name: &str) -> Vec<(String, String, bool)> {
+    let Ok(mut result) = conn.query(&format!(
+        "CALL TABLE_INFO('{}') RETURN *;",
+        escaped_identifier(table_name)
+    )) else {
+        return Vec::new();
+    };
+
+    let mut properties = Vec::new();
+    for row in &mut result {
+        let Some(name) = row.get(1).map(value_to_string) else {
+            continue;
+        };
+        let property_type = row
+            .get(2)
+            .map(value_to_string)
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let is_primary_key = row
+            .get(4)
+            .map(|value| matches!(value, Value::Bool(true)))
+            .unwrap_or(false);
+        properties.push((name, property_type, is_primary_key));
+    }
+    properties
+}
+
+fn schema_node_properties(
+    conn: &Connection,
+    table_name: &str,
+    include_primary_key: bool,
+) -> HashMap<String, String> {
+    table_properties(conn, table_name)
+        .into_iter()
+        .map(|(name, property_type, is_primary_key)| {
+            let value = if include_primary_key && is_primary_key {
+                format!("{property_type} primary key")
+            } else {
+                property_type
+            };
+            (name, value)
+        })
+        .collect()
+}
+
+fn collect_schema_graph(conn: &Connection) -> Result<GraphData, String> {
+    let mut tables = conn
+        .query("CALL show_tables() RETURN *;")
+        .map_err(|e| format!("Schema table query failed: {e}"))?;
+
+    let mut node_tables = Vec::new();
+    let mut rel_tables = Vec::new();
+    for row in &mut tables {
+        if row.len() < 3 {
+            continue;
+        }
+        let table_name = value_to_string(&row[1]);
+        let table_type = value_to_string(&row[2]);
+        if table_type.eq_ignore_ascii_case("NODE") {
+            node_tables.push(table_name);
+        } else if table_type.eq_ignore_ascii_case("REL") {
+            rel_tables.push(table_name);
+        }
+    }
+
+    node_tables.sort();
+    rel_tables.sort();
+
+    let nodes: Vec<GraphNode> = node_tables
+        .iter()
+        .map(|table_name| GraphNode {
+            id: table_name.clone(),
+            name: table_name.clone(),
+            label: "Node Table".to_string(),
+            properties: schema_node_properties(conn, table_name, true),
+            table_id: None,
+            rowid: None,
+            community: None,
+            expansion_kind: None,
+            expand_node_id: None,
+            offset: None,
+            hidden_count: None,
+            color_key: Some(format!("schema-node:{table_name}")),
+        })
+        .collect();
+
+    let node_table_set: HashSet<&str> = node_tables.iter().map(String::as_str).collect();
+    let mut links = Vec::new();
+    let mut seen_links = HashSet::new();
+
+    for rel_table in &rel_tables {
+        let Ok(mut result) = conn.query(&format!(
+            "CALL SHOW_CONNECTION('{}') RETURN *;",
+            escaped_identifier(rel_table)
+        )) else {
+            continue;
+        };
+
+        for row in &mut result {
+            if row.len() < 2 {
+                continue;
+            }
+            let source = value_to_string(&row[0]);
+            let target = value_to_string(&row[1]);
+            if !node_table_set.contains(source.as_str())
+                || !node_table_set.contains(target.as_str())
+            {
+                continue;
+            }
+            merge_link(
+                &mut links,
+                &mut seen_links,
+                GraphLink {
+                    source,
+                    target,
+                    label: rel_table.clone(),
+                },
+            );
+        }
+    }
+
+    Ok(graph_data_without_clusters(nodes, links, "collect_schema_graph"))
 }
 
 fn add_expanders(
@@ -1679,6 +1812,18 @@ fn get_graph(
 }
 
 #[tauri::command]
+fn get_schema_graph(state: State<AppState>, id: usize) -> Result<GraphData, String> {
+    let databases = get_all_databases(&state);
+    let db_info = databases.get(id).ok_or("Database not found")?;
+
+    let db = Database::new(&db_info.path, SystemConfig::default())
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::new(&db).map_err(|e| format!("Failed to create connection: {}", e))?;
+
+    collect_schema_graph(&conn)
+}
+
+#[tauri::command]
 fn search_nodes(
     state: State<AppState>,
     id: usize,
@@ -1885,6 +2030,7 @@ fn execute_query(
                             expand_node_id: None,
                             offset: None,
                             hidden_count: None,
+                            color_key: None,
                         });
                     }
                 }
@@ -1952,6 +2098,7 @@ pub fn run() {
             add_database,
             get_directories,
             get_graph,
+            get_schema_graph,
             search_nodes,
             get_node_neighborhood,
             expand_node,
