@@ -66,6 +66,10 @@ npm run setup
 cargo tauri dev --features=icebug-analytics
 ```
 
+### Ubuntu 26.04 (resolute)
+
+The same steps should work unchanged: the package names match and the Arrow repository serves `ubuntu/resolute` (verified to contain `libarrow-dev`). Not yet tested end to end - please report findings.
+
 ### Troubleshooting
 
 - `error: no such command: tauri` - the Tauri CLI is not installed: `cargo install tauri-cli --version "^2"`.
