@@ -77,6 +77,13 @@ The same steps should work unchanged: the package names match and the Arrow repo
 - `The system library arrow required by crate icebug was not found` - `libarrow-dev` is missing (steps 3-4 above), or you are building with `--features=icebug-analytics` unintentionally; plain `cargo tauri dev` does not need Arrow.
 - `error while loading shared libraries: libarrow.so.NN00` - the installed Arrow major version differs from the one the icebug prebuilt was linked against. Install the matching runtime and dev packages (e.g. `libarrow2400` + `libarrow-dev=24.0.0-1`), then `cargo clean -p icebug` and rebuild.
 - `error while loading shared libraries: libomp.so.5` - LLVM OpenMP runtime missing: `sudo apt install libomp5-19` (Debian/Ubuntu), `brew install libomp` (macOS).
+- Debian: installing `libarrow-dev` fails with `libnghttp3-dev : Depends: libnghttp3-9 (= 1.8.0-1)` or similar - you have curl libraries from trixie-backports; `libarrow-dev` needs the stable `libcurl4-openssl-dev` chain. Downgrade the whole cluster in one transaction:
+  ```bash
+  sudo apt install --allow-downgrades \
+    libcurl3t64-gnutls=8.14.1-2+deb13u4 libcurl4-gnutls- \
+    libnghttp3-9=1.8.0-1 \
+    libngtcp2-16=1.11.0-1+deb13u1 libngtcp2-crypto-gnutls8=1.11.0-1+deb13u1
+  ```
 - Prebuilt liblbug and the `lbug` crate version in `src-tauri/Cargo.toml` must match; `npm run setup` re-downloads automatically when the pin changes.
 
 ## Usage
