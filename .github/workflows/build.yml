@@ -70,7 +70,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: LadybugDB/ladybug
-          ref: 'v0.17.0'
+          ref: 'v0.18.1'
           path: ladybug
 
       - name: Checkout Sigma
