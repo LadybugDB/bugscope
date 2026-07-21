@@ -214,29 +214,46 @@ fn scan_for_databases(dir: &Path, base_dir: &Path) -> Vec<DatabaseInfo> {
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "lbdb" {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let relative_path = path
-                        .strip_prefix(base_dir)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
-                    databases.push(DatabaseInfo {
-                        id: 0, // assigned later
-                        name,
-                        path: path.to_string_lossy().to_string(),
-                        relative_path,
-                    });
-                }
+            let abs_path = path.to_string_lossy().to_string();
+            // Let Database::new() validate by magic bytes — no extension whitelist.
+            // A quick probe to skip obviously non-DB files without a full open.
+            if !is_lbug_file_fast(&abs_path) {
+                continue;
             }
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let relative_path = path
+                .strip_prefix(base_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            databases.push(DatabaseInfo {
+                id: 0, // assigned later
+                name,
+                path: abs_path,
+                relative_path,
+            });
         }
     }
     databases
+}
+
+/// Quick check that a file starts with Lbug's magic bytes, without a full database open.
+/// The Lbug magic is the 4-byte sequence `b"LBUG"` at offset 0.
+fn is_lbug_file_fast(path: &str) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    &magic == b"LBUG"
 }
 
 fn get_all_databases(state: &AppState) -> Vec<DatabaseInfo> {
@@ -264,9 +281,7 @@ fn database_info_from_path(file_path: &str) -> Result<DatabaseInfo, String> {
         return Err("File not found".to_string());
     }
 
-    if abs_path.extension().and_then(|e| e.to_str()) != Some("lbdb") {
-        return Err("Only .lbdb files are supported".to_string());
-    }
+    // Extension check removed: Database::new() validates by magic bytes and returns a clear error
 
     let abs_path_str = abs_path.to_string_lossy().to_string();
     let name = abs_path
@@ -1318,6 +1333,20 @@ fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData, Stri
         );
     }
 
+    // Also fetch isolated (edgeless) nodes and merge them in, so a database with
+    // nodes but few or no relationships doesn't render as an empty graph.
+    let mut isolated_result = conn
+        .query(&format!("MATCH (n) WHERE NOT (n)--() RETURN n LIMIT {limit}"))
+        .map_err(|e| format!("Isolated node query failed: {}", e))?;
+
+    for row in &mut isolated_result {
+        for val in row.iter() {
+            if let Some(node) = graph_node_from_value(val) {
+                nodes.insert(node.id.clone(), node);
+            }
+        }
+    }
+
     Ok(graph_data_without_clusters(
         nodes.into_values().collect(),
         links,
@@ -1769,9 +1798,15 @@ fn get_directories(
                 path: entry_path.to_string_lossy().to_string(),
                 entry_type: "directory".to_string(),
             });
-        } else if name.ends_with(".lbdb") {
+        } else if is_lbug_file_fast(&entry_path.to_string_lossy()) {
+            // Strip any extension for display so .lbug, .lbdb, .ldb etc.
+            // all show a clean name.
+            let trimmed = match entry_path.file_stem() {
+                Some(stem) => stem.to_string_lossy().to_string(),
+                None => name.clone(),
+            };
             files.push(DirEntry {
-                name: name.trim_end_matches(".lbdb").to_string(),
+                name: trimmed,
                 path: entry_path.to_string_lossy().to_string(),
                 entry_type: "file".to_string(),
             });
