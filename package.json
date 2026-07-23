@@ -1,7 +1,7 @@
 {
   "name": "bugscope",
   "private": true,
-  "version": "0.15.1",
+  "version": "0.18.1",
   "type": "module",
   "scripts": {
     "setup": "bash scripts/setup.sh",
@@ -12,7 +12,8 @@
     "dev:no-analytics": "cargo tauri dev",
     "build": "cargo tauri build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "version:bump": "node scripts/bump-version.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
