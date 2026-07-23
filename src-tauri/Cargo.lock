@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "bugscope"
-version = "0.15.1"
+version = "0.18.1"
 dependencies = [
  "arrow-array 56.2.1",
  "arrow-ipc",
