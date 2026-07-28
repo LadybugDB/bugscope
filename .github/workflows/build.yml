@@ -89,15 +89,10 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Tauri CLI
-        id: cache-tauri-cli
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/cargo-tauri*
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-tauri-v2-${{ hashFiles('src-tauri/Cargo.lock') }}
+          workspaces: './src-tauri -> target'
 
       - name: Install Tauri CLI (cargo plugin)
         shell: bash
