@@ -25,5 +25,5 @@ walkdir = "2"
 dirs = "5"
 fastrand = "2"
 reqwest = { version = "0.13.3", features = ["blocking", "json"] }
-icebug = { version = "12.9.0", optional = true }
+icebug = { version = "13.0.0", optional = true }
 lbug = { version = "0.18.1", features = ["arrow"] }
