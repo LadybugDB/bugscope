@@ -16,7 +16,7 @@ if (!newVersion) {
   process.exit(1);
 }
 
-if (!/^\d+\.\d+\.\d+/.test(newVersion)) {
+if (!/^\d+\.\d+\.\d+$/.test(newVersion)) {
   console.error(`Invalid version format: "${newVersion}". Expected semver (e.g. 1.2.3)`);
   process.exit(1);
 }
@@ -49,7 +49,7 @@ try {
 
 // Update Cargo.lock
 try {
-  execSync(`cargo update --precise ${newVersion} --manifest-path src-tauri/Cargo.toml bugscope`, {
+  execSync(`cargo update -p bugscope --precise ${newVersion} --manifest-path src-tauri/Cargo.toml`, {
     cwd: root,
     stdio: "inherit",
   });
