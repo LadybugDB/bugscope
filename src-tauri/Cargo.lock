@@ -1896,9 +1896,9 @@ dependencies = [
 
 [[package]]
 name = "icebug"
-version = "12.9.0"
+version = "13.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faefb8196c2e3a749df1035bf9f767b9ef2fa93e1b24734adb07ed5e75217c64"
+checksum = "7cfcf9aca78620ee7174f4a9c5afe64f7f12d85b73f5819c24213d426cdf252e"
 dependencies = [
  "arrow-array 56.2.1",
  "arrow-buffer 56.2.1",
