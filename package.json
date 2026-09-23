@@ -1,7 +1,7 @@
 {
   "name": "bugscope",
   "private": true,
-  "version": "0.18.1",
+  "version": "0.20.4",
   "type": "module",
   "scripts": {
     "setup": "bash scripts/setup.sh",
