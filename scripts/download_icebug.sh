@@ -7,7 +7,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REPOSITORY="${ICEBUG_GITHUB_REPOSITORY:-Ladybug-Memory/icebug}"
 TARGET_DIR="${ICEBUG_TARGET_DIR:-$PROJECT_DIR/src-tauri/icebug}"
-VERSION="${ICEBUG_VERSION:-13.0}"
+VERSION="${ICEBUG_VERSION:-13.2}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"

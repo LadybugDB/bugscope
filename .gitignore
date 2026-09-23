@@ -34,4 +34,5 @@ src-tauri/target/
 src-tauri/liblbug/
 src-tauri/icebug/
 src-tauri/macos-frameworks/
+src-tauri/windows-dlls/
 src-tauri/gen/
