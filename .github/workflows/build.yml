@@ -217,7 +217,7 @@ jobs:
         if: matrix.platform == 'windows-2022'
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: 'b322364f06308bdd24823f9d8f03fe0cc86fd46f'
+          vcpkgGitCommitId: '14d83b1c34655a6af6f044aa1679f668c0b0b70e'
 
       - name: Authenticate vcpkg NuGet (Windows)
         if: matrix.platform == 'windows-2022'
