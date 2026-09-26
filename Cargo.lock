@@ -844,7 +844,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bugscope-gpui"
+name = "bugscope"
 version = "0.1.0"
 dependencies = [
  "anyhow",

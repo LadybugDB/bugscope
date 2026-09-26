@@ -1,4 +1,4 @@
-use bugscope_gpui::ui::RootView;
+use bugscope::ui::RootView;
 use gpui::*;
 
 fn main() {
@@ -13,7 +13,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Bugscope — native graph explorer".into()),
+                    title: Some("Bugscope".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

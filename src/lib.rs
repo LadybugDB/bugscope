@@ -1,4 +1,4 @@
-//! Bugscope GPUI — native port of the ../bugscope `sage-port` branch.
+//! Bugscope — native port of the ../bugscope `sage-port` branch.
 //!
 //! The Tauri+React app is replaced by a single Rust binary:
 //!   * `backend` talks to LadybugDB (`lbug`) directly in-process — no Tauri IPC,

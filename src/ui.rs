@@ -153,6 +153,7 @@ impl RootView {
                 let msg = format!("{name}: {} nodes, {} edges", data.nodes.len(), data.links.len());
                 self.full = data.clone();
                 self.model.load(&data);
+                self.model.settle();
                 self.frame_initial(None);
                 self.focused = None;
                 self.selected = None;
@@ -191,33 +192,65 @@ impl RootView {
         }
         self.focused = Some(node_id.to_string());
         self.model.load(&view);
+        self.model.settle();
         self.frame_initial(Some(node_id));
         self.running = true;
         self.set_status(format!("Neighborhood of {node_id}"), cx);
     }
 
-    /// Default framing: zoomed in on the highest-degree hub with labels on.
-    /// `fit` alone would shrink the whole graph onto the screen (discs-only
-    /// territory); instead center the hub and never start below the hub-label
-    /// tier so the first paint already reads as a knowledge graph.
+    /// Default framing: zoomed in on the densest viewport with labels on.
+    /// Centering a single highest-degree hub fails on large graphs — the hub
+    /// can sit far from the bulk, leaving an almost-empty viewport. Instead
+    /// pick the zoom first, then center the window position holding the most
+    /// graph mass (degree-weighted). Callers must `settle` the model first
+    /// so density reflects topology, not the initial spiral.
     fn frame_initial(&mut self, focus: Option<&str>) {
-        // Fit against the measured canvas, not a hardcoded guess: the real
-        // canvas is the window minus sidebar/header, and fitting to 900x600
-        // skewed both zoom and centering.
         let s = self.canvas_size.get();
         let vw = f32::from(s.width).max(50.0);
         let vh = f32::from(s.height).max(50.0);
         self.camera.fit(&self.model, vw, vh);
-        // Center the focused node when there is one (a focused neighborhood
-        // used to recenter on its hub instead), else the highest-degree hub.
-        let anchor = focus
-            .and_then(|id| self.model.nodes.iter().find(|n| n.id == id))
-            .or_else(|| self.model.nodes.iter().max_by_key(|n| n.degree));
-        if let Some(a) = anchor {
-            self.camera.center_x = a.pos.x as f64;
-            self.camera.center_y = a.pos.y as f64;
-        }
         self.camera.zoom = self.camera.zoom.max(0.9).min(2.0);
+        let zoom = self.camera.zoom;
+        // World-space half extents of the viewport at this zoom.
+        let hw = (vw as f64 / zoom / 2.0) as f32;
+        let hh = (vh as f64 / zoom / 2.0) as f32;
+        // Focused node wins outright; otherwise score candidates by the
+        // degree-weighted mass visible around them.
+        if let Some(id) = focus {
+            if let Some(a) = self.model.nodes.iter().find(|n| n.id == id) {
+                self.camera.center_x = a.pos.x as f64;
+                self.camera.center_y = a.pos.y as f64;
+                self.still_ticks = 0;
+                return;
+            }
+        }
+        // Candidates: degree-weighted centroid + top hubs by degree.
+        let mut order: Vec<usize> = (0..self.model.nodes.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.model.nodes[i].degree));
+        let mut cx = 0.0f64;
+        let mut cy = 0.0f64;
+        let mut cw = 0.0f64;
+        for n in &self.model.nodes {
+            let w = 1.0 + n.degree as f64;
+            cx += n.pos.x as f64 * w;
+            cy += n.pos.y as f64 * w;
+            cw += w;
+        }
+        let mut best = (cx / cw.max(1.0), cy / cw.max(1.0), -1.0f64);
+        for &i in order.iter().take(200) {
+            let p = &self.model.nodes[i].pos;
+            let mut mass = 0.0f64;
+            for n in &self.model.nodes {
+                if (n.pos.x - p.x).abs() <= hw && (n.pos.y - p.y).abs() <= hh {
+                    mass += 1.0 + n.degree as f64;
+                }
+            }
+            if mass > best.2 {
+                best = (p.x as f64, p.y as f64, mass);
+            }
+        }
+        self.camera.center_x = best.0;
+        self.camera.center_y = best.1;
         self.still_ticks = 0;
     }
 
@@ -270,7 +303,7 @@ impl RootView {
             .py_2()
             .bg(theme.surface)
             .text_color(theme.foreground)
-            .child(div().font_weight(FontWeight::BOLD).child("Bugscope — native"))
+            .child(div().font_weight(FontWeight::BOLD).child("Bugscope"))
             .child(div().text_sm().child(format!("{db_name} · {status}")))
             .child(
                 div()

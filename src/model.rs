@@ -88,6 +88,18 @@ impl GraphModel {
         }
     }
 
+    /// Run the layout synchronously until clusters form, so framing decisions
+    /// see topology instead of the initial spiral. Scales with graph size.
+    pub fn settle(&mut self) {
+        let iters = ((self.nodes.len() / 50).clamp(40, 250)) as usize;
+        for _ in 0..iters {
+            self.tick();
+        }
+        for n in &mut self.nodes {
+            n.vel = Vec2 { x: 0.0, y: 0.0 };
+        }
+    }
+
     /// One force tick: Coulomb repulsion (sampled) + spring attraction + damping.
     pub fn tick(&mut self) {
         let n = self.nodes.len();

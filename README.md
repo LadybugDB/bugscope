@@ -1,4 +1,4 @@
-# bugscope-gpui — native GPUI port of Bugscope (`sage-port` branch)
+# bugscope — native GPUI port of Bugscope (`sage-port` branch)
 
 No Tauri, no React, no webview. A single Rust binary: LadybugDB in-process +
 native GPUI window.
