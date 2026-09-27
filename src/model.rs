@@ -78,7 +78,10 @@ impl GraphModel {
             });
         }
         for l in &data.links {
-            if let (Some(&s), Some(&t)) = (self.index.get(l.source.as_str()), self.index.get(l.target.as_str())) {
+            if let (Some(&s), Some(&t)) = (
+                self.index.get(l.source.as_str()),
+                self.index.get(l.target.as_str()),
+            ) {
                 self.links.push(SimLink {
                     source: s,
                     target: t,

@@ -12,7 +12,7 @@
 //! category at a single saturation/lightness level, with amber (`warning`)
 //! kept apart for selection, the primary action, and focus.
 
-use gpui::{Hsla, Window, WindowAppearance, rgb};
+use gpui::{rgb, Hsla, Window, WindowAppearance};
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -82,15 +82,15 @@ impl Theme {
 
 /// disktree `palette.rs` category hues, shared by both appearances.
 const CATEGORY_HUES: [(f32, f32); 9] = [
-    (0.605, 1.0), // code — blue
-    (0.065, 1.0), // agent scratch — orange
-    (0.415, 1.0), // toolchain — teal
-    (0.535, 1.0), // synced — cyan
-    (0.955, 1.0), // git — red
-    (0.745, 1.0), // media — violet
+    (0.605, 1.0),  // code — blue
+    (0.065, 1.0),  // agent scratch — orange
+    (0.415, 1.0),  // toolchain — teal
+    (0.535, 1.0),  // synced — cyan
+    (0.955, 1.0),  // git — red
+    (0.745, 1.0),  // media — violet
     (0.125, 0.95), // cache — amber
-    (0.6, 0.18),  // documents — near-neutral
-    (0.6, 0.08),  // other — neutral
+    (0.6, 0.18),   // documents — near-neutral
+    (0.6, 0.08),   // other — neutral
 ];
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {

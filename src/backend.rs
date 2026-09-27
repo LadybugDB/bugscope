@@ -133,10 +133,7 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
         return None;
     };
     let props = node.get_properties();
-    let owned: Vec<(String, Value)> = props
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let owned: Vec<(String, Value)> = props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let id = format!(
         "{}:{}",
         node.get_node_id().table_id,
@@ -248,7 +245,11 @@ fn collect_edges_arrow(
             node_ids.insert((st, so));
             node_ids.insert((dt, doff));
             if seen.insert((source.clone(), target.clone(), label.clone())) {
-                links.push(GraphLink { source, target, label });
+                links.push(GraphLink {
+                    source,
+                    target,
+                    label,
+                });
             }
         }
     }
@@ -283,17 +284,15 @@ fn collect_edges_csr(
             .context("arrow csr query failed")?;
         let csr = result.csr().context("no CSR metadata")?;
         let mut meta = conn
-            .query(&format!("MATCH (a)-[r:{rel}]->(b) RETURN id(a), id(b) LIMIT 1"))
+            .query(&format!(
+                "MATCH (a)-[r:{rel}]->(b) RETURN id(a), id(b) LIMIT 1"
+            ))
             .context("rel endpoint query failed")?;
         let (src_table, dst_table) = match meta.next() {
-            Some(row) if row.len() >= 2 => {
-                match (&row[0], &row[1]) {
-                    (Value::InternalID(s), Value::InternalID(d)) => {
-                        (s.table_id, d.table_id)
-                    }
-                    _ => continue,
-                }
-            }
+            Some(row) if row.len() >= 2 => match (&row[0], &row[1]) {
+                (Value::InternalID(s), Value::InternalID(d)) => (s.table_id, d.table_id),
+                _ => continue,
+            },
             _ => continue, // empty rel table
         };
         let indptr = csr.indptr.values();
@@ -354,7 +353,9 @@ pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> 
             node_ids = ids;
         }
         Err(e) => {
-            eprintln!("bugscope: CSR edge scan unavailable ({e}); falling back to columnar Arrow scan");
+            eprintln!(
+                "bugscope: CSR edge scan unavailable ({e}); falling back to columnar Arrow scan"
+            );
             collect_edges_arrow(conn, limit, &mut links, &mut node_ids)?
         }
     }
@@ -414,10 +415,14 @@ fn enrich_node_properties(
         offsets.sort_unstable();
         offsets.dedup();
         for chunk in offsets.chunks(1000) {
-            let list = chunk.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(",");
-            let Ok(mut result) =
-                conn.query(&format!("MATCH (n:{label}) WHERE offset(id(n)) IN [{list}] RETURN n"))
-            else {
+            let list = chunk
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let Ok(mut result) = conn.query(&format!(
+                "MATCH (n:{label}) WHERE offset(id(n)) IN [{list}] RETURN n"
+            )) else {
                 continue;
             };
             for row in &mut result {
@@ -468,7 +473,10 @@ pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
             properties: HashMap::new(),
         })
         .collect();
-    Ok(GraphData { nodes, links: vec![] })
+    Ok(GraphData {
+        nodes,
+        links: vec![],
+    })
 }
 
 /// Substring search over node properties — port of `search_nodes` fallback path.
@@ -531,8 +539,7 @@ pub fn neighborhood(full: &GraphData, focus: &str) -> GraphData {
     neighbor_ids.sort_by_key(|id| std::cmp::Reverse(*degrees.get(id).unwrap_or(&0)));
     let mut visible: HashSet<&str> = neighbor_ids.into_iter().take(NEIGHBOR_LIMIT).collect();
     visible.insert(focus);
-    let by_id: HashMap<&str, &GraphNode> =
-        full.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let by_id: HashMap<&str, &GraphNode> = full.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let nodes = visible
         .iter()
         .filter_map(|id| by_id.get(id).cloned().cloned())

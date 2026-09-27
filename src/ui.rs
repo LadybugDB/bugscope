@@ -3,8 +3,8 @@
 
 use crate::backend::{self, DatabaseInfo, GraphData, GraphNode};
 use crate::cli::CliOptions;
-use crate::model::{Camera, GraphModel, Vec2, node_size};
-use crate::theme::{Theme, edge_color, highlight, node_color};
+use crate::model::{node_size, Camera, GraphModel, Vec2};
+use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -182,7 +182,11 @@ impl RootView {
             }
         }) {
             Ok(data) => {
-                let msg = format!("{name}: {} nodes, {} edges", data.nodes.len(), data.links.len());
+                let msg = format!(
+                    "{name}: {} nodes, {} edges",
+                    data.nodes.len(),
+                    data.links.len()
+                );
                 self.full = data.clone();
                 self.model.load(&data);
                 self.model.settle();
@@ -213,8 +217,7 @@ impl RootView {
             };
             let _ = this.update(cx, |view, cx| {
                 let mut info = backend::database_info_for_path(&path);
-                if let Some(existing) = view.databases.iter().position(|d| d.path == info.path)
-                {
+                if let Some(existing) = view.databases.iter().position(|d| d.path == info.path) {
                     view.selected_db = Some(existing);
                 } else {
                     info.id = view.databases.len();
@@ -236,8 +239,7 @@ impl RootView {
         if q.trim().is_empty() {
             return;
         }
-        match backend::open_connection(&db.path).and_then(|conn| backend::search_nodes(&conn, &q))
-        {
+        match backend::open_connection(&db.path).and_then(|conn| backend::search_nodes(&conn, &q)) {
             Ok(results) => {
                 let n = results.len();
                 self.search_results = results;
@@ -355,7 +357,11 @@ impl RootView {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "no database".to_string());
         let status = self.status.clone();
-        let schema_label = if self.schema_mode { "Schema ✓" } else { "Schema" };
+        let schema_label = if self.schema_mode {
+            "Schema ✓"
+        } else {
+            "Schema"
+        };
         let layout_label = if self.running { "Pause" } else { "Layout" };
         div()
             .flex()
@@ -437,7 +443,11 @@ impl RootView {
             .text_color(theme.foreground)
             .text_sm()
             .child(div().font_weight(FontWeight::BOLD).child("Databases"))
-            .child(div().text_xs().child(self.db_dir.to_string_lossy().to_string()));
+            .child(
+                div()
+                    .text_xs()
+                    .child(self.db_dir.to_string_lossy().to_string()),
+            );
         for d in self.databases.clone() {
             let id = d.id;
             let active = Some(id) == self.selected_db;
@@ -447,11 +457,7 @@ impl RootView {
                     .py_1()
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(if active {
-                        theme.accent
-                    } else {
-                        theme.surface
-                    })
+                    .bg(if active { theme.accent } else { theme.surface })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |view, _, _, cx| {
@@ -511,7 +517,11 @@ impl RootView {
             let id = sel.id.clone();
             col = col
                 .child(div().pt_2().font_weight(FontWeight::BOLD).child("Selected"))
-                .child(div().text_xs().child(format!("{} · {}", sel.name, sel.label)))
+                .child(
+                    div()
+                        .text_xs()
+                        .child(format!("{} · {}", sel.name, sel.label)),
+                )
                 .child(div().text_xs().child(format!("id {}", sel.id)))
                 .child(div().text_xs().child(format!("degree {}", sel.degree)))
                 .child(
@@ -552,100 +562,100 @@ impl RootView {
         let origin_cell = self.canvas_origin.clone();
         let size_cell = self.canvas_size.clone();
         div()
-        .flex_1()
-        .h_full()
-        .bg(theme.inset)
-        // Structural clip: everything the canvas paints — discs, strokes,
-        // and especially the labels, which paint outside paint_layer — is
-        // cut at this box, so zoomed content can never cover the search
-        // box, title, or sidebar no matter what the label math does.
-        .overflow_hidden()
-        .child(
-        canvas(
-            move |bounds, _window, _cx| {
-                origin_cell.set(bounds.origin);
-                size_cell.set(bounds.size);
-                (snap, bounds)
-            },
-            move |_bounds, (snap, bounds), window, cx| {
-                paint_graph(&snap, bounds, window, cx);
-            },
-        )
-        .flex_1()
-        .h_full()
-        )
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|view, ev: &MouseDownEvent, _, cx| {
-                let (lx, ly) = view.to_local(ev.position);
-                let (vw, vh) = view.canvas_size();
-                if ev.click_count >= 2 {
+            .flex_1()
+            .h_full()
+            .bg(theme.inset)
+            // Structural clip: everything the canvas paints — discs, strokes,
+            // and especially the labels, which paint outside paint_layer — is
+            // cut at this box, so zoomed content can never cover the search
+            // box, title, or sidebar no matter what the label math does.
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        origin_cell.set(bounds.origin);
+                        size_cell.set(bounds.size);
+                        (snap, bounds)
+                    },
+                    move |_bounds, (snap, bounds), window, cx| {
+                        paint_graph(&snap, bounds, window, cx);
+                    },
+                )
+                .flex_1()
+                .h_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseDownEvent, _, cx| {
+                    let (lx, ly) = view.to_local(ev.position);
+                    let (vw, vh) = view.canvas_size();
+                    if ev.click_count >= 2 {
+                        let world = view.camera.screen_to_world(lx, ly, vw, vh);
+                        if let Some(i) = view.model.pick(world, 6.0) {
+                            let id = view.model.nodes[i].id.clone();
+                            view.focus_node(&id, cx);
+                        }
+                        return;
+                    }
+                    view.panning = Some(ev.position);
                     let world = view.camera.screen_to_world(lx, ly, vw, vh);
                     if let Some(i) = view.model.pick(world, 6.0) {
-                        let id = view.model.nodes[i].id.clone();
-                        view.focus_node(&id, cx);
+                        view.drag_node = Some(i);
+                        view.selected = Some(i);
+                        view.panning = None;
                     }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.drag_node = None;
+                    view.panning = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                let (lx, ly) = view.to_local(ev.position);
+                let (vw, vh) = view.canvas_size();
+                if let Some(i) = view.drag_node {
+                    if let Some(n) = view.model.nodes.get_mut(i) {
+                        n.pos = view.camera.screen_to_world(lx, ly, vw, vh);
+                        n.vel = Vec2 { x: 0.0, y: 0.0 };
+                    }
+                    // Dragging wakes the layout back up; it re-settles after.
+                    view.running = true;
+                    view.still_ticks = 0;
+                    cx.notify();
                     return;
                 }
-                view.panning = Some(ev.position);
+                if let Some(last) = view.panning {
+                    let dx = ev.position.x - last.x;
+                    let dy = ev.position.y - last.y;
+                    view.camera.center_x -= f64::from(dx) / view.camera.zoom;
+                    view.camera.center_y -= f64::from(dy) / view.camera.zoom;
+                    view.panning = Some(ev.position);
+                    cx.notify();
+                    return;
+                }
                 let world = view.camera.screen_to_world(lx, ly, vw, vh);
-                if let Some(i) = view.model.pick(world, 6.0) {
-                    view.drag_node = Some(i);
-                    view.selected = Some(i);
-                    view.panning = None;
+                let h = view.model.pick(world, 6.0);
+                if h != view.hovered {
+                    view.hovered = h;
+                    cx.notify();
                 }
+            }))
+            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _, cx| {
+                let (lx, ly) = view.to_local(ev.position);
+                let (vw, vh) = view.canvas_size();
+                let dy: f32 = match ev.delta {
+                    ScrollDelta::Pixels(p) => f32::from(p.y),
+                    ScrollDelta::Lines(p) => p.y * 20.0,
+                };
+                let factor = if dy < 0.0 { 1.12 } else { 1.0 / 1.12 };
+                view.camera.zoom_by(factor, lx, ly, vw, vh);
                 cx.notify();
-            }),
-        )
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|view, _, _, cx| {
-                view.drag_node = None;
-                view.panning = None;
-                cx.notify();
-            }),
-        )
-        .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
-            let (lx, ly) = view.to_local(ev.position);
-            let (vw, vh) = view.canvas_size();
-            if let Some(i) = view.drag_node {
-                if let Some(n) = view.model.nodes.get_mut(i) {
-                    n.pos = view.camera.screen_to_world(lx, ly, vw, vh);
-                    n.vel = Vec2 { x: 0.0, y: 0.0 };
-                }
-                // Dragging wakes the layout back up; it re-settles after.
-                view.running = true;
-                view.still_ticks = 0;
-                cx.notify();
-                return;
-            }
-            if let Some(last) = view.panning {
-                let dx = ev.position.x - last.x;
-                let dy = ev.position.y - last.y;
-                view.camera.center_x -= f64::from(dx) / view.camera.zoom;
-                view.camera.center_y -= f64::from(dy) / view.camera.zoom;
-                view.panning = Some(ev.position);
-                cx.notify();
-                return;
-            }
-            let world = view.camera.screen_to_world(lx, ly, vw, vh);
-            let h = view.model.pick(world, 6.0);
-            if h != view.hovered {
-                view.hovered = h;
-                cx.notify();
-            }
-        }))
-        .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _, cx| {
-            let (lx, ly) = view.to_local(ev.position);
-            let (vw, vh) = view.canvas_size();
-            let dy: f32 = match ev.delta {
-                ScrollDelta::Pixels(p) => f32::from(p.y),
-                ScrollDelta::Lines(p) => p.y * 20.0,
-            };
-            let factor = if dy < 0.0 { 1.12 } else { 1.0 / 1.12 };
-            view.camera.zoom_by(factor, lx, ly, vw, vh);
-            cx.notify();
-        }))
+            }))
     }
 }
 
@@ -690,11 +700,7 @@ impl Render for RootView {
                             .rounded_md()
                             .bg(theme.inset)
                             .border_1()
-                            .border_color(if qfocused {
-                                theme.accent
-                            } else {
-                                theme.border
-                            })
+                            .border_color(if qfocused { theme.accent } else { theme.border })
                             .text_color(if self.query.is_empty() && !qfocused {
                                 theme.secondary
                             } else {
@@ -879,7 +885,9 @@ fn paint_edge_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Windo
             underline: None,
             strikethrough: None,
         };
-        let shaped = window.text_system().shape_line(text, font_size, &[run], None);
+        let shaped = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
         let w = f32::from(shaped.width);
         let h = f32::from(shaped.ascent + shaped.descent);
         let mut lx = c.mx - w / 2.0 - pad_x;
@@ -1060,7 +1068,14 @@ fn paint_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx
     let min_degree = if zoom >= 2.0 {
         0
     } else {
-        snap.nodes.iter().map(|n| n.degree).max().unwrap_or(0).max(2) / 2 + 1
+        snap.nodes
+            .iter()
+            .map(|n| n.degree)
+            .max()
+            .unwrap_or(0)
+            .max(2)
+            / 2
+            + 1
     };
     let mut labelled = 0;
     for (i, sx, sy, r) in candidates {
@@ -1082,7 +1097,9 @@ fn paint_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx
             underline: None,
             strikethrough: None,
         };
-        let shaped = window.text_system().shape_line(text, font_size, &[run], None);
+        let shaped = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
         let w = f32::from(shaped.width);
         let h = f32::from(shaped.ascent + shaped.descent);
         let pill_w = w + pad_x * 2.0;

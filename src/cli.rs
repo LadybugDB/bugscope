@@ -99,14 +99,24 @@ mod tests {
         let opts = parse_cli(&args(&["bugscope", "a.lbdb", "b.lbdb"]))
             .unwrap()
             .unwrap();
-        assert_eq!(opts.files, vec![PathBuf::from("a.lbdb"), PathBuf::from("b.lbdb")]);
+        assert_eq!(
+            opts.files,
+            vec![PathBuf::from("a.lbdb"), PathBuf::from("b.lbdb")]
+        );
         assert!(!opts.schema_mode);
     }
 
     #[test]
     fn options_and_separator() {
         let opts = parse_cli(&args(&[
-            "bugscope", "--dir", "/tmp", "--limit", "500", "--schema", "--", "--weird.lbdb",
+            "bugscope",
+            "--dir",
+            "/tmp",
+            "--limit",
+            "500",
+            "--schema",
+            "--",
+            "--weird.lbdb",
         ]))
         .unwrap()
         .unwrap();
