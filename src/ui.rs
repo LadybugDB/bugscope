@@ -164,6 +164,37 @@ impl RootView {
         }
     }
 
+    fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => return,
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                let mut info = backend::database_info_for_path(&path);
+                if let Some(existing) = view.databases.iter().position(|d| d.path == info.path)
+                {
+                    view.selected_db = Some(existing);
+                } else {
+                    info.id = view.databases.len();
+                    view.databases.push(info);
+                    view.selected_db = Some(view.databases.len() - 1);
+                }
+                view.load_graph(cx);
+            });
+        })
+        .detach();
+    }
+
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected_db else { return };
         let Some(db) = self.databases.get(id) else {
@@ -399,6 +430,21 @@ impl RootView {
                     .child(d.name.clone()),
             );
         }
+        col = col.child(
+            div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.selection))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        view.open_file_dialog(cx);
+                    }),
+                )
+                .child("Open file…"),
+        );
         col = col
             .child(div().pt_2().font_weight(FontWeight::BOLD).child("Matches"))
             .child(div().text_xs().child(format!(

@@ -49,6 +49,7 @@ pub const SEARCH_RESULT_LIMIT: usize = 50;
 pub const NEIGHBOR_LIMIT: usize = 120;
 
 /// Walk `dir` for LadybugDB files — port of `scan_for_databases`.
+/// Simple recursive walk; `dir` is expected to be small (the working dir).
 pub fn scan_for_databases(dir: &Path) -> Vec<DatabaseInfo> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -61,15 +62,7 @@ pub fn scan_for_databases(dir: &Path) -> Vec<DatabaseInfo> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().map(|e| e == "lbdb").unwrap_or(false) {
-                let id = out.len();
-                out.push(DatabaseInfo {
-                    id,
-                    name: p
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    path: p.to_string_lossy().into_owned(),
-                });
+                out.push(database_info_for_path(&p));
             }
         }
     }
@@ -80,8 +73,20 @@ pub fn scan_for_databases(dir: &Path) -> Vec<DatabaseInfo> {
     out
 }
 
+/// Build a `DatabaseInfo` for an explicitly picked file.
+pub fn database_info_for_path(path: &Path) -> DatabaseInfo {
+    DatabaseInfo {
+        id: 0,
+        name: path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        path: path.to_string_lossy().into_owned(),
+    }
+}
+
 pub fn default_db_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    PathBuf::from(".")
 }
 
 fn value_to_string(v: &Value) -> String {
