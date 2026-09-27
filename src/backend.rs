@@ -81,9 +81,7 @@ pub fn scan_for_databases(dir: &Path) -> Vec<DatabaseInfo> {
 }
 
 pub fn default_db_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("../bugscope")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn value_to_string(v: &Value) -> String {
