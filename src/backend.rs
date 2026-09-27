@@ -154,7 +154,7 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
     })
 }
 
-pub fn open_connection(path: &str) -> Result<Connection> {
+pub fn open_connection(path: &str) -> Result<Connection<'_>> {
     let db = Database::new(path, SystemConfig::default())
         .with_context(|| format!("failed to open database {path}"))?;
     // Leak the Database so the Connection can outlive this call, mirroring the
