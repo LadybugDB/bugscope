@@ -2,6 +2,7 @@
 //! `QueryBox` + `GraphView` (layout, interaction, overlay).
 
 use crate::backend::{self, DatabaseInfo, GraphData, GraphNode};
+use crate::cli::CliOptions;
 use crate::model::{Camera, GraphModel, Vec2, node_size};
 use crate::theme::{Theme, edge_color, highlight, node_color};
 use gpui::*;
@@ -49,6 +50,7 @@ pub struct RootView {
     hovered: Option<usize>,
     selected: Option<usize>,
     schema_mode: bool,
+    limit: usize,
     running: bool,
     query_focus: FocusHandle,
     still_ticks: u32,
@@ -64,12 +66,42 @@ impl RootView {
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let db_dir = backend::default_db_dir();
-        let databases = backend::scan_for_databases(&db_dir);
+        Self::with_cli(&CliOptions::default(), cx)
+    }
+
+    /// Constructor honoring parsed command-line options: `--dir` replaces
+    /// the scanned directory, positional files are appended (first valid one
+    /// is selected), plus `--limit` / `--schema` overrides.
+    pub fn with_cli(opts: &CliOptions, cx: &mut Context<Self>) -> Self {
+        let db_dir = opts.db_dir.clone().unwrap_or_else(backend::default_db_dir);
+        let mut databases = backend::scan_for_databases(&db_dir);
+        for file in &opts.files {
+            if !file.is_file() {
+                eprintln!("bugscope: skipping {file:?}: not a file");
+                continue;
+            }
+            let info = backend::database_info_for_path(file);
+            if !databases.iter().any(|d| d.path == info.path) {
+                databases.push(info);
+            }
+        }
+        // Match scan_for_databases id assignment for appended entries.
+        for (i, db) in databases.iter_mut().enumerate() {
+            db.id = i;
+        }
+        let selected_db = opts
+            .files
+            .iter()
+            .filter_map(|f| {
+                let p = f.to_string_lossy().into_owned();
+                databases.iter().position(|d| d.path == p)
+            })
+            .next()
+            .or(if databases.is_empty() { None } else { Some(0) });
         let query_focus = cx.focus_handle();
         let mut this = Self {
             databases,
-            selected_db: None,
+            selected_db,
             db_dir,
             full: GraphData::default(),
             model: GraphModel::default(),
@@ -80,7 +112,8 @@ impl RootView {
             focused: None,
             hovered: None,
             selected: None,
-            schema_mode: false,
+            schema_mode: opts.schema_mode,
+            limit: opts.limit.unwrap_or(backend::EDGE_SCAN_LIMIT),
             running: false,
             query_focus,
             still_ticks: 0,
@@ -89,8 +122,7 @@ impl RootView {
             canvas_origin: Rc::new(Cell::new(point(px(0.), px(0.)))),
             canvas_size: Rc::new(Cell::new(size(px(900.), px(600.)))),
         };
-        if !this.databases.is_empty() {
-            this.selected_db = Some(0);
+        if this.selected_db.is_some() {
             this.load_graph(cx);
         }
         cx.spawn(async move |this, cx| loop {
@@ -146,7 +178,7 @@ impl RootView {
             if schema_mode {
                 backend::collect_schema_graph(&conn)
             } else {
-                backend::collect_edge_graph(&conn, backend::EDGE_SCAN_LIMIT)
+                backend::collect_edge_graph(&conn, self.limit)
             }
         }) {
             Ok(data) => {

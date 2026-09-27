@@ -10,6 +10,7 @@
 //!     `renderer.ts` node-disc + edge-body programs drawn on a `canvas`).
 
 pub mod backend;
+pub mod cli;
 pub mod model;
 pub mod theme;
 pub mod ui;
