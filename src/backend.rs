@@ -167,61 +167,268 @@ pub fn open_connection(path: &str) -> Result<Connection<'_>> {
     Connection::new(db).context("failed to create connection")
 }
 
-/// Port of `collect_edge_graph`: edge-bounded load + isolated nodes.
-pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> {
-    let mut nodes: HashMap<String, GraphNode> = HashMap::new();
-    let mut links = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut result = conn
-        .query(&format!("MATCH (a)-[r]->(b) RETURN a, r, b LIMIT {limit}"))
-        .context("relationship query failed")?;
+/// (table_id, name, kind) for every table — `CALL SHOW_TABLES` is tiny.
+fn table_catalog(conn: &Connection) -> Result<Vec<(u64, String, String)>> {
+    let mut out = Vec::new();
+    let mut result = conn.query("CALL SHOW_TABLES() RETURN *;")?;
     for row in &mut result {
         if row.len() < 3 {
             continue;
         }
-        let (Value::Node(_), Value::Rel(rel), _) = (&row[0], &row[1], &row[2]) else {
+        let (Value::UInt64(id), Value::String(name), Value::String(kind)) =
+            (&row[0], &row[1], &row[2])
+        else {
             continue;
         };
-        let source = format!(
-            "{}:{}",
-            rel.get_src_node().table_id,
-            rel.get_src_node().offset
-        );
-        let target = format!(
-            "{}:{}",
-            rel.get_dst_node().table_id,
-            rel.get_dst_node().offset
-        );
-        for val in [&row[0], &row[2]] {
-            if let Some(n) = graph_node_from_value(val) {
-                nodes.entry(n.id.clone()).or_insert(n);
+        out.push((*id, name.clone(), kind.clone()));
+    }
+    Ok(out)
+}
+
+/// Decode an `INTERNAL_ID` Arrow struct column (`{offset, table}`) into
+/// `(table_id, offset)` pairs, skipping nulls.
+fn decode_internal_id(col: &arrow::array::StructArray) -> Vec<(u64, u64)> {
+    use arrow::array::Array;
+    let offsets: Vec<i64> = col
+        .column_by_name("offset")
+        .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+        .map(|a| a.iter().map(|v| v.unwrap_or(0)).collect())
+        .unwrap_or_default();
+    let tables: Vec<i64> = col
+        .column_by_name("table")
+        .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+        .map(|a| a.iter().map(|v| v.unwrap_or(0)).collect())
+        .unwrap_or_default();
+    (0..col.len())
+        .filter(|&i| col.is_valid(i))
+        .filter_map(|i| Some((*tables.get(i)?, *offsets.get(i)?)))
+        .map(|(t, o)| (t.max(0) as u64, o.max(0) as u64))
+        .collect()
+}
+
+/// Columnar edge scan via Arrow memory: `RETURN id(a), id(b), label(r)`.
+/// No `Node`/`Rel` objects are materialized per row, so this scales far past
+/// what the row-wise `RETURN a, r, b` path can hold.
+fn collect_edges_arrow(
+    conn: &Connection,
+    limit: usize,
+    links: &mut Vec<GraphLink>,
+    node_ids: &mut HashSet<(u64, u64)>,
+) -> Result<()> {
+    use arrow::array::Array;
+    let mut result = conn
+        .query_as_arrow(
+            &format!(
+                "MATCH (a)-[r]->(b) RETURN id(a) AS src, id(b) AS dst, label(r) AS rel LIMIT {limit}"
+            ),
+            65_536,
+        )
+        .context("arrow edge query failed")?;
+    let mut seen = HashSet::new();
+    for batch in result.iter_arrow(65_536)? {
+        let srcs = batch
+            .column_by_name("src")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StructArray>())
+            .map(decode_internal_id)
+            .unwrap_or_default();
+        let dsts = batch
+            .column_by_name("dst")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StructArray>())
+            .map(decode_internal_id)
+            .unwrap_or_default();
+        let rels: Vec<String> = batch
+            .column_by_name("rel")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .map(|a| a.iter().map(|v| v.unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+        for (i, ((st, so), (dt, doff))) in srcs.into_iter().zip(dsts).enumerate() {
+            let label = rels.get(i).cloned().unwrap_or_default();
+            let source = format!("{st}:{so}");
+            let target = format!("{dt}:{doff}");
+            node_ids.insert((st, so));
+            node_ids.insert((dt, doff));
+            if seen.insert((source.clone(), target.clone(), label.clone())) {
+                links.push(GraphLink { source, target, label });
             }
         }
-        if seen.insert((source.clone(), target.clone(), rel.get_label_name().clone())) {
-            links.push(GraphLink {
-                source,
-                target,
-                label: rel.get_label_name().clone(),
-            });
+    }
+    Ok(())
+}
+
+/// Native CSR data path: per rel table, `RETURN a.rowid, r.rowid, b.rowid`
+/// via `query_as_arrow` carries CSR metadata and `QueryResult::csr()` hands
+/// back zero-copy `indptr`/`indices` Arrow arrays — the full adjacency list
+/// without materializing a single row. Src/dst table ids come from one cheap
+/// normal `LIMIT 1` query per rel table (metadata only). Any failure
+/// (no CSR metadata, e.g. older storage versions) is an `Err` so the caller
+/// can fall back to the columnar scan.
+fn collect_edges_csr(
+    conn: &Connection,
+    rel_tables: &[String],
+    limit: usize,
+) -> Result<(Vec<GraphLink>, HashSet<(u64, u64)>)> {
+    let mut links = Vec::new();
+    let mut node_ids = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut budget = limit;
+    for rel in rel_tables {
+        if budget == 0 {
+            break;
+        }
+        let result = conn
+            .query_as_arrow(
+                &format!("MATCH (a)-[r:{rel}]->(b) RETURN a.rowid, r.rowid, b.rowid"),
+                65_536,
+            )
+            .context("arrow csr query failed")?;
+        let csr = result.csr().context("no CSR metadata")?;
+        let mut meta = conn
+            .query(&format!("MATCH (a)-[r:{rel}]->(b) RETURN id(a), id(b) LIMIT 1"))
+            .context("rel endpoint query failed")?;
+        let (src_table, dst_table) = match meta.next() {
+            Some(row) if row.len() >= 2 => {
+                match (&row[0], &row[1]) {
+                    (Value::InternalID(s), Value::InternalID(d)) => {
+                        (s.table_id, d.table_id)
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue, // empty rel table
+        };
+        let indptr = csr.indptr.values();
+        let indices = csr.indices.values();
+        let n_src = csr.indptr.len().saturating_sub(1);
+        'src: for s in 0..n_src {
+            let start = indptr[s] as usize;
+            let end = indptr[s + 1] as usize;
+            for &d in &indices[start.min(indices.len())..end.min(indices.len())] {
+                if budget == 0 {
+                    break 'src;
+                }
+                budget -= 1;
+                let (su, du) = (s as u64, d.max(0) as u64);
+                node_ids.insert((src_table, su));
+                node_ids.insert((dst_table, du));
+                let source = format!("{src_table}:{su}");
+                let target = format!("{dst_table}:{du}");
+                if seen.insert((source.clone(), target.clone())) {
+                    links.push(GraphLink {
+                        source,
+                        target,
+                        label: rel.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok((links, node_ids))
+}
+
+/// Port of `collect_edge_graph`: edge-bounded load + isolated nodes.
+///
+/// Topology comes from native CSR via Arrow memory (`query_as_arrow` with a
+/// `RETURN a.rowid, r.rowid, b.rowid` projection + `QueryResult::csr()`),
+/// one CSR per rel table — no rows are materialized for edges. If CSR
+/// metadata is unavailable the columnar Arrow scan is the fallback; schema
+/// (`SHOW_TABLES`) and node properties always use normal row queries.
+pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> {
+    let catalog = table_catalog(conn).unwrap_or_default();
+    let rel_tables: Vec<String> = catalog
+        .iter()
+        .filter(|(_, _, kind)| kind == "REL")
+        .map(|(_, name, _)| name.clone())
+        .collect();
+    let label_of_table: HashMap<u64, String> = catalog
+        .iter()
+        .filter(|(_, _, kind)| kind == "NODE")
+        .map(|(id, name, _)| (*id, name.clone()))
+        .collect();
+
+    let mut links = Vec::new();
+    let mut node_ids: HashSet<(u64, u64)> = HashSet::new();
+    // CSR first for data; fall back to the columnar Arrow scan.
+    match collect_edges_csr(conn, &rel_tables, limit) {
+        Ok((l, ids)) => {
+            links = l;
+            node_ids = ids;
+        }
+        Err(e) => {
+            eprintln!("bugscope: CSR edge scan unavailable ({e}); falling back to columnar Arrow scan");
+            collect_edges_arrow(conn, limit, &mut links, &mut node_ids)?
         }
     }
 
-    let mut isolated = conn
-        .query(&format!("MATCH (n) WHERE NOT (n)--() RETURN n LIMIT {limit}"))
-        .context("isolated node query failed")?;
-    for row in &mut isolated {
-        for val in row.iter() {
-            if let Some(n) = graph_node_from_value(val) {
-                nodes.insert(n.id.clone(), n);
+    // Isolated nodes via Arrow ids — schema/details stay on normal queries.
+    if let Ok(mut iso) = conn.query_as_arrow(
+        &format!("MATCH (n) WHERE NOT (n)--() RETURN id(n) AS nid LIMIT {limit}"),
+        65_536,
+    ) {
+        if let Ok(batches) = iso.iter_arrow(65_536) {
+            for batch in batches {
+                if let Some(col) = batch
+                    .column_by_name("nid")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StructArray>())
+                {
+                    node_ids.extend(decode_internal_id(col));
+                }
             }
         }
     }
 
+    let mut nodes = HashMap::new();
+    enrich_node_properties(conn, &label_of_table, &node_ids, &mut nodes);
     Ok(GraphData {
         nodes: nodes.into_values().collect(),
         links,
     })
+}
+
+/// Fetch display names / properties for exactly the sampled nodes, grouped by
+/// table and batched with `WHERE offset(id(n)) IN [...]` so property
+/// materialization stays proportional to the sample, not the database.
+fn enrich_node_properties(
+    conn: &Connection,
+    label_of_table: &HashMap<u64, String>,
+    node_ids: &HashSet<(u64, u64)>,
+    nodes: &mut HashMap<String, GraphNode>,
+) {
+    let mut by_table: HashMap<u64, Vec<u64>> = HashMap::new();
+    for &(t, o) in node_ids {
+        by_table.entry(t).or_default().push(o);
+    }
+    for (table, mut offsets) in by_table {
+        let Some(label) = label_of_table.get(&table) else {
+            continue;
+        };
+        // Seed id+label so nodes survive even if the property fetch fails.
+        for &o in &offsets {
+            let id = format!("{table}:{o}");
+            nodes.entry(id.clone()).or_insert_with(|| GraphNode {
+                id: id.clone(),
+                name: id.clone(),
+                label: label.clone(),
+                properties: HashMap::new(),
+            });
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        for chunk in offsets.chunks(1000) {
+            let list = chunk.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(",");
+            let Ok(mut result) =
+                conn.query(&format!("MATCH (n:{label}) WHERE offset(id(n)) IN [{list}] RETURN n"))
+            else {
+                continue;
+            };
+            for row in &mut result {
+                for val in row.iter() {
+                    if let Some(n) = graph_node_from_value(val) {
+                        nodes.insert(n.id.clone(), n);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Schema view — one node per node table, linked by rel-table connectivity.

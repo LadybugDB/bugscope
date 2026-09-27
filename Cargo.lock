@@ -848,6 +848,7 @@ name = "bugscope"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "gpui",
  "lbug",
  "serde",
