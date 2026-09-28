@@ -48,22 +48,19 @@ pub const SEARCH_SCAN_LIMIT: usize = 50_000;
 pub const SEARCH_RESULT_LIMIT: usize = 50;
 pub const NEIGHBOR_LIMIT: usize = 120;
 
-/// Walk `dir` for LadybugDB files — port of `scan_for_databases`.
-/// Simple recursive walk; `dir` is expected to be small (the working dir).
+/// List LadybugDB files directly inside `dir` — port of `scan_for_databases`.
+/// Single level only (maxdepth 1): never descend into subdirectories, so a
+/// stray working dir (e.g. `/` when launched as a macOS .app) can't trigger
+/// a whole-filesystem walk that hangs startup.
 pub fn scan_for_databases(dir: &Path) -> Vec<DatabaseInfo> {
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().map(|e| e == "lbdb").unwrap_or(false) {
-                out.push(database_info_for_path(&p));
-            }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() && p.extension().map(|e| e == "lbdb").unwrap_or(false) {
+            out.push(database_info_for_path(&p));
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
