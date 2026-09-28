@@ -437,21 +437,23 @@ fn enrich_node_properties(
 }
 
 /// Schema view — one node per node table, linked by rel-table connectivity.
-/// Port of `collect_schema_graph` (simplified: tables + rel endpoints).
+/// Port of `collect_schema_graph`: node tables become nodes, and each rel
+/// table contributes one link, with endpoints resolved by sampling a single
+/// edge per rel table.
 pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
-    let mut tables: Vec<String> = Vec::new();
-    if let Ok(mut result) = conn.query("CALL SHOW_TABLES() RETURN *;") {
-        for row in &mut result {
-            for val in row.iter() {
-                let s = value_to_string(val);
-                if !s.is_empty() && !tables.contains(&s) {
-                    tables.push(s);
-                }
-            }
-        }
-    }
-    // Fallback: derive labels from a node sample.
-    if tables.is_empty() {
+    let catalog = table_catalog(conn).unwrap_or_default();
+    let mut node_tables: Vec<String> = catalog
+        .iter()
+        .filter(|(_, _, kind)| kind == "NODE")
+        .map(|(_, name, _)| name.clone())
+        .collect();
+    let rel_tables: Vec<String> = catalog
+        .iter()
+        .filter(|(_, _, kind)| kind == "REL")
+        .map(|(_, name, _)| name.clone())
+        .collect();
+    // Fallback: derive labels from a node sample when the catalog is empty.
+    if node_tables.is_empty() {
         let mut sample = conn.query("MATCH (n) RETURN n LIMIT 2000")?;
         let mut labels = HashSet::new();
         for row in &mut sample {
@@ -461,10 +463,35 @@ pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
                 }
             }
         }
-        tables = labels.into_iter().collect();
-        tables.sort();
+        node_tables = labels.into_iter().collect();
+        node_tables.sort();
     }
-    let nodes = tables
+    // One edge sample per rel table resolves its endpoint node tables.
+    let mut links = Vec::new();
+    let mut seen = HashSet::new();
+    for rel in &rel_tables {
+        let Ok(mut result) = conn.query(&format!(
+            "MATCH (a)-[r:{rel}]->(b) RETURN label(a) AS s, label(b) AS t LIMIT 1"
+        )) else {
+            continue;
+        };
+        for row in &mut result {
+            if row.len() < 2 {
+                continue;
+            }
+            let (Value::String(s), Value::String(t)) = (&row[0], &row[1]) else {
+                continue;
+            };
+            if seen.insert((s.clone(), t.clone(), rel.clone())) {
+                links.push(GraphLink {
+                    source: format!("schema:{s}"),
+                    target: format!("schema:{t}"),
+                    label: rel.clone(),
+                });
+            }
+        }
+    }
+    let nodes = node_tables
         .iter()
         .map(|t| GraphNode {
             id: format!("schema:{t}"),
@@ -473,10 +500,7 @@ pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
             properties: HashMap::new(),
         })
         .collect();
-    Ok(GraphData {
-        nodes,
-        links: vec![],
-    })
+    Ok(GraphData { nodes, links })
 }
 
 /// Substring search over node properties — port of `search_nodes` fallback path.
