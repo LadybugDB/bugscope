@@ -55,9 +55,10 @@ pub struct RootView {
     selected: Option<usize>,
     schema_mode: bool,
     sidebar_open: bool,
+    show_preferences: bool,
     /// `Some(true)` = force dark, `Some(false)` = light, `None` = follow OS.
     dark_override: Option<bool>,
-    /// Label typeface + size for canvas labels (sidebar preferences).
+    /// Label typeface + size for canvas labels (Preferences window).
     label_font: String,
     label_font_size: f32,
     /// Effective dark state from the last render — the theme toggle flips
@@ -86,7 +87,9 @@ impl RootView {
     /// the scanned directory, positional files are appended (first valid one
     /// is selected), plus `--limit` / `--schema` overrides.
     pub fn with_cli(opts: &CliOptions, cx: &mut Context<Self>) -> Self {
+        // Canonicalize so the sidebar shows a real path, never a bare ".".
         let db_dir = opts.db_dir.clone().unwrap_or_else(backend::default_db_dir);
+        let db_dir = db_dir.canonicalize().unwrap_or(db_dir);
         let mut databases = backend::scan_for_databases(&db_dir);
         for file in &opts.files {
             if !file.is_file() {
@@ -128,6 +131,7 @@ impl RootView {
             selected: None,
             schema_mode: opts.schema_mode,
             sidebar_open: false,
+            show_preferences: false,
             dark_override: None,
             label_font: ".SystemUIFont".to_string(),
             label_font_size: 11.0,
@@ -268,6 +272,21 @@ impl RootView {
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         cx.notify();
+    }
+
+    pub fn toggle_preferences(&mut self, cx: &mut Context<Self>) {
+        self.show_preferences = !self.show_preferences;
+        cx.notify();
+    }
+
+    /// Friendly display name: the default family starts with a literal
+    /// dot, which reads as a stray glyph in UI text.
+    pub fn label_font_display(&self) -> &str {
+        self.label_font
+            .trim_start_matches('.')
+            .split(' ')
+            .next()
+            .unwrap_or(&self.label_font)
     }
 
     pub fn set_label_font(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -656,78 +675,6 @@ impl RootView {
             );
         }
         col = col
-            .child(div().pt_2().font_weight(FontWeight::BOLD).child("Labels"))
-            .child(div().text_xs().child(format!(
-                "{} · {:.0}pt",
-                self.label_font, self.label_font_size
-            )));
-        {
-            let mut row = div().flex().flex_row().flex_wrap().gap_1();
-            for name in [".SystemUIFont", "Helvetica Neue", "Menlo", "Georgia"] {
-                let active = self.label_font == name;
-                let short = name
-                    .trim_start_matches('.')
-                    .split(' ')
-                    .next()
-                    .unwrap_or(name);
-                let name_owned = name.to_string();
-                row = row.child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_xs()
-                        .bg(if active { theme.accent } else { theme.surface })
-                        .hover(|s| s.bg(theme.selection))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |view, _, _, cx| {
-                                view.set_label_font(&name_owned.clone(), cx);
-                            }),
-                        )
-                        .child(short.to_string()),
-                );
-            }
-            col = col.child(row);
-        }
-        {
-            let size_row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(theme.surface)
-                        .hover(|s| s.bg(theme.selection))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _, _, cx| view.bump_label_font_size(-1.0, cx)),
-                        )
-                        .child("A−"),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(theme.surface)
-                        .hover(|s| s.bg(theme.selection))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _, _, cx| view.bump_label_font_size(1.0, cx)),
-                        )
-                        .child("A+"),
-                );
-            col = col.child(size_row);
-        }
-        col = col
             .child(div().pt_2().font_weight(FontWeight::BOLD).child("Matches"))
             .child(div().text_xs().child(format!(
                 "{} nodes · {} edges{}",
@@ -965,6 +912,7 @@ impl Render for RootView {
             .flex()
             .flex_col()
             .size_full()
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(self.render_header(theme, cx))
@@ -1089,6 +1037,133 @@ impl Render for RootView {
                             .child(query_content),
                     ),
             )
+            .children(self.render_preferences_modal(theme, cx))
+    }
+}
+
+impl RootView {
+    /// Native-style Preferences panel (app menu → Preferences…, ⌘,): a
+    /// centered modal with the label typeface + size controls. Rendered on
+    /// every platform from the same menu entry.
+    fn render_preferences_modal(&mut self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.show_preferences {
+            return None;
+        }
+        let mut chips = div().flex().flex_row().flex_wrap().gap_1();
+        for name in [".SystemUIFont", "Helvetica Neue", "Menlo", "Georgia"] {
+            let active = self.label_font == name;
+            let short = name
+                .trim_start_matches('.')
+                .split(' ')
+                .next()
+                .unwrap_or(name);
+            let name_owned = name.to_string();
+            chips = chips.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .bg(if active { theme.accent } else { theme.surface })
+                    .hover(|s| s.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.set_label_font(&name_owned.clone(), cx);
+                        }),
+                    )
+                    .child(short.to_string()),
+            );
+        }
+        let panel = div()
+            .w(px(360.))
+            .rounded_lg()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .text_color(theme.foreground)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Preferences"),
+            )
+            .child(div().font_weight(FontWeight::BOLD).child("Label font"))
+            .child(div().text_xs().text_color(theme.secondary).child(format!(
+                "{} · {:.0}pt",
+                self.label_font_display(),
+                self.label_font_size
+            )))
+            .child(chips)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(theme.inset)
+                            .hover(|s| s.bg(theme.selection))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.bump_label_font_size(-1.0, cx)),
+                            )
+                            .child("A−"),
+                    )
+                    .child(format!("{:.0}pt", self.label_font_size))
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(theme.inset)
+                            .hover(|s| s.bg(theme.selection))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.bump_label_font_size(1.0, cx)),
+                            )
+                            .child("A+"),
+                    ),
+            )
+            .child(
+                div().flex().flex_row().justify_end().child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme.accent)
+                        .hover(|s| s.bg(theme.selection))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| view.toggle_preferences(cx)),
+                        )
+                        .child("Close"),
+                ),
+            );
+        Some(
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(black().opacity(0.45))
+                .child(panel),
+        )
     }
 }
 

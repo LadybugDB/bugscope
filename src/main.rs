@@ -14,6 +14,7 @@ actions!(
         ToggleTheme,
         ToggleSidebar,
         ResetView,
+        OpenPreferences,
         Quit
     ]
 );
@@ -49,16 +50,22 @@ fn main() {
         cx.on_action(|_: &ToggleTheme, cx| with_view(cx, |v, cx| v.toggle_theme(cx)));
         cx.on_action(|_: &ToggleSidebar, cx| with_view(cx, |v, cx| v.toggle_sidebar(cx)));
         cx.on_action(|_: &ResetView, cx| with_view(cx, |v, cx| v.reset_view(cx)));
+        cx.on_action(|_: &OpenPreferences, cx| with_view(cx, |v, cx| v.toggle_preferences(cx)));
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-r", ReloadGraph, None),
             KeyBinding::new("cmd-b", ToggleSidebar, None),
+            KeyBinding::new("cmd-,", OpenPreferences, None),
         ]);
         cx.set_menus(vec![
             Menu {
                 name: "Bugscope".into(),
-                items: vec![MenuItem::action("Quit", Quit)],
+                items: vec![
+                    MenuItem::action("Preferences…", OpenPreferences),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit", Quit),
+                ],
             },
             Menu {
                 name: "File".into(),
