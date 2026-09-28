@@ -18,6 +18,8 @@ struct Snapshot {
     hovered: Option<usize>,
     selected: Option<usize>,
     theme: Theme,
+    label_font: String,
+    label_font_size: f32,
 }
 
 #[derive(Clone)]
@@ -55,6 +57,9 @@ pub struct RootView {
     sidebar_open: bool,
     /// `Some(true)` = force dark, `Some(false)` = light, `None` = follow OS.
     dark_override: Option<bool>,
+    /// Label typeface + size for canvas labels (sidebar preferences).
+    label_font: String,
+    label_font_size: f32,
     /// Effective dark state from the last render — the theme toggle flips
     /// relative to this, so the OS menu action needs no window handle.
     theme_dark: bool,
@@ -124,6 +129,8 @@ impl RootView {
             schema_mode: opts.schema_mode,
             sidebar_open: false,
             dark_override: None,
+            label_font: ".SystemUIFont".to_string(),
+            label_font_size: 11.0,
             theme_dark: false,
             limit: opts.limit.unwrap_or(backend::EDGE_SCAN_LIMIT),
             running: false,
@@ -260,6 +267,16 @@ impl RootView {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
+    pub fn set_label_font(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.label_font = name.to_string();
+        cx.notify();
+    }
+
+    pub fn bump_label_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.label_font_size = (self.label_font_size + delta).clamp(8.0, 24.0);
         cx.notify();
     }
 
@@ -504,6 +521,8 @@ impl RootView {
             camera: self.camera,
             hovered: self.hovered,
             selected: self.selected,
+            label_font: self.label_font.clone(),
+            label_font_size: self.label_font_size,
         }
     }
 
@@ -635,6 +654,78 @@ impl RootView {
                     )
                     .child(d.name.clone()),
             );
+        }
+        col = col
+            .child(div().pt_2().font_weight(FontWeight::BOLD).child("Labels"))
+            .child(div().text_xs().child(format!(
+                "{} · {:.0}pt",
+                self.label_font, self.label_font_size
+            )));
+        {
+            let mut row = div().flex().flex_row().flex_wrap().gap_1();
+            for name in [".SystemUIFont", "Helvetica Neue", "Menlo", "Georgia"] {
+                let active = self.label_font == name;
+                let short = name
+                    .trim_start_matches('.')
+                    .split(' ')
+                    .next()
+                    .unwrap_or(name);
+                let name_owned = name.to_string();
+                row = row.child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_xs()
+                        .bg(if active { theme.accent } else { theme.surface })
+                        .hover(|s| s.bg(theme.selection))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                view.set_label_font(&name_owned.clone(), cx);
+                            }),
+                        )
+                        .child(short.to_string()),
+                );
+            }
+            col = col.child(row);
+        }
+        {
+            let size_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme.surface)
+                        .hover(|s| s.bg(theme.selection))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| view.bump_label_font_size(-1.0, cx)),
+                        )
+                        .child("A−"),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme.surface)
+                        .hover(|s| s.bg(theme.selection))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| view.bump_label_font_size(1.0, cx)),
+                        )
+                        .child("A+"),
+                );
+            col = col.child(size_row);
         }
         col = col
             .child(div().pt_2().font_weight(FontWeight::BOLD).child("Matches"))
@@ -1043,7 +1134,7 @@ fn paint_edge_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Windo
     let vh = f32::from(bounds.size.height);
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
-    let font_size = px(10.);
+    let font_size = px((snap.label_font_size - 1.0).max(8.0));
     let pad_x = 3.0;
     let pad_y = 1.0;
     struct Cand {
@@ -1094,7 +1185,7 @@ fn paint_edge_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Windo
         let text: SharedString = c.label.into();
         let run = TextRun {
             len: text.len(),
-            font: font(".SystemUIFont"),
+            font: font(&snap.label_font),
             color: snap.theme.secondary,
             background_color: None,
             underline: None,
@@ -1254,7 +1345,7 @@ fn paint_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx
     let vh = f32::from(bounds.size.height);
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
-    let font_size = px(11.);
+    let font_size = px(snap.label_font_size);
     let pad_x = 4.0;
     let pad_y = 2.0;
 
@@ -1306,7 +1397,7 @@ fn paint_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx
         let text: SharedString = node.name.clone().into();
         let run = TextRun {
             len: text.len(),
-            font: font(".SystemUIFont"),
+            font: font(&snap.label_font),
             color: snap.theme.bright,
             background_color: None,
             underline: None,
