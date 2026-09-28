@@ -149,11 +149,25 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Stage binary for release
+        shell: bash
+        run: |
+          # Give each platform's binary a unique filename: macOS and Linux
+          # both produce `bugscope`, which collides as release assets.
+          src="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [[ "${{ matrix.binary }}" == *.exe ]]; then
+            dst="bugscope-${{ matrix.target }}.exe"
+          else
+            dst="bugscope-${{ matrix.target }}"
+          fi
+          cp "$src" "$dst"
+          echo "STAGED=$dst" >> "$GITHUB_ENV"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bugscope-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: ${{ env.STAGED }}
 
   release:
     needs: build
