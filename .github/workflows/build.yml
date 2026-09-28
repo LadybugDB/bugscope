@@ -149,25 +149,61 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage binary for release
-        shell: bash
+      - name: Package (macOS)
+        if: matrix.platform == 'macos-latest'
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          # Give each platform's binary a unique filename: macOS and Linux
-          # both produce `bugscope`, which collides as release assets.
-          src="target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          if [[ "${{ matrix.binary }}" == *.exe ]]; then
-            dst="bugscope-${{ matrix.target }}.exe"
-          else
-            dst="bugscope-${{ matrix.target }}"
-          fi
-          cp "$src" "$dst"
-          echo "STAGED=$dst" >> "$GITHUB_ENV"
+          # Ship a zipped .app bundle (disktree-style): raw binaries lose
+          # their exec bit and Gatekeeper attributes on download. Ad-hoc
+          # signed; a downloaded copy needs "Open Anyway" once unless a
+          # Developer ID signature + notarization is added later.
+          version="${VERSION#v}"
+          rm -rf dist
+          mkdir -p dist/Bugscope.app/Contents/MacOS dist/Bugscope.app/Contents/Resources
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/Bugscope.app/Contents/MacOS/bugscope
+          sed "s/@VERSION@/${version}/g" packaging/macos/Info.plist > dist/Bugscope.app/Contents/Info.plist
+          codesign --deep --force -s - dist/Bugscope.app
+          archive="dist/bugscope-${version}-${{ matrix.target }}-macos.zip"
+          ditto -c -k --keepParent dist/Bugscope.app "$archive"
+          (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+
+      - name: Package (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Ship a tarball: tar preserves the exec bit, unlike a bare binary.
+          version="${VERSION#v}"
+          name="bugscope-${version}-${{ matrix.target }}-linux"
+          rm -rf dist && mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          strip "dist/$name/${{ matrix.binary }}"
+          cp README.md "dist/$name/"
+          echo "$version" > "dist/$name/VERSION"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows-2022'
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $version = $env:VERSION -replace '^v',''
+          $name = "bugscope-$version-${{ matrix.target }}-windows"
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}", README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bugscope-${{ matrix.target }}
-          path: ${{ env.STAGED }}
+          path: dist/*
 
   release:
     needs: build
