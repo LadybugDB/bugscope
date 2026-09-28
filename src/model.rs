@@ -94,7 +94,7 @@ impl GraphModel {
     /// Run the layout synchronously until clusters form, so framing decisions
     /// see topology instead of the initial spiral. Scales with graph size.
     pub fn settle(&mut self) {
-        let iters = ((self.nodes.len() / 50).clamp(40, 250)) as usize;
+        let iters = (self.nodes.len() / 50).clamp(40, 250);
         for _ in 0..iters {
             self.tick();
         }

@@ -182,9 +182,12 @@ fn table_catalog(conn: &Connection) -> Result<Vec<(u64, String, String)>> {
     Ok(out)
 }
 
+/// A sampled node identity: `(table_id, offset)`, matching `"table:offset"` ids.
+type NodeId = (u64, u64);
+
 /// Decode an `INTERNAL_ID` Arrow struct column (`{offset, table}`) into
 /// `(table_id, offset)` pairs, skipping nulls.
-fn decode_internal_id(col: &arrow::array::StructArray) -> Vec<(u64, u64)> {
+fn decode_internal_id(col: &arrow::array::StructArray) -> Vec<NodeId> {
     use arrow::array::Array;
     let offsets: Vec<i64> = col
         .column_by_name("offset")
@@ -210,7 +213,7 @@ fn collect_edges_arrow(
     conn: &Connection,
     limit: usize,
     links: &mut Vec<GraphLink>,
-    node_ids: &mut HashSet<(u64, u64)>,
+    node_ids: &mut HashSet<NodeId>,
 ) -> Result<()> {
     use arrow::array::Array;
     let mut result = conn
@@ -267,7 +270,7 @@ fn collect_edges_csr(
     conn: &Connection,
     rel_tables: &[String],
     limit: usize,
-) -> Result<(Vec<GraphLink>, HashSet<(u64, u64)>)> {
+) -> Result<(Vec<GraphLink>, HashSet<NodeId>)> {
     let mut links = Vec::new();
     let mut node_ids = HashSet::new();
     let mut seen = HashSet::new();
@@ -345,7 +348,7 @@ pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> 
         .collect();
 
     let mut links = Vec::new();
-    let mut node_ids: HashSet<(u64, u64)> = HashSet::new();
+    let mut node_ids: HashSet<NodeId> = HashSet::new();
     // CSR first for data; fall back to the columnar Arrow scan.
     match collect_edges_csr(conn, &rel_tables, limit) {
         Ok((l, ids)) => {
@@ -391,7 +394,7 @@ pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> 
 fn enrich_node_properties(
     conn: &Connection,
     label_of_table: &HashMap<u64, String>,
-    node_ids: &HashSet<(u64, u64)>,
+    node_ids: &HashSet<NodeId>,
     nodes: &mut HashMap<String, GraphNode>,
 ) {
     let mut by_table: HashMap<u64, Vec<u64>> = HashMap::new();

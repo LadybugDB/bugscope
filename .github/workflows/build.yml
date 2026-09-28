@@ -30,8 +30,12 @@ jobs:
 
       - name: Install system dependencies (Linux)
         run: |
+          # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -76,7 +80,7 @@ jobs:
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: bugscope
-          - platform: windows-latest
+          - platform: windows-2022
             target: x86_64-pc-windows-msvc
             binary: bugscope.exe
 
@@ -93,18 +97,36 @@ jobs:
       - name: Install dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
+          # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev libwayland-dev
-
-      - name: Setup vcpkg (Windows)
-        if: matrix.platform == 'windows-latest'
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 'b322364f06308bdd24823f9d8f03fe0cc86fd46f'
+          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
 
       - name: Install OpenSSL (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: '& "$env:VCPKG_ROOT/vcpkg" install openssl --triplet x64-windows'
+        if: matrix.platform == 'windows-2022'
+        run: |
+          choco install openssl.light --no-progress -y
+          $root = 'C:\Program Files\OpenSSL'
+          echo "OPENSSL_DIR=$root" >> "$env:GITHUB_ENV"
+          # Shining Light nests import libs under lib\VC\x64\MD (DLL) and
+          # lib\VC\x64\MT (static); pick the first dir that exists.
+          $lib = @('lib\VC\x64\MD', 'lib\VC\x64\MT', 'lib') |
+            ForEach-Object { Join-Path $root $_ } |
+            Where-Object { Test-Path (Join-Path $_ 'libssl.lib') } |
+            Select-Object -First 1
+          if (-not $lib) { Get-ChildItem $root | Select-Object FullName; exit 1 }
+          echo "Windows OpenSSL lib dir: $lib"
+          # Stage the import libs somewhere space-free: MSVC silently
+          # mishandles the 'C:\Program Files\...' LIB entry (see the
+          # truncated 'LIBPATH:C:\Program' in the link line).
+          $stage = "$env:GITHUB_WORKSPACE\openssl-lib"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item (Join-Path $lib 'libssl.lib') $stage
+          Copy-Item (Join-Path $lib 'libcrypto.lib') $stage
+          Get-ChildItem $stage | Select-Object Name, Length
+          echo "LIB=$stage" >> "$env:GITHUB_ENV"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

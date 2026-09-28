@@ -274,7 +274,7 @@ impl RootView {
         let vw = f32::from(s.width).max(50.0);
         let vh = f32::from(s.height).max(50.0);
         self.camera.fit(&self.model, vw, vh);
-        self.camera.zoom = self.camera.zoom.max(0.9).min(2.0);
+        self.camera.zoom = self.camera.zoom.clamp(0.9, 2.0);
         let zoom = self.camera.zoom;
         // World-space half extents of the viewport at this zoom.
         let hw = (vw as f64 / zoom / 2.0) as f32;
