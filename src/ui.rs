@@ -45,11 +45,19 @@ pub struct RootView {
     camera: Camera,
     status: String,
     query: String,
+    /// Byte offset of the text cursor inside `query` (always a char boundary).
+    query_cursor: usize,
     search_results: Vec<GraphNode>,
     focused: Option<String>,
     hovered: Option<usize>,
     selected: Option<usize>,
     schema_mode: bool,
+    sidebar_open: bool,
+    /// `Some(true)` = force dark, `Some(false)` = light, `None` = follow OS.
+    dark_override: Option<bool>,
+    /// Effective dark state from the last render — the theme toggle flips
+    /// relative to this, so the OS menu action needs no window handle.
+    theme_dark: bool,
     limit: usize,
     running: bool,
     query_focus: FocusHandle,
@@ -108,11 +116,15 @@ impl RootView {
             camera: Camera::default(),
             status: "Pick a database to begin.".to_string(),
             query: String::new(),
+            query_cursor: 0,
             search_results: Vec::new(),
             focused: None,
             hovered: None,
             selected: None,
             schema_mode: opts.schema_mode,
+            sidebar_open: false,
+            dark_override: None,
+            theme_dark: false,
             limit: opts.limit.unwrap_or(backend::EDGE_SCAN_LIMIT),
             running: false,
             query_focus,
@@ -166,7 +178,7 @@ impl RootView {
         cx.notify();
     }
 
-    fn load_graph(&mut self, cx: &mut Context<Self>) {
+    pub fn load_graph(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected_db else { return };
         let Some(db) = self.databases.get(id) else {
             return;
@@ -200,7 +212,7 @@ impl RootView {
         }
     }
 
-    fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
+    pub fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -230,22 +242,163 @@ impl RootView {
         .detach();
     }
 
-    fn run_search(&mut self, cx: &mut Context<Self>) {
+    /// OS menu actions — one-liners around the old header buttons.
+    pub fn toggle_schema(&mut self, cx: &mut Context<Self>) {
+        self.schema_mode = !self.schema_mode;
+        self.load_graph(cx);
+    }
+
+    pub fn toggle_layout(&mut self, cx: &mut Context<Self>) {
+        self.running = !self.running;
+        cx.notify();
+    }
+
+    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.dark_override = Some(!self.theme_dark);
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
+    pub fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.query.clear();
+        self.query_cursor = 0;
+        self.search_results.clear();
+        self.load_graph(cx);
+    }
+
+    /// Keep the cursor on a char boundary and inside the text.
+    fn clamp_cursor(&mut self) {
+        while !self.query.is_char_boundary(self.query_cursor) && self.query_cursor > 0 {
+            self.query_cursor -= 1;
+        }
+        self.query_cursor = self.query_cursor.min(self.query.len());
+    }
+
+    fn query_insert(&mut self, text: &str) {
+        self.clamp_cursor();
+        self.query.insert_str(self.query_cursor, text);
+        self.query_cursor += text.len();
+    }
+
+    /// Backspace: delete the char before the cursor (⌘⌫ clears to start).
+    fn query_backspace(&mut self, to_start: bool) {
+        self.clamp_cursor();
+        if to_start {
+            self.query.drain(..self.query_cursor);
+            self.query_cursor = 0;
+            return;
+        }
+        if self.query_cursor == 0 {
+            return;
+        }
+        let mut start = self.query_cursor - 1;
+        while !self.query.is_char_boundary(start) && start > 0 {
+            start -= 1;
+        }
+        self.query.drain(start..self.query_cursor);
+        self.query_cursor = start;
+    }
+
+    /// Forward delete: remove the char under the cursor.
+    fn query_delete_fwd(&mut self) {
+        self.clamp_cursor();
+        if self.query_cursor >= self.query.len() {
+            return;
+        }
+        let mut end = self.query_cursor + 1;
+        while !self.query.is_char_boundary(end) && end < self.query.len() {
+            end += 1;
+        }
+        self.query.drain(self.query_cursor..end);
+    }
+
+    fn query_move(&mut self, dir: i8) {
+        self.clamp_cursor();
+        if dir < 0 {
+            if self.query_cursor > 0 {
+                let mut c = self.query_cursor - 1;
+                while !self.query.is_char_boundary(c) && c > 0 {
+                    c -= 1;
+                }
+                self.query_cursor = c;
+            }
+        } else {
+            self.query_cursor = self
+                .query
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| i > self.query_cursor)
+                .unwrap_or(self.query.len());
+        }
+    }
+
+    /// Enter in the query bar: `/foo` searches node names/properties,
+    /// anything else runs as a Cypher query and replaces the graph.
+    fn run_query(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected_db else { return };
         let Some(db) = self.databases.get(id) else {
             return;
         };
-        let q = self.query.clone();
-        if q.trim().is_empty() {
+        let raw = self.query.clone();
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
             return;
         }
-        match backend::open_connection(&db.path).and_then(|conn| backend::search_nodes(&conn, &q)) {
-            Ok(results) => {
-                let n = results.len();
-                self.search_results = results;
-                self.set_status(format!("{n} matches for {q} — click to focus"), cx);
+        let is_search = raw.starts_with('/');
+        let mut term = raw.trim_start_matches('/').trim().to_string();
+        // Accept both `/rdf` and `/search rdf` (the old hint text
+        // suggested the latter).
+        if let Some(rest) = term.strip_prefix("search") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                term = rest.trim().to_string();
             }
-            Err(e) => self.set_status(format!("Search failed: {e:#}"), cx),
+        }
+        if term.is_empty() {
+            return;
+        }
+        let path = db.path.clone();
+        let work = if is_search {
+            // Search mode: reuse the substring scan, presented as matches.
+            backend::open_connection(&path).and_then(|conn| {
+                backend::search_nodes(&conn, &term).map(|nodes| GraphData {
+                    nodes,
+                    links: vec![],
+                })
+            })
+        } else {
+            backend::open_connection(&path).and_then(|conn| backend::run_cypher(&conn, &raw))
+        };
+        match work {
+            Ok(data) => {
+                if is_search {
+                    let n = data.nodes.len();
+                    self.search_results = data.nodes;
+                    if n > 0 {
+                        // Matches only render in the sidebar — open it so
+                        // the search visibly does something.
+                        self.sidebar_open = true;
+                    }
+                    self.set_status(format!("{n} matches for {term} — click to focus"), cx);
+                } else {
+                    self.search_results.clear();
+                    self.focused = None;
+                    self.selected = None;
+                    self.full = data.clone();
+                    self.model.load(&data);
+                    self.model.settle();
+                    self.frame_initial(None);
+                    self.running = !data.nodes.is_empty() && !self.schema_mode;
+                    self.set_status(
+                        format!("Cypher: {} nodes, {} edges", data.nodes.len(), data.links.len()),
+                        cx,
+                    );
+                }
+            }
+            Err(e) => self.set_status(format!("Query failed: {e:#}"), cx),
         }
     }
 
@@ -350,6 +503,16 @@ impl RootView {
         }
     }
 
+    /// Theme with the manual light/dark override applied on top of the
+    /// OS appearance.
+    fn theme_for(&self, window: &Window) -> Theme {
+        match self.dark_override {
+            Some(true) => Theme::tokyo_night(),
+            Some(false) => Theme::flexoki_light(),
+            None => Theme::current(window),
+        }
+    }
+
     fn render_header(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let db_name = self
             .selected_db
@@ -357,12 +520,9 @@ impl RootView {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "no database".to_string());
         let status = self.status.clone();
-        let schema_label = if self.schema_mode {
-            "Schema ✓"
-        } else {
-            "Schema"
-        };
-        let layout_label = if self.running { "Pause" } else { "Layout" };
+        // The theme button flips between the two palettes; the glyph shows
+        // what you get when you click (sun on dark, moon on light).
+        let theme_button = if theme.dark { "☀" } else { "☾" };
         div()
             .flex()
             .flex_row()
@@ -380,7 +540,6 @@ impl RootView {
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .gap_2()
                     .child(
                         div()
                             .px_2()
@@ -390,43 +549,53 @@ impl RootView {
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.load_graph(cx)),
-                            )
-                            .child("Reload"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(theme.selection)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| {
-                                    view.schema_mode = !view.schema_mode;
-                                    view.load_graph(cx);
-                                }),
-                            )
-                            .child(schema_label),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(theme.selection)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| {
-                                    view.running = !view.running;
+                                cx.listener(|view, _, window, cx| {
+                                    let current = view
+                                        .dark_override
+                                        .unwrap_or_else(|| Theme::current(window).dark);
+                                    view.dark_override = Some(!current);
                                     cx.notify();
                                 }),
                             )
-                            .child(layout_label),
+                            .child(theme_button),
                     ),
             )
+    }
+
+    /// Divider gutter between the sidebar and the canvas: a 1px line split
+    /// into top/bottom segments with the collapse chevron straddling its
+    /// vertical middle. Always rendered so the bar can be reopened when
+    /// hidden. Pure flexbox — no absolute positioning needed.
+    fn render_divider(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        // Chevron points the way the bar will go.
+        let side_glyph = if self.sidebar_open { "«" } else { "»" };
+        let line = || div().flex_1().w(px(1.)).bg(theme.border);
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w(px(18.))
+            .h_full()
+            .py_1()
+            .child(line())
+            .child(
+                div()
+                    .px_1()
+                    .text_xs()
+                    .rounded_md()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.secondary)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)),
+                    )
+                    .child(side_glyph),
+            )
+            .child(line())
     }
 
     fn render_sidebar(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -468,21 +637,6 @@ impl RootView {
                     .child(d.name.clone()),
             );
         }
-        col = col.child(
-            div()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.selection))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |view, _, _, cx| {
-                        view.open_file_dialog(cx);
-                    }),
-                )
-                .child("Open file…"),
-        );
         col = col
             .child(div().pt_2().font_weight(FontWeight::BOLD).child("Matches"))
             .child(div().text_xs().child(format!(
@@ -661,20 +815,61 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window);
+        let theme = self.theme_for(window);
+        self.theme_dark = theme.dark;
         // The search box is a real focusable element: click focuses it,
         // keystrokes land on it (not on a root handler that never had focus
         // — the old bug), and it autofocuses when the window opens.
         let qfocus = self.query_focus.clone();
         let qfocused = self.query_focus.is_focused(window);
-        let query_text = if self.query.is_empty() && !qfocused {
-            "Search nodes… (click here, type, Enter)".to_string()
+        // Caret as a reverse-video highlight on the char under the cursor,
+        // not an inserted `▍` glyph: inserting a glyph changes the line
+        // width, so moving the cursor used to shove the text around it.
+        let caret_on = qfocused && !self.query.is_empty();
+        let (before, cur, after) = if caret_on {
+            let mut at = self.query_cursor.min(self.query.len());
+            if !self.query.is_char_boundary(at) {
+                at = self.query.len();
+            }
+            let (b, rest) = self.query.split_at(at);
+            match rest.chars().next() {
+                Some(c) => (
+                    b.to_string(),
+                    c.to_string(),
+                    rest[c.len_utf8()..].to_string(),
+                ),
+                // End of text: highlight a trailing space so the caret
+                // is still visible without moving anything before it.
+                None => (b.to_string(), " ".to_string(), String::new()),
+            }
+        } else if self.query.is_empty() && !qfocused {
+            (
+                "/rdf searches nodes · anything else is Cypher — Enter".to_string(),
+                String::new(),
+                String::new(),
+            )
         } else if self.query.is_empty() {
-            "▍".to_string()
-        } else if qfocused {
-            format!("{}▍", self.query)
+            ("▍".to_string(), String::new(), String::new())
         } else {
-            self.query.clone()
+            (self.query.clone(), String::new(), String::new())
+        };
+        let mut cur_el = div().child(cur);
+        if caret_on {
+            cur_el = cur_el
+                .bg(theme.accent)
+                .text_color(theme.on_accent)
+                .rounded_sm();
+        }
+        let query_content = div()
+            .flex()
+            .flex_row()
+            .child(before)
+            .child(cur_el)
+            .child(after);
+        let sidebar = if self.sidebar_open {
+            Some(self.render_sidebar(theme, cx))
+        } else {
+            None
         };
         div()
             .flex()
@@ -687,14 +882,27 @@ impl Render for RootView {
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .flex_1()
+                    .min_h_0()
+                    .children(sidebar)
+                    .child(self.render_divider(theme, cx))
+                    .child(self.render_graph_canvas(theme, cx)),
+            )
+            // Compact query bar at the bottom: `/foo` searches, anything
+            // else runs as Cypher. Enter submits; Escape clears.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_center()
                     .px_3()
                     .py_2()
-                    .bg(theme.background)
+                    .bg(theme.surface)
                     .child(
                         div()
                             .id("query-box")
-                            .flex_1()
+                            .w(px(560.))
+                            .max_w_full()
                             .px_2()
                             .py_1()
                             .rounded_md()
@@ -718,70 +926,78 @@ impl Render for RootView {
                                 }),
                             )
                             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _, cx| {
-                                if ev.keystroke.key == "backspace" {
-                                    view.query.pop();
-                                    cx.notify();
-                                } else if ev.keystroke.key == "enter" {
-                                    view.run_search(cx);
-                                } else if ev.keystroke.key == "escape" {
-                                    view.query.clear();
-                                    cx.notify();
-                                } else if let Some(ch) = ev.keystroke.key_char.clone() {
-                                    if !ev.keystroke.modifiers.control
-                                        && !ev.keystroke.modifiers.platform
-                                        && !ev.keystroke.modifiers.alt
-                                        && ch.chars().count() == 1
-                                    {
-                                        view.query.push_str(&ch);
+                                let mods = &ev.keystroke.modifiers;
+                                let cmd = mods.platform || mods.control;
+                                match ev.keystroke.key.as_str() {
+                                    "backspace" => {
+                                        view.query_backspace(cmd);
                                         cx.notify();
+                                    }
+                                    "delete" => {
+                                        view.query_delete_fwd();
+                                        cx.notify();
+                                    }
+                                    "enter" => view.run_query(cx),
+                                    "escape" => {
+                                        view.query.clear();
+                                        view.query_cursor = 0;
+                                        cx.notify();
+                                    }
+                                    "left" => {
+                                        view.query_move(-1);
+                                        cx.notify();
+                                    }
+                                    "right" => {
+                                        view.query_move(1);
+                                        cx.notify();
+                                    }
+                                    "home" => {
+                                        view.query_cursor = 0;
+                                        cx.notify();
+                                    }
+                                    "end" => {
+                                        view.query_cursor = view.query.len();
+                                        cx.notify();
+                                    }
+                                    // ⌘V paste (clipboard text, flattened to
+                                    // one line); ⌘C copies the whole query.
+                                    "v" if cmd => {
+                                        if let Some(item) = cx.read_from_clipboard() {
+                                            if let Some(text) = item.text() {
+                                                let flat = text
+                                                    .split_whitespace()
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ");
+                                                if !flat.is_empty() {
+                                                    view.query_insert(&flat);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "c" if cmd => {
+                                        if !view.query.is_empty() {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                view.query.clone(),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        if let Some(ch) = ev.keystroke.key_char.clone() {
+                                            if !mods.control
+                                                && !mods.platform
+                                                && !mods.alt
+                                                && ch.chars().count() == 1
+                                            {
+                                                view.query_insert(&ch);
+                                                cx.notify();
+                                            }
+                                        }
                                     }
                                 }
                             }))
-                            .child(query_text),
-                    )
-                    .child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(highlight(&theme))
-                            .text_color(theme.background)
-                            .text_sm()
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.run_search(cx)),
-                            )
-                            .child("Search"),
-                    )
-                    .child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(theme.selection)
-                            .text_color(theme.foreground)
-                            .text_sm()
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| {
-                                    view.query.clear();
-                                    view.search_results.clear();
-                                    view.load_graph(cx);
-                                }),
-                            )
-                            .child("Reset"),
+                            .child(query_content),
                     ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar(theme, cx))
-                    .child(self.render_graph_canvas(theme, cx)),
             )
     }
 }

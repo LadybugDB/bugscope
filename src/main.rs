@@ -1,6 +1,36 @@
 use bugscope::cli::parse_cli;
 use bugscope::ui::RootView;
 use gpui::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+actions!(
+    bugscope,
+    [
+        OpenFile,
+        ReloadGraph,
+        ToggleSchema,
+        ToggleLayout,
+        ToggleTheme,
+        ToggleSidebar,
+        ResetView,
+        Quit
+    ]
+);
+
+/// Handle to the live root view so OS menu actions can reach it.
+struct ActiveView(WeakEntity<RootView>);
+impl Global for ActiveView {}
+
+fn with_view(cx: &mut App, f: impl FnOnce(&mut RootView, &mut Context<RootView>)) {
+    let Some(entity) = cx
+        .try_global::<ActiveView>()
+        .and_then(|h| h.0.upgrade())
+    else {
+        return;
+    };
+    entity.update(cx, f);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,6 +45,56 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         // Menu + window chrome come from GPUI itself — no Tauri webview, no
         // titlebar plugin, no capability files.
+        cx.on_action(|_: &OpenFile, cx| with_view(cx, |v, cx| v.open_file_dialog(cx)));
+        cx.on_action(|_: &ReloadGraph, cx| {
+            with_view(cx, |v, cx| v.load_graph(cx))
+        });
+        cx.on_action(|_: &ToggleSchema, cx| {
+            with_view(cx, |v, cx| v.toggle_schema(cx))
+        });
+        cx.on_action(|_: &ToggleLayout, cx| {
+            with_view(cx, |v, cx| v.toggle_layout(cx))
+        });
+        cx.on_action(|_: &ToggleTheme, cx| {
+            with_view(cx, |v, cx| v.toggle_theme(cx))
+        });
+        cx.on_action(|_: &ToggleSidebar, cx| {
+            with_view(cx, |v, cx| v.toggle_sidebar(cx))
+        });
+        cx.on_action(|_: &ResetView, cx| with_view(cx, |v, cx| v.reset_view(cx)));
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([
+            KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("cmd-r", ReloadGraph, None),
+            KeyBinding::new("cmd-b", ToggleSidebar, None),
+        ]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Bugscope".into(),
+                items: vec![MenuItem::action("Quit", Quit)],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open Database…", OpenFile),
+                    MenuItem::action("Reload Graph", ReloadGraph),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Schema View", ToggleSchema),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Pause/Resume Layout", ToggleLayout),
+                    MenuItem::action("Toggle Light/Dark Theme", ToggleTheme),
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::separator(),
+                    MenuItem::action("Reset View", ResetView),
+                ],
+            },
+        ]);
+        let holder: Rc<RefCell<Option<Entity<RootView>>>> = Rc::new(RefCell::new(None));
+        let capture = holder.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -34,11 +114,15 @@ fn main() {
                     let view = cx.new(|cx| RootView::with_cli(&opts, cx));
                     // Autofocus the search box so typing works immediately.
                     window.focus(&view.read(cx).query_focus_handle());
+                    *capture.borrow_mut() = Some(view.clone());
                     view
                 }
             },
         )
         .expect("failed to open window");
+        if let Some(view) = holder.borrow().clone() {
+            cx.set_global(ActiveView(view.downgrade()));
+        }
         cx.activate(true);
     });
 }

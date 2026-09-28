@@ -10,7 +10,7 @@
 //!     (ports `get_node_neighborhood` + click-to-expand)
 
 use anyhow::{Context, Result};
-use lbug::{Connection, Database, SystemConfig, Value};
+use lbug::{Connection, Database, InternalID, SystemConfig, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -515,6 +515,76 @@ pub fn search_nodes(conn: &Connection, query: &str) -> Result<Vec<GraphNode>> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(matches)
+}
+
+/// Run an arbitrary read Cypher query and build a graph from the result:
+/// every returned `Node` becomes a node, every `Rel` a link (with endpoint
+/// nodes seeded from the rel's internal ids if not returned themselves),
+/// recursive rels contribute both. Scalar-only results yield an empty graph.
+pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
+    const CYPHER_NODE_LIMIT: usize = 20_000;
+    let mut nodes: HashMap<String, GraphNode> = HashMap::new();
+    let mut links = Vec::new();
+    let seed = |nodes: &mut HashMap<String, GraphNode>, id: &InternalID| {
+        let key = format!("{id}");
+        nodes.entry(key.clone()).or_insert_with(|| GraphNode {
+            id: key,
+            name: format!("{id}"),
+            label: String::new(),
+            properties: HashMap::new(),
+        });
+    };
+    let mut result = conn.query(query)?;
+    'rows: for row in &mut result {
+        for val in row.iter() {
+            match val {
+                Value::Node(_) => {
+                    if let Some(n) = graph_node_from_value(val) {
+                        if nodes.len() >= CYPHER_NODE_LIMIT {
+                            break 'rows;
+                        }
+                        nodes.insert(n.id.clone(), n);
+                    }
+                }
+                Value::Rel(rel) => {
+                    let (src, dst) = (rel.get_src_node(), rel.get_dst_node());
+                    seed(&mut nodes, &src);
+                    seed(&mut nodes, &dst);
+                    if links.len() >= EDGE_SCAN_LIMIT {
+                        break 'rows;
+                    }
+                    links.push(GraphLink {
+                        source: format!("{src}"),
+                        target: format!("{dst}"),
+                        label: rel.get_label_name().clone(),
+                    });
+                }
+                Value::RecursiveRel { nodes: rn, rels: rr } => {
+                    for n in rn {
+                        seed(&mut nodes, n.get_node_id());
+                    }
+                    for r in rr {
+                        let (src, dst) = (r.get_src_node(), r.get_dst_node());
+                        seed(&mut nodes, &src);
+                        seed(&mut nodes, &dst);
+                        if links.len() >= EDGE_SCAN_LIMIT {
+                            break 'rows;
+                        }
+                        links.push(GraphLink {
+                            source: format!("{src}"),
+                            target: format!("{dst}"),
+                            label: r.get_label_name().clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(GraphData {
+        nodes: nodes.into_values().collect(),
+        links,
+    })
 }
 
 /// 1-hop neighborhood of `focus` — port of `get_node_neighborhood`.
