@@ -23,10 +23,7 @@ struct ActiveView(WeakEntity<RootView>);
 impl Global for ActiveView {}
 
 fn with_view(cx: &mut App, f: impl FnOnce(&mut RootView, &mut Context<RootView>)) {
-    let Some(entity) = cx
-        .try_global::<ActiveView>()
-        .and_then(|h| h.0.upgrade())
-    else {
+    let Some(entity) = cx.try_global::<ActiveView>().and_then(|h| h.0.upgrade()) else {
         return;
     };
     entity.update(cx, f);
@@ -46,21 +43,11 @@ fn main() {
         // Menu + window chrome come from GPUI itself — no Tauri webview, no
         // titlebar plugin, no capability files.
         cx.on_action(|_: &OpenFile, cx| with_view(cx, |v, cx| v.open_file_dialog(cx)));
-        cx.on_action(|_: &ReloadGraph, cx| {
-            with_view(cx, |v, cx| v.load_graph(cx))
-        });
-        cx.on_action(|_: &ToggleSchema, cx| {
-            with_view(cx, |v, cx| v.toggle_schema(cx))
-        });
-        cx.on_action(|_: &ToggleLayout, cx| {
-            with_view(cx, |v, cx| v.toggle_layout(cx))
-        });
-        cx.on_action(|_: &ToggleTheme, cx| {
-            with_view(cx, |v, cx| v.toggle_theme(cx))
-        });
-        cx.on_action(|_: &ToggleSidebar, cx| {
-            with_view(cx, |v, cx| v.toggle_sidebar(cx))
-        });
+        cx.on_action(|_: &ReloadGraph, cx| with_view(cx, |v, cx| v.load_graph(cx)));
+        cx.on_action(|_: &ToggleSchema, cx| with_view(cx, |v, cx| v.toggle_schema(cx)));
+        cx.on_action(|_: &ToggleLayout, cx| with_view(cx, |v, cx| v.toggle_layout(cx)));
+        cx.on_action(|_: &ToggleTheme, cx| with_view(cx, |v, cx| v.toggle_theme(cx)));
+        cx.on_action(|_: &ToggleSidebar, cx| with_view(cx, |v, cx| v.toggle_sidebar(cx)));
         cx.on_action(|_: &ResetView, cx| with_view(cx, |v, cx| v.reset_view(cx)));
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([

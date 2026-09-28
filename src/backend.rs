@@ -548,8 +548,8 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                 }
                 Value::Rel(rel) => {
                     let (src, dst) = (rel.get_src_node(), rel.get_dst_node());
-                    seed(&mut nodes, &src);
-                    seed(&mut nodes, &dst);
+                    seed(&mut nodes, src);
+                    seed(&mut nodes, dst);
                     if links.len() >= EDGE_SCAN_LIMIT {
                         break 'rows;
                     }
@@ -559,14 +559,17 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                         label: rel.get_label_name().clone(),
                     });
                 }
-                Value::RecursiveRel { nodes: rn, rels: rr } => {
+                Value::RecursiveRel {
+                    nodes: rn,
+                    rels: rr,
+                } => {
                     for n in rn {
                         seed(&mut nodes, n.get_node_id());
                     }
                     for r in rr {
                         let (src, dst) = (r.get_src_node(), r.get_dst_node());
-                        seed(&mut nodes, &src);
-                        seed(&mut nodes, &dst);
+                        seed(&mut nodes, src);
+                        seed(&mut nodes, dst);
                         if links.len() >= EDGE_SCAN_LIMIT {
                             break 'rows;
                         }

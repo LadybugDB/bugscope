@@ -393,7 +393,11 @@ impl RootView {
                     self.frame_initial(None);
                     self.running = !data.nodes.is_empty() && !self.schema_mode;
                     self.set_status(
-                        format!("Cypher: {} nodes, {} edges", data.nodes.len(), data.links.len()),
+                        format!(
+                            "Cypher: {} nodes, {} edges",
+                            data.nodes.len(),
+                            data.links.len()
+                        ),
                         cx,
                     );
                 }
@@ -535,30 +539,25 @@ impl RootView {
             .child(div().font_weight(FontWeight::BOLD).child("Bugscope"))
             .child(div().text_sm().child(format!("{db_name} · {status}")))
             .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(theme.selection)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|view, _, window, cx| {
-                                    let current = view
-                                        .dark_override
-                                        .unwrap_or_else(|| Theme::current(window).dark);
-                                    view.dark_override = Some(!current);
-                                    cx.notify();
-                                }),
-                            )
-                            .child(theme_button),
-                    ),
+                div().flex_1().flex().flex_row().justify_end().child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.selection)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, window, cx| {
+                                let current = view
+                                    .dark_override
+                                    .unwrap_or_else(|| Theme::current(window).dark);
+                                view.dark_override = Some(!current);
+                                cx.notify();
+                            }),
+                        )
+                        .child(theme_button),
+                ),
             )
     }
 
