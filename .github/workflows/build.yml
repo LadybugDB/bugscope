@@ -203,7 +203,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bugscope-${{ matrix.target }}
-          path: dist/*
+          # Archives only: the dist/ staging dirs (Bugscope.app, the
+          # tar/zip source dirs) must not become release assets.
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
 
   release:
     needs: build
