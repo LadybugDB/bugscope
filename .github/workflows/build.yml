@@ -17,8 +17,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pin the prebuilt liblbug release to the lbug crate version in Cargo.toml.
-  LBUG_VERSION: "0.20.4"
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
 
@@ -41,6 +39,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Resolve lbug version from Cargo.toml
+        shell: bash
+        run: |
+          # Single source of truth is the lbug dependency in Cargo.toml;
+          # do not hard-code the version here. grep (not sed), so this
+          # works identically on Linux/macOS/Windows runners (incl. git-bash).
+          VERSION=$(grep -E '^lbug *=.*version *=' Cargo.toml | head -n1 | grep -oE '"[^"]+"' | head -n1 | tr -d '"')
+          if [ -z "$VERSION" ]; then
+            echo "could not resolve lbug version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "LBUG_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Resolved lbug version: $VERSION"
 
       - name: Run sccache
         uses: mozilla/sccache-action@v0.0.9
@@ -89,6 +101,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Resolve lbug version from Cargo.toml
+        shell: bash
+        run: |
+          # Single source of truth is the lbug dependency in Cargo.toml;
+          # do not hard-code the version here. grep (not sed), so this
+          # works identically on Linux/macOS/Windows runners (incl. git-bash).
+          VERSION=$(grep -E '^lbug *=.*version *=' Cargo.toml | head -n1 | grep -oE '"[^"]+"' | head -n1 | tr -d '"')
+          if [ -z "$VERSION" ]; then
+            echo "could not resolve lbug version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "LBUG_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Resolved lbug version: $VERSION"
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'macos-latest'
@@ -159,10 +185,12 @@ jobs:
           # signed; a downloaded copy needs "Open Anyway" once unless a
           # Developer ID signature + notarization is added later.
           version="${VERSION#v}"
+          # PR builds have ref_name like 1/merge; slashes break archive paths.
+          version="${version//\//-}"
           rm -rf dist
           mkdir -p dist/Bugscope.app/Contents/MacOS dist/Bugscope.app/Contents/Resources
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/Bugscope.app/Contents/MacOS/bugscope
-          sed "s/@VERSION@/${version}/g" packaging/macos/Info.plist > dist/Bugscope.app/Contents/Info.plist
+          sed "s|@VERSION@|${version}|g" packaging/macos/Info.plist > dist/Bugscope.app/Contents/Info.plist
           codesign --deep --force -s - dist/Bugscope.app
           archive="dist/bugscope-${version}-${{ matrix.target }}-macos.zip"
           ditto -c -k --keepParent dist/Bugscope.app "$archive"
@@ -175,6 +203,8 @@ jobs:
         run: |
           # Ship a tarball: tar preserves the exec bit, unlike a bare binary.
           version="${VERSION#v}"
+          # PR builds have ref_name like 1/merge; slashes break archive paths.
+          version="${version//\//-}"
           name="bugscope-${version}-${{ matrix.target }}-linux"
           rm -rf dist && mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
@@ -191,6 +221,8 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           $version = $env:VERSION -replace '^v',''
+          # PR builds have ref_name like 1/merge; slashes break archive paths.
+          $version = $version -replace '/', '-'
           $name = "bugscope-$version-${{ matrix.target }}-windows"
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
