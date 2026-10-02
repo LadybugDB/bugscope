@@ -376,6 +376,24 @@ jobs:
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
 
+      - name: Assert macOS well-known rpaths
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          # The runtime-downloaded algo extension resolves its @rpath deps
+          # against this binary's LC_RPATHs: fail if the Homebrew / system
+          # fallbacks are missing (no DYLD_LIBRARY_PATH in the field).
+          rpaths="$(otool -l dist/Bugscope.app/Contents/MacOS/bugscope | grep -A 2 LC_RPATH | grep 'path ')"
+          echo "$rpaths"
+          missing=0
+          for want in /opt/homebrew/lib /opt/homebrew/opt/apache-arrow/lib /opt/homebrew/opt/libomp/lib /usr/local/lib; do
+            if ! echo "$rpaths" | grep -Fq "path $want "; then
+              echo "missing LC_RPATH: $want" >&2
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
