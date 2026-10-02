@@ -28,17 +28,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies (Linux)
+        timeout-minutes: 25
         run: |
           # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           # LLVM repo for libomp matching the icebug prebuilt binaries.
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
+          wget -qO- --timeout=60 --tries=3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
-          wget https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
+          wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
+          # Bound mirror stalls: fail fast instead of hanging the run for hours.
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
@@ -134,18 +136,20 @@ jobs:
         run: brew install libomp apache-arrow cmake openssl
 
       - name: Install dependencies (Linux)
+        timeout-minutes: 25
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           # LLVM repo for libomp matching the icebug prebuilt binaries.
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
+          wget -qO- --timeout=60 --tries=3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
-          wget https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
+          wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
+          # Bound mirror stalls: fail fast instead of hanging the run for hours.
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
@@ -198,10 +202,15 @@ jobs:
         if: matrix.platform == 'windows-2022'
         shell: pwsh
         run: |
+          # NOTE: must be a classic PAT with write:packages (repo secret
+          # VCPKG_NUGET_PAT), SSO-authorized if the org enforces SAML.
+          # GITHUB_TOKEN 403s on push: repo-scoped tokens cannot publish
+          # new, unlinked packages to the org-level feed, so the cache
+          # could never populate and every build rebuilt from source.
           $nuget = & $env:VCPKG_ROOT/vcpkg fetch nuget | Out-String
           $nuget = $nuget.Trim()
-          & $nuget sources add -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" -Name "GitHubPackages" -Username "${{ github.repository_owner }}" -Password "${{ secrets.GITHUB_TOKEN }}" -StorePasswordInClearText -Verbosity detailed
-          & $nuget setapikey "${{ secrets.GITHUB_TOKEN }}" -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+          & $nuget sources add -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" -Name "GitHubPackages" -Username "${{ github.repository_owner }}" -Password "${{ secrets.VCPKG_NUGET_PAT }}" -StorePasswordInClearText -Verbosity detailed
+          & $nuget setapikey "${{ secrets.VCPKG_NUGET_PAT }}" -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
 
       - name: Install vcpkg packages (Windows)
         if: matrix.platform == 'windows-2022'
@@ -260,6 +269,12 @@ jobs:
           echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" >> "$GITHUB_ENV"
           echo "CXXFLAGS=/std:c++20" >> "$GITHUB_ENV"
+          # pkgconf itself must be on PATH: the icebug crate probes arrow via
+          # pkg-config (mirrors ../bugscope's PATH setup on its build step).
+          # Convert the whole list with cygpath -p: appending a Windows entry
+          # to bash's Unix-form PATH would leave later pwsh steps with an
+          # unresolvable PATH (cargo not found).
+          echo "PATH=$(cygpath -w "$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/pkgconf");$(cygpath -wp "$PATH")" >> "$GITHUB_ENV"
 
       - name: Test GDS_PAGE_RANK
         shell: bash
@@ -268,7 +283,10 @@ jobs:
           # LOADs it at runtime: its libarrow dep resolves via our rpaths
           # (vendored above) on Unix, via PATH (vcpkg) on Windows.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            export PATH="$(cygpath -w "$GITHUB_WORKSPACE/icebug/lib");$(cygpath -w "$GITHUB_WORKSPACE/liblbug");$(cygpath -w "$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin");$PATH"
+            # NB: networkit_state.dll lives in the icebug/lib/networkit
+            # subdir (the win prebuilt splits GlobalState out of the static
+            # networkit.lib); the loader needs that dir on PATH too.
+            export PATH="$(cygpath -w "$GITHUB_WORKSPACE/icebug/lib");$(cygpath -w "$GITHUB_WORKSPACE/icebug/lib/networkit");$(cygpath -w "$GITHUB_WORKSPACE/liblbug");$(cygpath -w "$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin");$PATH"
             export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/lib/pkgconfig"
             export CXXFLAGS="/std:c++20"
           else
