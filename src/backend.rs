@@ -215,9 +215,14 @@ pub fn ensure_algo_extension(conn: &Connection) -> bool {
 /// (NetworKit) library — no extension needed. Returns `(node_id, score)`
 /// sorted by score descending. Mirrors the GDS_PAGE_RANK ranking so the
 /// extension result can be cross-checked (see `tests/gds_page_rank.rs`).
+///
+/// Without the `icebug-analytics` feature this is unavailable and returns
+/// an empty ranking (callers show an empty Top PageRank list).
 #[cfg(feature = "icebug-analytics")]
 pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
-    use arrow::array::UInt64Array;
+    // icebug 13.2.0 speaks arrow 56: build with the alias, not the
+    // lbug-pinned `arrow` (55).
+    use arrow56::array::UInt64Array;
     let index: HashMap<&str, u64> = data
         .nodes
         .iter()
@@ -305,6 +310,11 @@ type NodeId = (u64, u64);
 
 /// Decode an `INTERNAL_ID` Arrow struct column (`{offset, table}`) into
 /// `(table_id, offset)` pairs, skipping nulls.
+///
+/// Our `arrow` is pinned to 55 to match lbug, so these downcasts hit the
+/// same types lbug builds its batches with. A 55/56 skew here silently
+/// decodes zero rows (observed: 6285 edges → 0), which is why the loader
+/// verifies every tier instead of trusting an empty success.
 fn decode_internal_id(col: &arrow::array::StructArray) -> Vec<NodeId> {
     use arrow::array::Array;
     let offsets: Vec<i64> = col
@@ -325,8 +335,8 @@ fn decode_internal_id(col: &arrow::array::StructArray) -> Vec<NodeId> {
 }
 
 /// Columnar edge scan via Arrow memory: `RETURN id(a), id(b), label(r)`.
-/// No `Node`/`Rel` objects are materialized per row, so this scales far past
-/// what the row-wise `RETURN a, r, b` path can hold.
+/// No `Node`/`Rel` objects are materialized per row, so bulk loads from
+/// larger DBs stay fast. Decoding relies on the arrow-55 pin (see above).
 fn collect_edges_arrow(
     conn: &Connection,
     limit: usize,
@@ -376,13 +386,58 @@ fn collect_edges_arrow(
     Ok(())
 }
 
+/// Row-wise edge scan: `RETURN id(a), id(b), label(r)`.
+/// Only internal ids and the rel label cross each row — no `Node`/`Rel`
+/// objects are materialized — so this stays cheap up to the edge limit.
+///
+/// NOTE: this deliberately avoids decoding `query_as_arrow` batches: it is
+/// the version-proof last resort behind the pinned-Arrow fast paths.
+/// Row values cross the boundary as plain `Value`s.
+fn collect_edges_rows(
+    conn: &Connection,
+    limit: usize,
+    links: &mut Vec<GraphLink>,
+    node_ids: &mut HashSet<NodeId>,
+) -> Result<()> {
+    let mut result = conn
+        .query(&format!(
+            "MATCH (a)-[r]->(b) RETURN id(a), id(b), label(r) LIMIT {limit}"
+        ))
+        .context("edge scan failed")?;
+    let mut seen = HashSet::new();
+    for row in &mut result {
+        if row.len() < 3 {
+            continue;
+        }
+        let (Value::InternalID(src), Value::InternalID(dst), Value::String(label)) =
+            (&row[0], &row[1], &row[2])
+        else {
+            continue;
+        };
+        let (st, so) = (src.table_id, src.offset);
+        let (dt, doff) = (dst.table_id, dst.offset);
+        let source = format!("{st}:{so}");
+        let target = format!("{dt}:{doff}");
+        node_ids.insert((st, so));
+        node_ids.insert((dt, doff));
+        if seen.insert((source.clone(), target.clone(), label.clone())) {
+            links.push(GraphLink {
+                source,
+                target,
+                label: label.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Native CSR data path: per rel table, `RETURN a.rowid, r.rowid, b.rowid`
 /// via `query_as_arrow` carries CSR metadata and `QueryResult::csr()` hands
-/// back zero-copy `indptr`/`indices` Arrow arrays — the full adjacency list
+/// back zero-copy `indptr`/`indices` arrays — the full adjacency list
 /// without materializing a single row. Src/dst table ids come from one cheap
 /// normal `LIMIT 1` query per rel table (metadata only). Any failure
-/// (no CSR metadata, e.g. older storage versions) is an `Err` so the caller
-/// can fall back to the columnar scan.
+/// (no/empty CSR metadata, e.g. older storage versions) is an `Err` so the
+/// caller can fall back to the row-wise scan.
 fn collect_edges_csr(
     conn: &Connection,
     rel_tables: &[String],
@@ -441,6 +496,13 @@ fn collect_edges_csr(
             }
         }
     }
+    // Some storage versions report Ok with empty CSR arrays instead of an
+    // error. Zero links from a non-empty rel catalog is indistinguishable
+    // from a broken fast path, so decline it and let the caller verify via
+    // the row-wise scan (which also finds nothing on a truly empty db).
+    if links.is_empty() && !rel_tables.is_empty() {
+        anyhow::bail!("empty CSR for {} rel tables", rel_tables.len());
+    }
     Ok((links, node_ids))
 }
 
@@ -448,9 +510,11 @@ fn collect_edges_csr(
 ///
 /// Topology comes from native CSR via Arrow memory (`query_as_arrow` with a
 /// `RETURN a.rowid, r.rowid, b.rowid` projection + `QueryResult::csr()`),
-/// one CSR per rel table — no rows are materialized for edges. If CSR
-/// metadata is unavailable the columnar Arrow scan is the fallback; schema
-/// (`SHOW_TABLES`) and node properties always use normal row queries.
+/// one CSR per rel table — no rows are materialized for edges. Missing or
+/// empty CSR metadata falls back to the columnar Arrow id scan, then to the
+/// row-wise id scan; schema (`SHOW_TABLES`) and node properties always use
+/// normal row queries. Tiers decline on error *or* empty success, so a
+/// silent-empty fast path can never hide the graph.
 pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> {
     let catalog = table_catalog(conn).unwrap_or_default();
     let rel_tables: Vec<String> = catalog
@@ -466,33 +530,38 @@ pub fn collect_edge_graph(conn: &Connection, limit: usize) -> Result<GraphData> 
 
     let mut links = Vec::new();
     let mut node_ids: HashSet<NodeId> = HashSet::new();
-    // CSR first for data; fall back to the columnar Arrow scan.
+    // CSR first for data, then columnar Arrow, then row-wise. Each tier
+    // declines on error or empty success (an empty win from a non-empty
+    // catalog is indistinguishable from a broken fast path).
     match collect_edges_csr(conn, &rel_tables, limit) {
         Ok((l, ids)) => {
             links = l;
             node_ids = ids;
         }
         Err(e) => {
-            eprintln!(
-                "bugscope: CSR edge scan unavailable ({e}); falling back to columnar Arrow scan"
-            );
-            collect_edges_arrow(conn, limit, &mut links, &mut node_ids)?
+            eprintln!("bugscope: CSR edge scan unavailable ({e}); trying Arrow scan");
+            let mut arrow_links = Vec::new();
+            let mut arrow_ids = HashSet::new();
+            let arrow_ok = collect_edges_arrow(conn, limit, &mut arrow_links, &mut arrow_ids)
+                .is_ok()
+                && !arrow_links.is_empty();
+            if arrow_ok {
+                links = arrow_links;
+                node_ids = arrow_ids;
+            } else {
+                eprintln!("bugscope: Arrow scan unavailable/empty; falling back to row-wise scan");
+                collect_edges_rows(conn, limit, &mut links, &mut node_ids)?
+            }
         }
     }
 
-    // Isolated nodes via Arrow ids — schema/details stay on normal queries.
-    if let Ok(mut iso) = conn.query_as_arrow(
-        &format!("MATCH (n) WHERE NOT (n)--() RETURN id(n) AS nid LIMIT {limit}"),
-        65_536,
-    ) {
-        if let Ok(batches) = iso.iter_arrow(65_536) {
-            for batch in batches {
-                if let Some(col) = batch
-                    .column_by_name("nid")
-                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StructArray>())
-                {
-                    node_ids.extend(decode_internal_id(col));
-                }
+    // Isolated nodes by internal id — schema/details stay on normal queries.
+    if let Ok(mut iso) = conn.query(&format!(
+        "MATCH (n) WHERE NOT (n)--() RETURN id(n) LIMIT {limit}"
+    )) {
+        for row in &mut iso {
+            if let Some(Value::InternalID(id)) = row.first() {
+                node_ids.insert((id.table_id, id.offset));
             }
         }
     }
@@ -768,4 +837,208 @@ pub fn neighborhood(full: &GraphData, focus: &str) -> GraphData {
         .cloned()
         .collect();
     GraphData { nodes, links }
+}
+
+/// Fallback when `icebug-analytics` is off: no ranking available.
+#[cfg(not(feature = "icebug-analytics"))]
+pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
+    let _ = data;
+    Vec::new()
+}
+
+/// Leiden community detection over an already-collected graph via the linked
+/// icebug (NetworKit) library — the same algorithm family as the
+/// `GDS_LEIDEN()` table function in the algo extension (see
+/// `tests/gds_leiden.rs`, ported from the extension's `gds_leiden.test`).
+/// Runs in-process, so it works on any displayed graph — full edge scan,
+/// Cypher result, or 1-hop neighborhood — without a `PROJECT_GRAPH` step.
+///
+/// Returns `(assignment, modularity, community_count)` where `assignment[i]`
+/// is the community of `data.nodes[i]`. Community ids are arbitrary; only
+/// equality matters.
+#[cfg(feature = "icebug-analytics")]
+pub fn graphr_leiden_full(data: &GraphData) -> (Vec<u64>, f64, u64) {
+    // icebug 13.2.0 speaks arrow 56: build with the alias, not the
+    // lbug-pinned `arrow` (55).
+    use arrow56::array::UInt64Array;
+    let n = data.nodes.len();
+    if n == 0 {
+        return (Vec::new(), 0.0, 0);
+    }
+    if data.links.is_empty() {
+        return (vec![0; n], 0.0, 1);
+    }
+    let index: HashMap<&str, u64> = data
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| (nd.id.as_str(), i as u64))
+        .collect();
+    // Leiden works on undirected topology: union both directions.
+    let mut adj: Vec<Vec<u64>> = vec![Vec::new(); n];
+    for l in &data.links {
+        if let (Some(&s), Some(&t)) = (index.get(l.source.as_str()), index.get(l.target.as_str())) {
+            if s != t {
+                adj[s as usize].push(t);
+                adj[t as usize].push(s);
+            }
+        }
+    }
+    let mut indptr = Vec::with_capacity(n + 1);
+    let mut indices = Vec::new();
+    for mut neighbors in adj {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        indptr.push(indices.len() as u64);
+        indices.extend(neighbors);
+    }
+    indptr.push(indices.len() as u64);
+    let Ok(graph) = icebug::GraphR::from_csr(
+        n as u64,
+        false,
+        UInt64Array::from(indices),
+        UInt64Array::from(indptr),
+    ) else {
+        return (vec![0; n], 0.0, 1);
+    };
+    // Deterministic (randomize=false) so the treemap is stable across loads.
+    let Ok(mut leiden) = icebug::Leiden::new(&graph, 32, false, 1.0) else {
+        return (vec![0; n], 0.0, 1);
+    };
+    if leiden.run().is_err() {
+        return (vec![0; n], 0.0, 1);
+    }
+    let (membership, count) = match leiden.partition() {
+        Ok(p) => (p.membership, p.count),
+        Err(_) => (vec![0; n], 1),
+    };
+    let modularity = leiden.modularity().unwrap_or(0.0);
+    let mut assignment = vec![0u64; n];
+    for (i, c) in membership.into_iter().enumerate().take(n) {
+        assignment[i] = c;
+    }
+    (assignment, modularity, count)
+}
+
+/// Leiden community assignment per node, in `data.nodes` order.
+/// Convenience wrapper over [`graphr_leiden_full`] when modularity is unneeded.
+#[cfg(feature = "icebug-analytics")]
+pub fn graphr_leiden(data: &GraphData) -> Vec<u64> {
+    graphr_leiden_full(data).0
+}
+
+/// Fallback when `icebug-analytics` is off: everything in one community.
+#[cfg(not(feature = "icebug-analytics"))]
+pub fn graphr_leiden_full(data: &GraphData) -> (Vec<u64>, f64, u64) {
+    let n = data.nodes.len();
+    (vec![0; n], 0.0, if n == 0 { 0 } else { 1 })
+}
+
+/// Fallback when `icebug-analytics` is off.
+#[cfg(not(feature = "icebug-analytics"))]
+pub fn graphr_leiden(data: &GraphData) -> Vec<u64> {
+    graphr_leiden_full(data).0
+}
+
+/// Read back the communities of an existing `PROJECT_GRAPH` projection via
+/// the algo extension's `GDS_LEIDEN()` table function:
+///
+/// ```cypher
+/// CALL PROJECT_GRAPH('G', ['N'], ['E']);
+/// CALL GDS_LEIDEN('G') RETURN node, community_id;
+/// ```
+///
+/// Returns `node_id ("table:offset") -> community_id`, mirroring the
+/// `gds_leiden.test` assertions (structure, not exact ids: Leiden
+/// randomizes, so only community *equality* is meaningful).
+pub fn gds_leiden_communities(
+    conn: &Connection,
+    graph: &str,
+    gamma: Option<f64>,
+) -> Result<HashMap<String, u64>> {
+    let call = match gamma {
+        Some(g) => format!("CALL GDS_LEIDEN('{graph}', gamma := {g})"),
+        None => format!("CALL GDS_LEIDEN('{graph}')"),
+    };
+    let mut result = conn
+        .query(&format!("{call} RETURN node, community_id"))
+        .with_context(|| format!("GDS_LEIDEN call on '{graph}' failed"))?;
+    let mut out = HashMap::new();
+    for row in &mut result {
+        if row.len() < 2 {
+            continue;
+        }
+        let Some(node) = graph_node_from_value(&row[0]) else {
+            continue;
+        };
+        let community: u64 = match &row[1] {
+            Value::Int8(v) => (*v).max(0) as u64,
+            Value::Int16(v) => (*v).max(0) as u64,
+            Value::Int32(v) => (*v).max(0) as u64,
+            Value::Int64(v) => (*v).max(0) as u64,
+            Value::Int128(v) => (*v).max(0) as u64,
+            Value::UInt8(v) => *v as u64,
+            Value::UInt16(v) => *v as u64,
+            Value::UInt32(v) => *v as u64,
+            Value::UInt64(v) => *v,
+            _ => continue,
+        };
+        out.insert(node.id, community);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_ephemeral() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arrow_pin.lbdb");
+        let db = Database::new(path.to_str().unwrap(), SystemConfig::default()).unwrap();
+        (dir, db)
+    }
+
+    /// Locks the arrow-55 pin: lbug's `id()` batches must decode to the exact
+    /// `(table, offset)` pairs through our types. If lbug ever moves to a new
+    /// arrow major (or renames the struct fields), this fails loudly instead
+    /// of the loader silently showing 0 nodes.
+    #[test]
+    fn arrow_internal_id_decode_matches_lbug_batches() {
+        let (_dir, db) = open_ephemeral();
+        let conn = Connection::new(&db).unwrap();
+        conn.query("CREATE NODE TABLE N(id INT64 PRIMARY KEY)")
+            .unwrap();
+        conn.query("CREATE REL TABLE E(FROM N TO N)").unwrap();
+        conn.query("CREATE (a:N{id:0}), (b:N{id:1}), (c:N{id:2})")
+            .unwrap();
+        conn.query("MATCH (x:N{id:0}), (y:N{id:1}) CREATE (x)-[:E]->(y)")
+            .unwrap();
+        conn.query("MATCH (x:N{id:1}), (y:N{id:2}) CREATE (x)-[:E]->(y)")
+            .unwrap();
+
+        // End-to-end through the loader's Arrow tier.
+        let mut links = Vec::new();
+        let mut node_ids = HashSet::new();
+        collect_edges_arrow(&conn, 10_000, &mut links, &mut node_ids).unwrap();
+        assert_eq!(links.len(), 2, "both edges decode: {links:?}");
+        assert_eq!(node_ids.len(), 3, "all endpoints decode: {node_ids:?}");
+
+        // And the raw batch shape the decoder relies on.
+        let mut result = conn
+            .query_as_arrow("MATCH (a)-[r]->(b) RETURN id(a) AS src LIMIT 1", 64)
+            .unwrap();
+        let batches = result.iter_arrow(64).unwrap();
+        let mut saw = 0;
+        for batch in batches {
+            let col = batch
+                .column_by_name("src")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StructArray>())
+                .expect("src decodes as StructArray with our pinned arrow");
+            let ids = decode_internal_id(col);
+            assert_eq!(ids.len(), batch.num_rows());
+            saw += ids.len();
+        }
+        assert!(saw > 0);
+    }
 }

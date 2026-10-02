@@ -1005,6 +1005,7 @@ name = "bugscope"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow 55.2.0",
  "arrow 56.2.1",
  "gpui",
  "icebug",

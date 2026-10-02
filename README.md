@@ -14,6 +14,8 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 - **Search + Focus** - Substring search over node properties; click a match to focus its 1-hop neighborhood.
 - **Schema View** - Toggle to see node tables instead of the edge graph.
 - **Live Layout** - Force simulation (repulsion + springs + damping) runs at 30 Hz and settles when the layout goes quiet; pause/resume any time.
+- **Leiden Treemap** - Header toggle switches the canvas between the graph and a squarified treemap of Leiden communities (in-process icebug Leiden, same family as `GDS_LEIDEN`); tile area follows PageRank weight. Double-click drills into a neighborhood.
+- **Insights Pane** - Collapsible right pane with the top 10 nodes by PageRank plus the Leiden community summary; clicking a row focuses (PageRank) or selects (community) it.
 
 ## Usage
 
@@ -57,6 +59,13 @@ Set `BUGSCOPE_ALGO_EXTENSION` to a local `.lbug_extension` file to override
 the downloaded one (e.g. a build from
 [LadybugDB/extensions](https://github.com/LadybugDB/extensions/tree/main/algo)).
 
+The treemap and insights pane run the same algorithms in-process over
+whatever is displayed (full scan, Cypher result, or neighborhood), with no
+`PROJECT_GRAPH` step: `backend::graphr_leiden_full` (Leiden + modularity)
+and `backend::graphr_page_rank`. `backend::gds_leiden_communities` reads
+`CALL GDS_LEIDEN(...)` rows back for an existing projection when you want
+the extension's own output.
+
 From source:
 
 ```bash
@@ -65,26 +74,34 @@ bash scripts/download-liblbug.sh     # prebuilt shared liblbug (dlopen needs sha
 bash scripts/vendor_arrow.sh         # stage libarrow/libomp next to libnetworkit (the algo
                                       # extension references @rpath/libarrow, resolved via our rpaths)
 cargo test --test gds_page_rank      # GDS_PAGE_RANK vs the expected ranks (skips when offline)
+cargo test --test gds_leiden         # GDS_LEIDEN two-cliques structure + local Leiden cross-check
 ```
 
 The `icebug-analytics` cargo feature (on by default; `--no-default-features` to skip) links the
 icebug Rust crate for in-process analytics such as `backend::graphr_page_rank`.
+
+Bulk loading is tiered CSR → columnar Arrow → row-wise ids, so a silent-empty
+fast path can never hide the graph. Our `arrow` is pinned to 55 to match lbug
+(0.21.x builds its batches with arrow 55 — decoding them with another major
+silently yields zero rows); icebug 13.2.0 needs arrow 56, which lives behind
+the `arrow56` alias for the analytics arrays only.
 
 ## Project structure
 
 | Path | Contents |
 |---|---|
 | `src/main.rs` | App entry: window setup, titlebar, autofocus |
-| `src/backend.rs` | Direct LadybugDB backend — `open_connection`, `scan_for_databases`, `collect_edge_graph`, `collect_schema_graph`, `search_nodes`, `neighborhood` |
+| `src/backend.rs` | Direct LadybugDB backend — `open_connection`, `scan_for_databases`, `collect_edge_graph`, `collect_schema_graph`, `search_nodes`, `neighborhood`, in-process PageRank/Leiden (`graphr_page_rank`, `graphr_leiden_full`) + `GDS_LEIDEN` readout (`gds_leiden_communities`) |
+| `src/clusters.rs` | Squarified treemap layout over Leiden communities (disktree-inspired `squarify` + header bands + hit-testing), pure geometry with unit tests |
 | `src/model.rs` | `GraphModel` (force layout tick, palette, picking) + `Camera` (world↔screen, cursor-anchored zoom, fit) |
-| `src/ui.rs` | `RootView` — sidebar, query box, canvas rendering, interaction |
+| `src/ui.rs` | `RootView` — sidebar, insights pane, query box, canvas graph + treemap views, interaction |
 | `src/theme.rs` | Vendored disktree theme (`tokyo_night` dark / `flexoki_light` light), selected via `window.appearance()` like disktree follows the system setting |
 
 The backend runs the same Cypher as the Tauri commands (`MATCH (a)-[r]->(b) RETURN a, r, b`, isolated-node scan, `CALL SHOW_TABLES`, node sampling) with direct `lbug` calls and no IPC boundary.
 
 ## Deliberately out of scope for v1
 
-Summary-space PageRank sidecars, Leiden cluster levels and LLM cluster naming, Voronoi overlay, the lever panel, Arrow IPC transport — all were web-renderer or sidecar concerns in bugscope-tauri. The native port loads the edge graph directly and lays it out live. Cluster/color extensions can build on `GraphModel` without an IPC boundary.
+Summary-space PageRank sidecars, LLM cluster naming, Voronoi overlay, the lever panel, Arrow IPC transport — all were web-renderer or sidecar concerns in bugscope-tauri. The native port loads the edge graph directly and lays it out live. The sunburst view is skipped for now (arc-heavy painting in GPUI needs more scaffolding than the treemap's rects).
 
 ### Troubleshooting
 

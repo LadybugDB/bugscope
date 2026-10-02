@@ -11,7 +11,13 @@ icebug-analytics = ["dep:icebug"]
 gpui = "0.2"
 lbug = { version = "0.21.1", features = ["arrow"] }
 icebug = { version = "=13.2.0", optional = true }
-arrow = { version = "56", default-features = false, features = ["ffi"] }
+# Pinned to 55 to match lbug's `arrow` (0.21.x uses arrow 55): lbug hands us
+# Arrow batches built with its own arrow, so our decode types must be the
+# same crate version or every `downcast_ref` silently yields nothing.
+arrow = { version = "55", default-features = false, features = ["ffi"] }
+# icebug 13.2.0 instead needs arrow 56 (`arrow-array`/`arrow-buffer` 56.x),
+# so the in-process analytics arrays use this alias.
+arrow56 = { package = "arrow", version = "56", default-features = false, features = ["ffi"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
