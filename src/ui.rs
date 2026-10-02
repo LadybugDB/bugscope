@@ -8,6 +8,7 @@ use crate::model::{node_size, Camera, GraphModel, Vec2};
 use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -18,6 +19,11 @@ struct Snapshot {
     camera: Camera,
     hovered: Option<usize>,
     selected: Option<usize>,
+    /// Schema multi-selection, as model indices resolved at snapshot time:
+    /// selected node types + selected edge types (⌘/Ctrl-click in schema view).
+    sel_nodes: Vec<usize>,
+    sel_edges: Vec<usize>,
+    hover_edge: Option<usize>,
     theme: Theme,
     label_font: String,
     label_font_size: f32,
@@ -145,6 +151,14 @@ pub struct RootView {
     trail: Vec<Crumb>,
     hovered: Option<usize>,
     selected: Option<usize>,
+    /// Edge under the cursor (schema view: hover highlight for edge types).
+    hovered_edge: Option<usize>,
+    /// Schema-view multi-selection: selected node-table and rel-table names.
+    /// Multi-select clicks (⌘ on macOS, Ctrl elsewhere) collect types while
+    /// staying in the schema view; a plain click adds its type and displays
+    /// the accumulated subset as the data graph.
+    schema_node_sel: HashSet<String>,
+    schema_edge_sel: HashSet<String>,
     schema_mode: bool,
     sidebar_open: bool,
     show_preferences: bool,
@@ -234,6 +248,9 @@ impl RootView {
             trail: Vec::new(),
             hovered: None,
             selected: None,
+            hovered_edge: None,
+            schema_node_sel: HashSet::new(),
+            schema_edge_sel: HashSet::new(),
             schema_mode: opts.schema_mode,
             sidebar_open: false,
             show_preferences: false,
@@ -370,6 +387,7 @@ impl RootView {
         self.focused = focused.clone();
         self.selected = None;
         self.hovered = None;
+        self.hovered_edge = None;
         self.treemap_hover = None;
         self.drag_node = None;
         self.panning = None;
@@ -458,6 +476,8 @@ impl RootView {
 
     /// `.schema [on|off]`: deterministically enter/leave the schema view.
     /// No arg (or `on`) enters it; `off`/`data`/`graph` leaves it.
+    /// The schema multi-selection survives the round-trip so types picked
+    /// with the multi-select key can be extended after inspecting data.
     pub fn set_schema_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.schema_mode == enabled {
             // Already there — still reset any drill-down so `.schema`
@@ -467,6 +487,136 @@ impl RootView {
         }
         self.schema_mode = enabled;
         self.load_graph(cx);
+    }
+
+    /// Clear the schema multi-selection: database switches, manual reloads
+    /// of unrelated content, and explicit resets — not the schema ⇄ data
+    /// round-trip, which preserves the selection by design.
+    fn clear_schema_selection(&mut self) {
+        self.schema_node_sel.clear();
+        self.schema_edge_sel.clear();
+        self.hovered_edge = None;
+    }
+
+    /// Short `TypeA|TypeB + :RelA` summary of the schema selection for status.
+    fn schema_selection_summary(&self) -> String {
+        let mut nodes: Vec<&str> = self.schema_node_sel.iter().map(|s| s.as_str()).collect();
+        nodes.sort_unstable();
+        let mut edges: Vec<&str> = self.schema_edge_sel.iter().map(|s| s.as_str()).collect();
+        edges.sort_unstable();
+        let mut parts = Vec::new();
+        if !nodes.is_empty() {
+            parts.push(nodes.join("|"));
+        }
+        if !edges.is_empty() {
+            parts.push(
+                edges
+                    .iter()
+                    .map(|e| format!(":{e}"))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+        }
+        if parts.is_empty() {
+            "schema".to_string()
+        } else {
+            parts.join(" + ")
+        }
+    }
+
+    /// Run the subset query for the current schema selection and show the
+    /// data graph, leaving schema mode. `full` becomes the subset so
+    /// breadcrumbs, focus, and analytics operate on what is displayed.
+    fn run_schema_subset(&mut self, cx: &mut Context<Self>) {
+        let nodes: Vec<String> = self.schema_node_sel.iter().cloned().collect();
+        let edges: Vec<String> = self.schema_edge_sel.iter().cloned().collect();
+        if backend::schema_subset_query(&nodes, &edges, Some(self.limit)).is_none() {
+            self.set_status("Schema selection empty — showing schema overview", cx);
+            return;
+        }
+        let Some(id) = self.selected_db else { return };
+        let Some(db) = self.databases.get(id) else {
+            return;
+        };
+        let path = db.path.clone();
+        let limit = self.limit;
+        let work = backend::open_connection(&path)
+            .and_then(|conn| backend::run_schema_subset(&conn, &nodes, &edges, limit));
+        match work {
+            Ok(data) => {
+                let desc = self.schema_selection_summary();
+                let (nn, ne) = (data.nodes.len(), data.links.len());
+                self.schema_mode = false;
+                self.search_results.clear();
+                self.trail.clear();
+                self.focused = None;
+                self.selected = None;
+                self.hovered = None;
+                self.hovered_edge = None;
+                self.treemap_hover = None;
+                self.full = data.clone();
+                self.model.load(&data);
+                self.model.settle();
+                self.frame_initial(None);
+                self.running = !data.nodes.is_empty();
+                self.maybe_auto_view(ne);
+                self.shown = data;
+                self.refresh_analytics();
+                self.set_status(format!("Schema {desc}: {nn} nodes, {ne} edges"), cx);
+            }
+            Err(e) => {
+                eprintln!("bugscope: schema query failed: {e:#}");
+                self.set_status(format!("Schema query failed: {e:#}"), cx)
+            }
+        }
+    }
+
+    /// Plain click on a schema node type: add it to the selection and display
+    /// the accumulated subset — both endpoints bound to the selected types
+    /// plus their isolated nodes, so no foreign type can appear. A fresh
+    /// schema view reduces to `MATCH (a:Type)-[b]->(c:Type) RETURN *`; after
+    /// multi-select clicks it displays the union of everything collected.
+    fn navigate_schema_node(&mut self, table: &str, cx: &mut Context<Self>) {
+        self.schema_node_sel.insert(table.to_string());
+        self.run_schema_subset(cx);
+    }
+
+    /// Plain click on a schema edge type: add it and display the subset.
+    fn navigate_schema_edge(&mut self, rel: &str, cx: &mut Context<Self>) {
+        self.schema_edge_sel.insert(rel.to_string());
+        self.run_schema_subset(cx);
+    }
+
+    /// Status line describing the pending schema selection.
+    fn schema_selection_status(&self) -> String {
+        if self.schema_node_sel.is_empty() && self.schema_edge_sel.is_empty() {
+            return "Schema selection cleared".to_string();
+        }
+        format!(
+            "Schema selection: {} \u{2014} click a type to display, {} to collect more",
+            self.schema_selection_summary(),
+            multiselect_key()
+        )
+    }
+
+    /// Multi-select toggle (⌘-click / Ctrl-click) on a node type: update the
+    /// selection and stay in the schema view so more types can be collected.
+    /// Nothing is queried until a plain click (or the sidebar Show button)
+    /// displays the accumulated selection.
+    fn toggle_schema_node(&mut self, table: &str, cx: &mut Context<Self>) {
+        if !self.schema_node_sel.remove(table) {
+            self.schema_node_sel.insert(table.to_string());
+        }
+        self.set_status(self.schema_selection_status(), cx);
+    }
+
+    /// Multi-select toggle (⌘-click / Ctrl-click) on an edge type: collect
+    /// without leaving the schema view.
+    fn toggle_schema_edge(&mut self, rel: &str, cx: &mut Context<Self>) {
+        if !self.schema_edge_sel.remove(rel) {
+            self.schema_edge_sel.insert(rel.to_string());
+        }
+        self.set_status(self.schema_selection_status(), cx);
     }
 
     pub fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
@@ -493,6 +643,8 @@ impl RootView {
                     view.databases.push(info);
                     view.selected_db = Some(view.databases.len() - 1);
                 }
+                // A different file has a different schema: drop the selection.
+                view.clear_schema_selection();
                 view.load_graph(cx);
             });
         })
@@ -721,6 +873,7 @@ impl RootView {
         self.query.clear();
         self.query_cursor = 0;
         self.search_results.clear();
+        self.clear_schema_selection();
         self.load_graph(cx);
     }
 
@@ -874,6 +1027,9 @@ impl RootView {
                     self.trail.clear();
                     self.focused = None;
                     self.selected = None;
+                    // A hand-written query replaces the graph: any schema
+                    // multi-selection it may have come from is stale.
+                    self.clear_schema_selection();
                     self.full = data.clone();
                     self.model.load(&data);
                     self.model.settle();
@@ -1068,6 +1224,29 @@ impl RootView {
     }
 
     fn snapshot(&self, theme: Theme) -> Snapshot {
+        // Resolve schema multi-selection (type names) to model indices for
+        // this frame. Only meaningful while the schema graph is displayed.
+        let (sel_nodes, sel_edges) = if self.schema_mode {
+            let nodes = self
+                .model
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| self.schema_node_sel.contains(&n.name))
+                .map(|(i, _)| i)
+                .collect();
+            let edges = self
+                .model
+                .links
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| self.schema_edge_sel.contains(&l.label))
+                .map(|(i, _)| i)
+                .collect();
+            (nodes, edges)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Snapshot {
             theme,
             nodes: self
@@ -1095,6 +1274,9 @@ impl RootView {
             camera: self.camera,
             hovered: self.hovered,
             selected: self.selected,
+            sel_nodes,
+            sel_edges,
+            hover_edge: self.hovered_edge,
             label_font: self.label_font.clone(),
             label_font_size: self.label_font_size,
         }
@@ -1409,11 +1591,15 @@ impl RootView {
                         MouseButton::Left,
                         cx.listener(move |view, _, _, cx| {
                             view.selected_db = Some(id);
+                            view.clear_schema_selection();
                             view.load_graph(cx);
                         }),
                     )
                     .child(d.name.clone()),
             );
+        }
+        if self.schema_mode {
+            col = self.render_schema_section(col, theme, cx);
         }
         col = col
             .child(div().pt_2().font_weight(FontWeight::BOLD).child("Matches"))
@@ -1478,6 +1664,168 @@ impl RootView {
         col
     }
 
+    /// Sidebar browser for the schema view: every node-table and rel-table
+    /// with the same click semantics as the canvas (plain click navigates
+    /// by that single type, multi-select key toggles it in the subset).
+    /// Edge types that are hard to hit on the canvas are easy to pick here.
+    fn render_schema_section(
+        &mut self,
+        mut col: Stateful<Div>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        col = col
+            .child(
+                div()
+                    .pt_2()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Schema types"),
+            )
+            .child(div().text_xs().text_color(theme.secondary).child(format!(
+                "Click displays the subset \u{b7} {} collects types first",
+                multiselect_key()
+            )));
+        let mut node_types: Vec<String> = self.shown.nodes.iter().map(|n| n.name.clone()).collect();
+        node_types.sort();
+        node_types.dedup();
+        let mut edge_types: Vec<String> = self
+            .shown
+            .links
+            .iter()
+            .map(|l| l.label.clone())
+            .filter(|l| !l.is_empty())
+            .collect();
+        edge_types.sort();
+        edge_types.dedup();
+        if !node_types.is_empty() {
+            col = col.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("Nodes"),
+            );
+        }
+        for t in node_types {
+            let active = self.schema_node_sel.contains(&t);
+            let name = t.clone();
+            col = col.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { theme.accent } else { theme.surface })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .hover(|s| {
+                        s.bg(if active {
+                            theme.accent
+                        } else {
+                            theme.selection
+                        })
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                            if ev.modifiers.platform || ev.modifiers.control {
+                                view.toggle_schema_node(&name.clone(), cx);
+                            } else {
+                                view.navigate_schema_node(&name.clone(), cx);
+                            }
+                        }),
+                    )
+                    .child(t),
+            );
+        }
+        if !edge_types.is_empty() {
+            col = col.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("Edges"),
+            );
+        }
+        for t in edge_types {
+            let active = self.schema_edge_sel.contains(&t);
+            let name = t.clone();
+            let row = format!(":{t}");
+            col = col.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { theme.accent } else { theme.surface })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .hover(|s| {
+                        s.bg(if active {
+                            theme.accent
+                        } else {
+                            theme.selection
+                        })
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                            if ev.modifiers.platform || ev.modifiers.control {
+                                view.toggle_schema_edge(&name.clone(), cx);
+                            } else {
+                                view.navigate_schema_edge(&name.clone(), cx);
+                            }
+                        }),
+                    )
+                    .child(row),
+            );
+        }
+        if !self.schema_node_sel.is_empty() || !self.schema_edge_sel.is_empty() {
+            let summary = self.schema_selection_summary();
+            col = col.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .mt_1()
+                    .rounded_md()
+                    .bg(highlight(&theme))
+                    .text_color(theme.background)
+                    .cursor_pointer()
+                    .text_sm()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.run_schema_subset(cx)),
+                    )
+                    .child(format!("Show {summary}")),
+            );
+            col = col.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .mt_1()
+                    .rounded_md()
+                    .bg(theme.selection)
+                    .cursor_pointer()
+                    .text_sm()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.clear_schema_selection();
+                            view.set_status("Schema selection cleared", cx);
+                        }),
+                    )
+                    .child("Clear selection"),
+            );
+        }
+        col
+    }
+
     /// Window coords → canvas-local coords using the origin captured at prepaint.
     fn to_local(&self, p: Point<Pixels>) -> (f32, f32) {
         let o = self.canvas_origin.get();
@@ -1521,8 +1869,45 @@ impl RootView {
                 cx.listener(|view, ev: &MouseDownEvent, _, cx| {
                     let (lx, ly) = view.to_local(ev.position);
                     let (vw, vh) = view.canvas_size();
+                    let world = view.camera.screen_to_world(lx, ly, vw, vh);
+                    // Schema view: clicks navigate by type. A plain click adds
+                    // the type to the selection and displays the accumulated
+                    // subset; the platform multi-select key (⌘ on macOS, Ctrl
+                    // elsewhere) only collects the type and stays here so more
+                    // can follow. Double-click navigates like a plain click
+                    // (schema nodes have no 1-hop data focus).
+                    if view.schema_mode {
+                        let multi = ev.modifiers.platform || ev.modifiers.control;
+                        let node = view.model.pick(world, 6.0);
+                        let edge = if node.is_none() {
+                            view.model.pick_edge(world, 8.0)
+                        } else {
+                            None
+                        };
+                        if multi {
+                            if let Some(i) = node {
+                                let t = view.model.nodes[i].name.clone();
+                                view.toggle_schema_node(&t, cx);
+                            } else if let Some(e) = edge {
+                                let t = view.model.links[e].label.clone();
+                                view.toggle_schema_edge(&t, cx);
+                            }
+                            return;
+                        }
+                        if let Some(i) = node {
+                            let t = view.model.nodes[i].name.clone();
+                            view.navigate_schema_node(&t, cx);
+                        } else if let Some(e) = edge {
+                            let t = view.model.links[e].label.clone();
+                            view.navigate_schema_edge(&t, cx);
+                        } else {
+                            // Empty space: pan, like the data view.
+                            view.panning = Some(ev.position);
+                            cx.notify();
+                        }
+                        return;
+                    }
                     if ev.click_count >= 2 {
-                        let world = view.camera.screen_to_world(lx, ly, vw, vh);
                         if let Some(i) = view.model.pick(world, 6.0) {
                             let id = view.model.nodes[i].id.clone();
                             view.focus_node(&id, cx);
@@ -1530,7 +1915,6 @@ impl RootView {
                         return;
                     }
                     view.panning = Some(ev.position);
-                    let world = view.camera.screen_to_world(lx, ly, vw, vh);
                     if let Some(i) = view.model.pick(world, 6.0) {
                         view.drag_node = Some(i);
                         view.selected = Some(i);
@@ -1572,8 +1956,16 @@ impl RootView {
                 }
                 let world = view.camera.screen_to_world(lx, ly, vw, vh);
                 let h = view.model.pick(world, 6.0);
-                if h != view.hovered {
+                // Schema view also tracks the edge under the cursor so rel
+                // types highlight before a multi-select click.
+                let he = if view.schema_mode && h.is_none() {
+                    view.model.pick_edge(world, 8.0)
+                } else {
+                    None
+                };
+                if h != view.hovered || he != view.hovered_edge {
                     view.hovered = h;
+                    view.hovered_edge = he;
                     cx.notify();
                 }
             }))
@@ -1771,6 +2163,21 @@ impl RootView {
                         return;
                     };
                     let node = view.treemap_tile_node(&tile);
+                    // Schema view: tiles are node types — click navigates by
+                    // type instead of selecting/focusing data nodes.
+                    if view.schema_mode {
+                        let table = node
+                            .and_then(|i| view.shown.nodes.get(i))
+                            .map(|n| n.name.clone());
+                        if let Some(t) = table {
+                            if ev.modifiers.platform || ev.modifiers.control {
+                                view.toggle_schema_node(&t, cx);
+                            } else {
+                                view.navigate_schema_node(&t, cx);
+                            }
+                        }
+                        return;
+                    }
                     if ev.click_count >= 2 {
                         if let Some(i) = node {
                             if let Some(nd) = view.shown.nodes.get(i) {
@@ -1840,6 +2247,20 @@ impl RootView {
                         return;
                     }
                     let node = view.sunburst_hit_node(hit);
+                    // Schema view: arcs are node types — navigate by type.
+                    if view.schema_mode {
+                        let table = node
+                            .and_then(|i| view.shown.nodes.get(i))
+                            .map(|n| n.name.clone());
+                        if let Some(t) = table {
+                            if ev.modifiers.platform || ev.modifiers.control {
+                                view.toggle_schema_node(&t, cx);
+                            } else {
+                                view.navigate_schema_node(&t, cx);
+                            }
+                        }
+                        return;
+                    }
                     if ev.click_count >= 2 {
                         if let Some(i) = node {
                             if let Some(nd) = view.shown.nodes.get(i) {
@@ -2199,6 +2620,16 @@ impl RootView {
     }
 }
 
+/// Human label for the platform multi-select modifier used by schema
+/// navigation: ⌘ on macOS, Ctrl everywhere else.
+fn multiselect_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘-click"
+    } else {
+        "Ctrl-click"
+    }
+}
+
 /// Inline labels, legible at any zoom: short names on a pill behind the text.
 fn truncate_label(name: &str) -> String {
     const MAX: usize = 26;
@@ -2340,7 +2771,7 @@ fn paint_edges(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window) {
     let mut hot = PathBuilder::stroke(px(1.5));
     let mut heads = PathBuilder::fill();
     let draw_heads = snap.links.len() <= 3000 && zoom >= 0.5;
-    for l in &snap.links {
+    for (li, l) in snap.links.iter().enumerate() {
         let (s, t) = (l.source, l.target);
         let (Some(a), Some(b)) = (snap.nodes.get(s), snap.nodes.get(t)) else {
             continue;
@@ -2374,7 +2805,9 @@ fn paint_edges(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window) {
         let is_hot = Some(s) == snap.selected
             || Some(t) == snap.selected
             || Some(s) == snap.hovered
-            || Some(t) == snap.hovered;
+            || Some(t) == snap.hovered
+            || snap.sel_edges.contains(&li)
+            || Some(li) == snap.hover_edge;
         if is_hot {
             hot.move_to(from);
             hot.line_to(to);
@@ -2421,7 +2854,9 @@ fn paint_nodes(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window) {
             continue;
         }
         let r = disc_radius(node.degree, snap.camera.zoom);
-        let (ring_width, ring_color) = if Some(i) == snap.selected {
+        // Schema multi-selection reads as the same amber ring as the
+        // single selection — the hue keeps meaning "chosen type".
+        let (ring_width, ring_color) = if Some(i) == snap.selected || snap.sel_nodes.contains(&i) {
             (px(2.), highlight(&snap.theme))
         } else if Some(i) == snap.hovered {
             (px(2.), snap.theme.bright)

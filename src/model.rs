@@ -165,11 +165,43 @@ impl GraphModel {
         }
         best.map(|(i, _)| i)
     }
+
+    /// Closest link to a world-space point: point-to-segment distance in
+    /// world units, so schema-view edge types are clickable for multi-select.
+    /// Endpoints missing from the model (stale links) are skipped.
+    pub fn pick_edge(&self, world: Vec2, tol: f32) -> Option<usize> {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, link) in self.links.iter().enumerate() {
+            let (Some(a), Some(b)) = (self.nodes.get(link.source), self.nodes.get(link.target))
+            else {
+                continue;
+            };
+            let d = point_segment_dist(world, a.pos, b.pos);
+            if d <= tol && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
 }
 
 pub fn node_size(degree: usize) -> f32 {
     // Port of `render/nodeSizing.ts` realNodeSize (log-scaled).
     5.0 + 3.0 * ((degree + 1) as f32).ln()
+}
+
+/// World-space distance from `p` to the segment `a–b`.
+fn point_segment_dist(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-6 {
+        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    let cx = a.x + t * dx;
+    let cy = a.y + t * dy;
+    ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
 }
 
 /// Camera — port of `render/camera.ts`: world↔screen with zoom + pan.

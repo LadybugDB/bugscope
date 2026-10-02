@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "bugscope"
-version = "0.1.0"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "arrow 55.2.0",

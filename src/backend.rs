@@ -698,6 +698,129 @@ pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
     Ok(GraphData { nodes, links })
 }
 
+/// Backtick-quote a Cypher label when it is not a bare identifier, so
+/// schema-driven queries stay valid for table names with spaces or symbols.
+/// A bare `[A-Za-z_][A-Za-z0-9_]*` passes through unchanged.
+pub fn escape_cypher_label(label: &str) -> String {
+    // Bare identifier: leading alphabetic/underscore, then alnum/underscore.
+    let bare = !label.is_empty()
+        && label
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_alphabetic())
+        && label.chars().all(|c| c == '_' || c.is_alphanumeric());
+    if bare {
+        label.to_string()
+    } else {
+        format!("`{}`", label.replace('`', "``"))
+    }
+}
+
+/// Sorted + deduped label refs, so repeated toggles produce a stable query.
+fn sorted_unique_labels(labels: &[String]) -> Vec<&str> {
+    let mut v: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// `T1|T2` alternation with escaping, for a non-empty label list.
+fn label_alternation(labels: &[&str]) -> String {
+    labels
+        .iter()
+        .map(|t| escape_cypher_label(t))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Cypher for schema-based navigation: the subset of the data graph matching
+/// the selected schema types. Both endpoints are bound to the selected node
+/// types, so no unselected type can appear: a single node type `T` yields
+/// `MATCH (a:T)-[b]->(c:T) RETURN *`. Multiple selections generalize by
+/// alternation (`(a:T1|T2)`), and selected edge types bind the rel
+/// (`[b:E1|E2]`); any unselected side stays unbound. `limit` appends
+/// `LIMIT n` as a UI guard (the loader also caps nodes/edges internally).
+/// Returns `None` when both selections are empty (nothing to match).
+pub fn schema_subset_query(
+    node_types: &[String],
+    edge_types: &[String],
+    limit: Option<usize>,
+) -> Option<String> {
+    let nodes = sorted_unique_labels(node_types);
+    let edges = sorted_unique_labels(edge_types);
+    if nodes.is_empty() && edges.is_empty() {
+        return None;
+    }
+    let node_alts = label_alternation(&nodes);
+    let node_src = if nodes.is_empty() {
+        "(a)".to_string()
+    } else {
+        format!("(a:{node_alts})")
+    };
+    // Restrict the target side too: an unbound `(c)` would drag in every
+    // neighbor type of the selection.
+    let node_dst = if nodes.is_empty() {
+        "(c)".to_string()
+    } else {
+        format!("(c:{node_alts})")
+    };
+    let edge_part = if edges.is_empty() {
+        "[b]".to_string()
+    } else {
+        format!("[b:{}]", label_alternation(&edges))
+    };
+    let mut q = format!("MATCH {node_src}-{edge_part}->{node_dst} RETURN *");
+    if let Some(n) = limit {
+        q.push_str(&format!(" LIMIT {n}"));
+    }
+    Some(q)
+}
+
+/// Execute the schema subset: the edge pattern plus isolated nodes of the
+/// selected types (the edge pattern only returns nodes incident to an
+/// edge), merged and deduped by node id. Errors when the selection builds
+/// no query.
+pub fn run_schema_subset(
+    conn: &Connection,
+    node_types: &[String],
+    edge_types: &[String],
+    limit: usize,
+) -> Result<GraphData> {
+    let query = schema_subset_query(node_types, edge_types, Some(limit))
+        .context("empty schema selection")?;
+    let mut data = run_cypher(conn, &query)?;
+    if let Some(iso_q) = schema_isolated_query(node_types, Some(limit)) {
+        if let Ok(iso) = run_cypher(conn, &iso_q) {
+            let mut seen: HashSet<String> = data.nodes.iter().map(|n| n.id.clone()).collect();
+            for n in iso.nodes {
+                if seen.insert(n.id.clone()) {
+                    data.nodes.push(n);
+                }
+            }
+        }
+    }
+    Ok(data)
+}
+
+/// Isolated nodes of the selected types:
+/// `MATCH (n:T1|T2) WHERE NOT (n)--() RETURN n`.
+/// Complements [`schema_subset_query`], whose edge pattern only returns
+/// nodes incident to an edge. `None` when no node types are selected.
+pub fn schema_isolated_query(node_types: &[String], limit: Option<usize>) -> Option<String> {
+    let nodes = sorted_unique_labels(node_types);
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut q = format!(
+        "MATCH (n:{}) WHERE NOT (n)--() RETURN n",
+        label_alternation(&nodes)
+    );
+    if let Some(n) = limit {
+        q.push_str(&format!(" LIMIT {n}"));
+    }
+    Some(q)
+}
+
 /// Substring search over node properties — port of `search_nodes` fallback path.
 pub fn search_nodes(conn: &Connection, query: &str) -> Result<Vec<GraphNode>> {
     let q = query.trim().to_lowercase();
@@ -997,6 +1120,60 @@ pub fn gds_leiden_communities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_subset_query_shapes() {
+        let t = |s: &str| s.to_string();
+        // Single node type: both endpoints bound — no foreign types leak in.
+        assert_eq!(
+            schema_subset_query(&[t("Person")], &[], None),
+            Some("MATCH (a:Person)-[b]->(c:Person) RETURN *".to_string())
+        );
+        // Single edge type: source/target stay unbound (nothing to bind).
+        assert_eq!(
+            schema_subset_query(&[], &[t("KNOWS")], None),
+            Some("MATCH (a)-[b:KNOWS]->(c) RETURN *".to_string())
+        );
+        // Multi-select: alternation on all three positions, stable order.
+        assert_eq!(
+            schema_subset_query(&[t("Movie"), t("Person")], &[t("LIKES"), t("KNOWS")], None),
+            Some("MATCH (a:Movie|Person)-[b:KNOWS|LIKES]->(c:Movie|Person) RETURN *".to_string())
+        );
+        // LIMIT guard appended.
+        assert_eq!(
+            schema_subset_query(&[t("Person")], &[], Some(100)),
+            Some("MATCH (a:Person)-[b]->(c:Person) RETURN * LIMIT 100".to_string())
+        );
+        // Empty selection matches nothing.
+        assert_eq!(schema_subset_query(&[], &[], None), None);
+        // Dedup + escaping.
+        assert_eq!(
+            schema_subset_query(&[t("Person"), t("Person")], &[], None),
+            Some("MATCH (a:Person)-[b]->(c:Person) RETURN *".to_string())
+        );
+        assert_eq!(
+            schema_subset_query(&[t("My Type")], &[], None),
+            Some("MATCH (a:`My Type`)-[b]->(c:`My Type`) RETURN *".to_string())
+        );
+        assert_eq!(escape_cypher_label("Person"), "Person");
+        assert_eq!(escape_cypher_label("_x1"), "_x1");
+        assert_eq!(escape_cypher_label("9lives"), "`9lives`");
+        assert_eq!(escape_cypher_label(""), "``");
+    }
+
+    #[test]
+    fn schema_isolated_query_shapes() {
+        let t = |s: &str| s.to_string();
+        assert_eq!(
+            schema_isolated_query(&[t("Person"), t("Movie")], None),
+            Some("MATCH (n:Movie|Person) WHERE NOT (n)--() RETURN n".to_string())
+        );
+        assert_eq!(
+            schema_isolated_query(&[t("Person")], Some(50)),
+            Some("MATCH (n:Person) WHERE NOT (n)--() RETURN n LIMIT 50".to_string())
+        );
+        assert_eq!(schema_isolated_query(&[], None), None);
+    }
 
     fn open_ephemeral() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
