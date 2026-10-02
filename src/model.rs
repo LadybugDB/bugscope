@@ -22,6 +22,8 @@ pub struct SimNode {
     pub pos: Vec2,
     pub vel: Vec2,
     pub degree: usize,
+    /// All node properties for the hover attribute tooltip.
+    pub properties: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,8 @@ pub struct SimLink {
     pub source: usize,
     pub target: usize,
     pub label: String,
+    /// Relationship properties when the loader materialized them.
+    pub properties: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,6 +72,7 @@ impl GraphModel {
                 id: node.id.clone(),
                 name: node.name.clone(),
                 label: node.label.clone(),
+                properties: node.properties.clone(),
                 color,
                 pos: Vec2 {
                     x: angle.cos() * r,
@@ -86,6 +91,7 @@ impl GraphModel {
                     source: s,
                     target: t,
                     label: l.label.clone(),
+                    properties: l.properties.clone(),
                 });
             }
         }

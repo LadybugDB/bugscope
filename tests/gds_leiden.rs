@@ -172,6 +172,7 @@ fn local_leiden_two_cliques() {
             source: format!("0:{s}"),
             target: format!("0:{t}"),
             label: "Edge".to_string(),
+            properties: Default::default(),
         })
         .collect();
     let data = GraphData { nodes, links };

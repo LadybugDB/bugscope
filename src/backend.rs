@@ -35,6 +35,23 @@ pub struct GraphLink {
     pub source: String,
     pub target: String,
     pub label: String,
+    /// Relationship properties (`RETURN r` fields), when the loader
+    /// materialized a `Rel` value (Cypher path). Bulk edge scans only
+    /// carry ids + the rel label, so this stays empty there.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+}
+
+/// Property map for a materialized relationship value.
+fn graph_link_properties(rel: &lbug::RelVal) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (k, v) in rel.get_properties() {
+        let s = value_to_string(v);
+        if !s.is_empty() {
+            out.insert(k.clone(), s);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -385,6 +402,7 @@ fn collect_edges_arrow(
                     source,
                     target,
                     label,
+                    properties: HashMap::new(),
                 });
             }
         }
@@ -431,6 +449,7 @@ fn collect_edges_rows(
                 source,
                 target,
                 label: label.clone(),
+                properties: HashMap::new(),
             });
         }
     }
@@ -497,6 +516,7 @@ fn collect_edges_csr(
                         source,
                         target,
                         label: rel.clone(),
+                        properties: HashMap::new(),
                     });
                 }
             }
@@ -682,6 +702,7 @@ pub fn collect_schema_graph(conn: &Connection) -> Result<GraphData> {
                     source: format!("schema:{s}"),
                     target: format!("schema:{t}"),
                     label: rel.clone(),
+                    properties: HashMap::new(),
                 });
             }
         }
@@ -1362,6 +1383,7 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                         source: format!("{src}"),
                         target: format!("{dst}"),
                         label: rel.get_label_name().clone(),
+                        properties: graph_link_properties(rel),
                     });
                 }
                 Value::RecursiveRel {
@@ -1382,6 +1404,7 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                             source: format!("{src}"),
                             target: format!("{dst}"),
                             label: r.get_label_name().clone(),
+                            properties: graph_link_properties(r),
                         });
                     }
                 }

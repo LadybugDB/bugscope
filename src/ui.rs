@@ -8,7 +8,7 @@ use crate::model::{node_size, Camera, GraphModel, Vec2};
 use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -24,6 +24,11 @@ struct Snapshot {
     sel_nodes: Vec<usize>,
     sel_edges: Vec<usize>,
     hover_edge: Option<usize>,
+    /// Canvas-local cursor position for anchoring the hover tooltip.
+    hover_pos: Option<(f32, f32)>,
+    /// Prebuilt attribute lines for the hovered node/edge (built at
+    /// snapshot time so per-frame paint clones no property maps).
+    hover_lines: Option<Vec<String>>,
     theme: Theme,
     label_font: String,
     label_font_size: f32,
@@ -107,6 +112,10 @@ struct TreeSnapshot {
     /// Root of the displayed graph for the sunburst center disc: the
     /// focused node when drilled in, else the node count.
     center_label: String,
+    /// Canvas-local cursor + prebuilt attribute lines for the hovered
+    /// treemap/sunburst node.
+    hover_pos: Option<(f32, f32)>,
+    hover_lines: Option<Vec<String>>,
 }
 
 pub struct RootView {
@@ -151,8 +160,10 @@ pub struct RootView {
     trail: Vec<Crumb>,
     hovered: Option<usize>,
     selected: Option<usize>,
-    /// Edge under the cursor (schema view: hover highlight for edge types).
+    /// Edge under the cursor: hover highlight + attribute tooltip.
     hovered_edge: Option<usize>,
+    /// Canvas-local cursor position, for anchoring the hover tooltip.
+    hover_pos: Option<(f32, f32)>,
     /// Schema-view multi-selection: selected node-table and rel-table names.
     /// Multi-select clicks (⌘ on macOS, Ctrl elsewhere) collect types while
     /// staying in the schema view; a plain click adds its type and displays
@@ -249,6 +260,7 @@ impl RootView {
             hovered: None,
             selected: None,
             hovered_edge: None,
+            hover_pos: None,
             schema_node_sel: HashSet::new(),
             schema_edge_sel: HashSet::new(),
             schema_mode: opts.schema_mode,
@@ -340,6 +352,7 @@ impl RootView {
                 self.trail.clear();
                 self.selected = None;
                 self.hovered = None;
+                self.hover_pos = None;
                 self.treemap_hover = None;
                 self.drag_node = None;
                 self.panning = None;
@@ -388,6 +401,7 @@ impl RootView {
         self.selected = None;
         self.hovered = None;
         self.hovered_edge = None;
+        self.hover_pos = None;
         self.treemap_hover = None;
         self.drag_node = None;
         self.panning = None;
@@ -553,6 +567,7 @@ impl RootView {
                 self.selected = None;
                 self.hovered = None;
                 self.hovered_edge = None;
+                self.hover_pos = None;
                 self.treemap_hover = None;
                 self.full = data.clone();
                 self.model.load(&data);
@@ -830,6 +845,17 @@ impl RootView {
             .last()
             .map(|c| c.label.clone())
             .unwrap_or_else(|| format!("{} nodes", self.shown.nodes.len()));
+        let hover_lines = self.treemap_hover.and_then(|i| {
+            self.model.nodes.get(i).map(|n| {
+                node_tooltip_lines(
+                    &n.name,
+                    &n.id,
+                    &n.label,
+                    n.degree,
+                    &sorted_props(&n.properties),
+                )
+            })
+        });
         TreeSnapshot {
             tree: self.tree.clone(),
             names: self.tree_names.clone(),
@@ -841,6 +867,8 @@ impl RootView {
             label_font_size: self.label_font_size,
             summary: self.cluster_status.clone(),
             center_label,
+            hover_pos: self.hover_pos,
+            hover_lines,
         }
     }
 
@@ -1012,6 +1040,8 @@ impl RootView {
                     } else {
                         self.selected = None;
                         self.hovered = None;
+                        self.hover_pos = None;
+                        self.hovered_edge = None;
                         self.treemap_hover = None;
                     }
                     let n = data.nodes.len();
@@ -1027,6 +1057,10 @@ impl RootView {
                     self.trail.clear();
                     self.focused = None;
                     self.selected = None;
+                    self.hovered = None;
+                    self.hovered_edge = None;
+                    self.hover_pos = None;
+                    self.treemap_hover = None;
                     // A hand-written query replaces the graph: any schema
                     // multi-selection it may have come from is stale.
                     self.clear_schema_selection();
@@ -1110,6 +1144,8 @@ impl RootView {
         if self.trail.is_empty() && self.focused.is_none() {
             self.selected = None;
             self.hovered = None;
+            self.hovered_edge = None;
+            self.hover_pos = None;
             self.treemap_hover = None;
             self.set_status("Search cleared", cx);
             return;
@@ -1247,6 +1283,47 @@ impl RootView {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Attribute lines for the hovered node/edge, built once per frame
+        // from the model (node hover wins over edge hover).
+        let hover_lines = self
+            .hovered
+            .and_then(|i| {
+                self.model.nodes.get(i).map(|n| {
+                    node_tooltip_lines(
+                        &n.name,
+                        &n.id,
+                        &n.label,
+                        n.degree,
+                        &sorted_props(&n.properties),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.hovered_edge.and_then(|e| {
+                    self.model.links.get(e).map(|l| {
+                        let (from_name, from_id) = self
+                            .model
+                            .nodes
+                            .get(l.source)
+                            .map(|n| (n.name.as_str(), n.id.as_str()))
+                            .unwrap_or(("", ""));
+                        let (to_name, to_id) = self
+                            .model
+                            .nodes
+                            .get(l.target)
+                            .map(|n| (n.name.as_str(), n.id.as_str()))
+                            .unwrap_or(("", ""));
+                        edge_tooltip_lines(
+                            &l.label,
+                            from_name,
+                            from_id,
+                            to_name,
+                            to_id,
+                            &sorted_props(&l.properties),
+                        )
+                    })
+                })
+            });
         Snapshot {
             theme,
             nodes: self
@@ -1277,6 +1354,8 @@ impl RootView {
             sel_nodes,
             sel_edges,
             hover_edge: self.hovered_edge,
+            hover_pos: self.hover_pos,
+            hover_lines,
             label_font: self.label_font.clone(),
             label_font_size: self.label_font_size,
         }
@@ -1956,16 +2035,28 @@ impl RootView {
                 }
                 let world = view.camera.screen_to_world(lx, ly, vw, vh);
                 let h = view.model.pick(world, 6.0);
-                // Schema view also tracks the edge under the cursor so rel
-                // types highlight before a multi-select click.
-                let he = if view.schema_mode && h.is_none() {
-                    view.model.pick_edge(world, 8.0)
+                // Track the edge under the cursor whenever no node is hit,
+                // so hovering a relationship shows its attributes (and, in
+                // the schema view, highlights the rel type before click).
+                // Tolerance is screen-constant (~10px) via zoom scaling.
+                let tol = (10.0 / view.camera.zoom.max(0.2)) as f32;
+                let he = if h.is_none() {
+                    view.model.pick_edge(world, tol)
                 } else {
                     None
                 };
-                if h != view.hovered || he != view.hovered_edge {
+                // Cursor position only matters while something is hovered
+                // (tooltip anchor); otherwise leave it empty so empty-canvas
+                // moves don't re-render every frame.
+                let pos = if h.is_some() || he.is_some() {
+                    Some((lx, ly))
+                } else {
+                    None
+                };
+                if h != view.hovered || he != view.hovered_edge || pos != view.hover_pos {
                     view.hovered = h;
                     view.hovered_edge = he;
+                    view.hover_pos = pos;
                     cx.notify();
                 }
             }))
@@ -2197,8 +2288,10 @@ impl RootView {
                 let h = view
                     .pick_treemap(lx, ly)
                     .and_then(|t| view.treemap_tile_node(&t));
-                if h != view.treemap_hover {
+                let pos = if h.is_some() { Some((lx, ly)) } else { None };
+                if h != view.treemap_hover || pos != view.hover_pos {
                     view.treemap_hover = h;
+                    view.hover_pos = pos;
                     cx.notify();
                 }
             }))
@@ -2280,8 +2373,10 @@ impl RootView {
                 let h = view
                     .pick_sunburst(lx, ly)
                     .and_then(|hit| view.sunburst_hit_node(hit));
-                if h != view.treemap_hover {
+                let pos = if h.is_some() { Some((lx, ly)) } else { None };
+                if h != view.treemap_hover || pos != view.hover_pos {
                     view.treemap_hover = h;
+                    view.hover_pos = pos;
                     cx.notify();
                 }
             }))
@@ -2645,6 +2740,238 @@ fn disc_radius(degree: usize, zoom: f64) -> f32 {
     (node_size(degree) * zoom as f32).clamp(3.0, 26.0)
 }
 
+/// Sorted `(key, value)` pairs for deterministic hover tooltips.
+fn sorted_props(map: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// One attribute value on a single tooltip line.
+fn truncate_attr_value(s: &str) -> String {
+    const MAX: usize = 48;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(MAX - 1).collect();
+    format!("{kept}…")
+}
+
+/// Attribute lines for a hovered node: title + identity + properties.
+/// First line is the title; the painter renders it emphasized.
+fn node_tooltip_lines(
+    name: &str,
+    id: &str,
+    label: &str,
+    degree: usize,
+    props: &[(String, String)],
+) -> Vec<String> {
+    const MAX_PROPS: usize = 12;
+    let mut lines = Vec::new();
+    lines.push(if name.is_empty() {
+        id.to_string()
+    } else {
+        name.to_string()
+    });
+    lines.push(format!("id: {id}"));
+    if !label.is_empty() {
+        lines.push(format!("type: {label}"));
+    }
+    lines.push(format!("connections: {degree}"));
+    for (k, v) in props.iter().take(MAX_PROPS) {
+        lines.push(format!("{}: {}", k, truncate_attr_value(v)));
+    }
+    if props.len() > MAX_PROPS {
+        lines.push(format!("… +{} more", props.len() - MAX_PROPS));
+    }
+    lines
+}
+
+/// Attribute lines for a hovered edge: rel type + endpoints + properties.
+fn edge_tooltip_lines(
+    rel: &str,
+    from_name: &str,
+    from_id: &str,
+    to_name: &str,
+    to_id: &str,
+    props: &[(String, String)],
+) -> Vec<String> {
+    const MAX_PROPS: usize = 10;
+    let mut lines = Vec::new();
+    lines.push(if rel.is_empty() {
+        "relationship".to_string()
+    } else {
+        format!(":{rel}")
+    });
+    lines.push(format!(
+        "from: {}",
+        truncate_attr_value(if from_name.is_empty() {
+            from_id
+        } else {
+            from_name
+        })
+    ));
+    lines.push(format!(
+        "to: {}",
+        truncate_attr_value(if to_name.is_empty() { to_id } else { to_name })
+    ));
+    for (k, v) in props.iter().take(MAX_PROPS) {
+        lines.push(format!("{}: {}", k, truncate_attr_value(v)));
+    }
+    if props.len() > MAX_PROPS {
+        lines.push(format!("… +{} more", props.len() - MAX_PROPS));
+    }
+    lines
+}
+
+/// Hover attribute tooltip core: bg card + one shaped line per row,
+/// anchored near the cursor and clamped to the canvas box.
+#[allow(clippy::too_many_arguments)]
+fn paint_tooltip_lines(
+    theme: &Theme,
+    label_font: &String,
+    label_font_size: f32,
+    lines: &[String],
+    anchor_local: (f32, f32),
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    const MAX_LINES: usize = 16;
+    if lines.is_empty() {
+        return;
+    }
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    let font_size = px(label_font_size.max(8.0));
+    let pad_x = 8.0;
+    let pad_y = 6.0;
+    let gap = 1.0;
+    let take = lines.len().min(MAX_LINES);
+    // Shape first so the card fits the real text.
+    let mut shaped: Vec<(gpui::ShapedLine, f32, f32)> = Vec::with_capacity(take);
+    let mut card_w = 0.0f32;
+    let mut card_h = pad_y * 2.0;
+    for (i, line) in lines.iter().take(take).enumerate() {
+        let text: SharedString = line.clone().into();
+        let run = TextRun {
+            len: text.len(),
+            font: font(label_font),
+            color: if i == 0 {
+                theme.bright
+            } else {
+                theme.foreground
+            },
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let s = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let w = f32::from(s.width);
+        let h = f32::from(s.ascent + s.descent);
+        card_w = card_w.max(w);
+        card_h += h + if i + 1 < take { gap } else { 0.0 };
+        shaped.push((s, w, h));
+    }
+    card_w += pad_x * 2.0;
+    if card_w > vw - 8.0 || card_h > vh - 8.0 {
+        return;
+    }
+    // Cursor-anchored, flipped when it would spill past the edge.
+    let mut tx = anchor_local.0 + 14.0;
+    if tx + card_w > vw - 4.0 {
+        tx = anchor_local.0 - card_w - 12.0;
+    }
+    let mut ty = anchor_local.1 + 16.0;
+    if ty + card_h > vh - 4.0 {
+        ty = anchor_local.1 - card_h - 12.0;
+    }
+    tx = tx.clamp(4.0, (vw - card_w - 4.0).max(4.0));
+    ty = ty.clamp(4.0, (vh - card_h - 4.0).max(4.0));
+    window.paint_quad(PaintQuad {
+        bounds: Bounds::new(
+            point(px(ox + tx), px(oy + ty)),
+            size(px(card_w), px(card_h)),
+        ),
+        corner_radii: Corners::all(px(6.)),
+        background: theme.surface.into(),
+        border_widths: Edges::all(px(1.)),
+        border_color: theme.border,
+        border_style: BorderStyle::Solid,
+    });
+    let mut y = ty + pad_y;
+    for (s, _, h) in &shaped {
+        let _ = s.paint(point(px(ox + tx + pad_x), px(oy + y)), px(14.), window, cx);
+        y += *h + gap;
+    }
+}
+
+/// Graph-view hover tooltip from the prebuilt snapshot lines. Falls back
+/// to the hovered node position / edge midpoint when the cursor position
+/// is unavailable.
+fn paint_hover_tooltip(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let Some(lines) = snap.hover_lines.as_ref() else {
+        return;
+    };
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let anchor = snap.hover_pos.unwrap_or_else(|| {
+        if let Some(n) = snap.hovered.and_then(|i| snap.nodes.get(i)) {
+            snap.camera.world_to_screen(n.x, n.y, vw, vh)
+        } else if let Some(l) = snap.hover_edge.and_then(|e| snap.links.get(e)) {
+            let (Some(a), Some(b)) = (snap.nodes.get(l.source), snap.nodes.get(l.target)) else {
+                return (vw / 2.0, vh / 2.0);
+            };
+            let (x0, y0) = snap.camera.world_to_screen(a.x, a.y, vw, vh);
+            let (x1, y1) = snap.camera.world_to_screen(b.x, b.y, vw, vh);
+            ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        } else {
+            (vw / 2.0, vh / 2.0)
+        }
+    });
+    paint_tooltip_lines(
+        &snap.theme,
+        &snap.label_font,
+        snap.label_font_size,
+        lines,
+        anchor,
+        bounds,
+        window,
+        cx,
+    );
+}
+
+/// Treemap / sunburst hover tooltip from the prebuilt snapshot lines.
+#[allow(clippy::too_many_arguments)]
+fn paint_tree_tooltip(
+    theme: &Theme,
+    label_font: &String,
+    label_font_size: f32,
+    lines: &Option<Vec<String>>,
+    anchor: &Option<(f32, f32)>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (Some(ls), Some(pos)) = (lines.as_ref(), anchor.as_ref()) else {
+        return;
+    };
+    paint_tooltip_lines(
+        theme,
+        label_font,
+        label_font_size,
+        ls,
+        *pos,
+        bounds,
+        window,
+        cx,
+    );
+}
+
 fn paint_graph(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
     let vw = f32::from(bounds.size.width);
     let vh = f32::from(bounds.size.height);
@@ -2658,6 +2985,7 @@ fn paint_graph(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx:
     let _ = (vw, vh);
     paint_labels(snap, bounds, window, cx);
     paint_edge_labels(snap, bounds, window, cx);
+    paint_hover_tooltip(snap, bounds, window, cx);
 }
 
 /// Edge labels at the segment midpoint, tiered with the node labels:
@@ -3191,6 +3519,16 @@ fn paint_treemap(snap: &TreeSnapshot, bounds: Bounds<Pixels>, window: &mut Windo
         window,
         cx,
     );
+    paint_tree_tooltip(
+        &snap.theme,
+        &snap.label_font,
+        snap.label_font_size,
+        &snap.hover_lines,
+        &snap.hover_pos,
+        bounds,
+        window,
+        cx,
+    );
 }
 
 /// One treemap label, painted only when the shaped text fits its tile —
@@ -3495,6 +3833,16 @@ fn paint_sunburst(snap: &TreeSnapshot, bounds: Bounds<Pixels>, window: &mut Wind
             px(oy + vh - h - pad_y * 2.0 - 8.0 + pad_y),
         ),
         px(14.),
+        window,
+        cx,
+    );
+    paint_tree_tooltip(
+        &snap.theme,
+        &snap.label_font,
+        snap.label_font_size,
+        &snap.hover_lines,
+        &snap.hover_pos,
+        bounds,
         window,
         cx,
     );
