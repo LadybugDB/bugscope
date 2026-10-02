@@ -40,6 +40,36 @@ cargo run --release
 
 Working directory matters only for the initial sidebar scan: `*.lbdb` files under `.` are listed automatically. Anything else can be opened via **Open file…**, so you can run from anywhere.
 
+## Graph analytics (icebug / GDS)
+
+Every connection runs `LOAD algo` (installing from the official repo at
+`https://extension.ladybugdb.com` on first use), so PageRank and friends work
+straight from the query box as Cypher table functions:
+
+```cypher
+CALL PROJECT_GRAPH('G', ['N'], ['E']);
+CALL GDS_PAGE_RANK('G') RETURN node.id, rank ORDER BY rank DESC;
+```
+
+Available: `PROJECT_GRAPH`, `PAGE_RANK`, `GDS_PAGE_RANK`, `GDS_LOUVAIN`,
+`GDS_LEIDEN`, `GDS_PPR`, `GDS_NODE2VEC`, k-core, components, spanning forest.
+Set `BUGSCOPE_ALGO_EXTENSION` to a local `.lbug_extension` file to override
+the downloaded one (e.g. a build from
+[LadybugDB/extensions](https://github.com/LadybugDB/extensions/tree/main/algo)).
+
+From source:
+
+```bash
+bash scripts/download_icebug.sh      # prebuilt libnetworkit for your platform -> ./icebug/
+bash scripts/download-liblbug.sh     # prebuilt shared liblbug (dlopen needs shared, not static) -> ./liblbug/
+bash scripts/vendor_arrow.sh         # stage libarrow/libomp next to libnetworkit (the algo
+                                      # extension references @rpath/libarrow, resolved via our rpaths)
+cargo test --test gds_page_rank      # GDS_PAGE_RANK vs the expected ranks (skips when offline)
+```
+
+The `icebug-analytics` cargo feature (on by default; `--no-default-features` to skip) links the
+icebug Rust crate for in-process analytics such as `backend::graphr_page_rank`.
+
 ## Project structure
 
 | Path | Contents |

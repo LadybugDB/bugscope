@@ -158,7 +158,128 @@ pub fn open_connection(path: &str) -> Result<Connection<'_>> {
     // Tauri backend which re-opens per command and drops at command end. Here a
     // short-lived query holds both alive via the leaked handle.
     let db: &'static Database = Box::leak(Box::new(db));
-    Connection::new(db).context("failed to create connection")
+    let conn = Connection::new(db).context("failed to create connection")?;
+    // Best-effort: make the icebug-backed algo extension (PAGE_RANK,
+    // GDS_PAGE_RANK, PROJECT_GRAPH, …) available to Cypher. Missing bundle
+    // just means those functions are unavailable; everything else works.
+    ensure_algo_extension(&conn);
+    Ok(conn)
+}
+
+/// Install the algo extension from the official repo
+/// (`https://extension.ladybugdb.com`). A no-op when already installed.
+/// Returns false when the download fails (e.g. offline). Never fails the caller.
+pub fn install_algo_extension(conn: &Connection) -> bool {
+    conn.query("INSTALL algo").is_ok()
+}
+
+/// Load the algo extension on this connection. Returns true when the
+/// GDS_* surface is available. Never fails the caller.
+///
+/// Must run per connection, not once per process: ladybug tracks loaded
+/// extensions per Database (`ExtensionManager` lives on the `Database`), and
+/// this app opens a fresh `Database` per `open_connection` call. A cached
+/// "already loaded" result would leave other connections without GDS.
+///
+/// Resolution order: `LOAD algo` (already installed), otherwise
+/// `INSTALL algo` from the official repo followed by `LOAD algo`. As an
+/// escape hatch for local extension builds, `BUGSCOPE_ALGO_EXTENSION` may
+/// point at a `.lbug_extension` file to `LOAD EXTENSION` directly.
+pub fn ensure_algo_extension(conn: &Connection) -> bool {
+    if let Some(path) = std::env::var_os("BUGSCOPE_ALGO_EXTENSION").map(PathBuf::from) {
+        // LOAD EXTENSION takes a path without the suffix on some builds;
+        // try the full path first, then the stem form.
+        let full = path.to_string_lossy().replace('\\', "/");
+        if conn.query(&format!("LOAD EXTENSION '{full}'")).is_ok() {
+            return true;
+        }
+        let stem = full
+            .strip_suffix(".lbug_extension")
+            .unwrap_or(&full)
+            .to_string();
+        if conn.query(&format!("LOAD EXTENSION '{stem}'")).is_ok() {
+            return true;
+        }
+    }
+    if conn.query("LOAD algo").is_ok() {
+        return true;
+    }
+    // Not installed yet: fetch it, then load.
+    if install_algo_extension(conn) {
+        return conn.query("LOAD algo").is_ok();
+    }
+    false
+}
+
+/// In-process PageRank over an already-collected graph via the linked icebug
+/// (NetworKit) library — no extension needed. Returns `(node_id, score)`
+/// sorted by score descending. Mirrors the GDS_PAGE_RANK ranking so the
+/// extension result can be cross-checked (see `tests/gds_page_rank.rs`).
+#[cfg(feature = "icebug-analytics")]
+pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
+    use arrow::array::UInt64Array;
+    let index: HashMap<&str, u64> = data
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i as u64))
+        .collect();
+    let n = data.nodes.len() as u64;
+    if n == 0 {
+        return Vec::new();
+    }
+    // Directed GraphR needs both out- and in-edge CSRs.
+    let mut outgoing: Vec<Vec<u64>> = vec![Vec::new(); n as usize];
+    let mut incoming: Vec<Vec<u64>> = vec![Vec::new(); n as usize];
+    for l in &data.links {
+        if let (Some(&s), Some(&t)) = (index.get(l.source.as_str()), index.get(l.target.as_str())) {
+            if s != t {
+                outgoing[s as usize].push(t);
+                incoming[t as usize].push(s);
+            }
+        }
+    }
+    fn pack(adj: Vec<Vec<u64>>) -> (Vec<u64>, Vec<u64>) {
+        let mut indptr = Vec::with_capacity(adj.len() + 1);
+        let mut indices = Vec::new();
+        for mut neighbors in adj {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            indptr.push(indices.len() as u64);
+            indices.extend(neighbors);
+        }
+        indptr.push(indices.len() as u64);
+        (indices, indptr)
+    }
+    let (out_indices, out_indptr) = pack(outgoing);
+    let (in_indices, in_indptr) = pack(incoming);
+    let Ok(graph) = icebug::GraphR::from_directed_csr(
+        n,
+        UInt64Array::from(out_indices),
+        UInt64Array::from(out_indptr),
+        UInt64Array::from(in_indices),
+        UInt64Array::from(in_indptr),
+    ) else {
+        return Vec::new();
+    };
+    // normalized=false: scores form a sum-to-1 distribution like GDS_PAGE_RANK.
+    let Ok(mut pr) = icebug::PageRank::new(&graph, 0.85, 1e-9, false) else {
+        return Vec::new();
+    };
+    if pr.run().is_err() {
+        return Vec::new();
+    }
+    let Ok(scores) = pr.scores() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, f64)> = data
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| (nd.id.clone(), *scores.get(i).unwrap_or(&0.0)))
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 /// (table_id, name, kind) for every table — `CALL SHOW_TABLES` is tiny.
@@ -212,7 +333,6 @@ fn collect_edges_arrow(
     links: &mut Vec<GraphLink>,
     node_ids: &mut HashSet<NodeId>,
 ) -> Result<()> {
-    use arrow::array::Array;
     let mut result = conn
         .query_as_arrow(
             &format!(
