@@ -366,8 +366,14 @@ pub fn sunburst_frame(vw: f32, vh: f32) -> (f32, f32, f32) {
 pub const SUNBURST_CENTER_FRAC: f32 = 0.30;
 
 /// Lay out `communities` as sunburst wedges for a `radius`-px sunburst.
-/// Member arcs narrower than ~2px at their mid radius are dropped — they
-/// can neither be read nor hit, like sub-`min_tile` treemap cells.
+///
+/// Angles encode each slice's share (community share of the whole, member
+/// share of its community), while each member arc's outer radius encodes
+/// its absolute weight (square-root scaled against the heaviest member in
+/// the graph). Heavy members stick out past their neighbours, so the
+/// outer edge reads jagged instead of a perfect disc. Member arcs narrower
+/// than ~2px at their mid radius are dropped — they can neither be read
+/// nor hit, like sub-`min_tile` treemap cells.
 pub fn layout_sunburst(communities: &[Community], radius: f32) -> Vec<SunburstWedge> {
     let mut wedges = Vec::new();
     if communities.is_empty() || radius <= 0.0 {
@@ -379,6 +385,13 @@ pub fn layout_sunburst(communities: &[Community], radius: f32) -> Vec<SunburstWe
     let base = -std::f32::consts::FRAC_PI_2;
     let (c_inner, c_outer) = (radius * SUNBURST_CENTER_FRAC, radius * 0.62);
     let (m_inner, m_outer) = (radius * 0.64, radius * 0.97);
+    // Heaviest member anywhere: the reach every member arc is scaled against.
+    let wmax: f64 = communities
+        .iter()
+        .flat_map(|c| c.weights.iter())
+        .map(|w| (*w).max(0.0))
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
     let mut a = base;
     for (pos, comm) in communities.iter().enumerate() {
         let share = if total > 0.0 {
@@ -414,13 +427,16 @@ pub fn layout_sunburst(communities: &[Community], radius: f32) -> Vec<SunburstWe
             if m1 <= m0 {
                 continue;
             }
+            // Square-root reach: area-proportional, with a short stub floor
+            // so weak members still render instead of vanishing.
+            let reach = ((w / wmax).sqrt() as f32 * 0.9 + 0.1).min(1.0);
             let wedge = SunburstWedge {
                 community: pos,
                 node: Some(m),
                 start: m0,
                 end: m1,
                 inner: m_inner,
-                outer: m_outer,
+                outer: m_inner + (m_outer - m_inner) * reach,
             };
             if wedge.arc_len() < 2.0 {
                 continue;
@@ -664,6 +680,33 @@ mod tests {
                 .expect("parent arc");
             assert!(m.inner >= parent.outer - 1e-4);
             assert!(m.outer <= radius + 1e-3);
+        }
+    }
+
+    #[test]
+    fn sunburst_member_reach_tracks_weight() {
+        // Heavy member spans full reach; weak ones fall short (jagged edge).
+        let cs = build_communities(3, &[0, 0, 0], Some(&[100.0, 1.0, 1.0]));
+        let wedges = layout_sunburst(&cs, 250.0);
+        let members: Vec<&SunburstWedge> = wedges.iter().filter(|w| w.node.is_some()).collect();
+        assert_eq!(members.len(), 3);
+        let heavy = members.iter().find(|w| w.node == Some(0)).unwrap();
+        assert!((heavy.outer - 250.0 * 0.97).abs() < 1e-3);
+        for m in members.iter().filter(|w| w.node != Some(0)) {
+            assert!(m.outer < heavy.outer - 1.0, "weak falls short");
+            assert!(m.outer > m.inner, "stub floor keeps it visible");
+        }
+        // Uniform weights → uniform reach (a true disc).
+        let cs = build_communities(4, &[0, 0, 1, 1], None);
+        let wedges = layout_sunburst(&cs, 250.0);
+        let outers: Vec<f32> = wedges
+            .iter()
+            .filter(|w| w.node.is_some())
+            .map(|w| w.outer)
+            .collect();
+        assert!(!outers.is_empty());
+        for o in &outers {
+            assert!((o - outers[0]).abs() < 1e-3);
         }
     }
 
