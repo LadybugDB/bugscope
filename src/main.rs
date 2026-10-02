@@ -16,6 +16,7 @@ actions!(
         ToggleInsights,
         ViewGraph,
         ViewTreemap,
+        ViewSunburst,
         ResetView,
         OpenPreferences,
         Quit
@@ -59,6 +60,9 @@ fn main() {
         cx.on_action(|_: &ViewTreemap, cx| {
             with_view(cx, |v, cx| v.set_view_mode(ViewMode::Treemap, cx))
         });
+        cx.on_action(|_: &ViewSunburst, cx| {
+            with_view(cx, |v, cx| v.set_view_mode(ViewMode::Sunburst, cx))
+        });
         cx.on_action(|_: &ResetView, cx| with_view(cx, |v, cx| v.reset_view(cx)));
         cx.on_action(|_: &OpenPreferences, cx| with_view(cx, |v, cx| v.toggle_preferences(cx)));
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -69,6 +73,7 @@ fn main() {
             KeyBinding::new("cmd-i", ToggleInsights, None),
             KeyBinding::new("cmd-1", ViewGraph, None),
             KeyBinding::new("cmd-2", ViewTreemap, None),
+            KeyBinding::new("cmd-3", ViewSunburst, None),
             KeyBinding::new("cmd-,", OpenPreferences, None),
         ]);
         cx.set_menus(vec![
@@ -99,6 +104,7 @@ fn main() {
                     MenuItem::separator(),
                     MenuItem::action("Graph View", ViewGraph),
                     MenuItem::action("Treemap (Leiden) View", ViewTreemap),
+                    MenuItem::action("Sunburst (Leiden) View", ViewSunburst),
                     MenuItem::separator(),
                     MenuItem::action("Reset View", ResetView),
                 ],

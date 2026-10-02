@@ -39,19 +39,21 @@ struct SnapNode {
     name: String,
 }
 
-/// Center-pane view: force-directed graph or Leiden treemap.
+/// Center-pane view: force-directed graph, Leiden treemap, or Leiden
+/// sunburst (same communities, radial instead of rectangular).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
     Graph,
     Treemap,
+    Sunburst,
 }
 
-/// Auto-switch threshold: a displayed graph with more than this many edges
-/// opens in the treemap view by default (the Leiden overview scales better
-/// than the force graph); smaller ones open in the graph view. Applies on
-/// every graph change (load, Cypher, drill-down); the header toggle still
-/// overrides for the current view.
+/// Startup default threshold: the first graph shown with more than this
+/// many edges opens in the treemap view (the Leiden overview scales better
+/// than the force graph); smaller ones open in the graph view. Applied
+/// only once — afterwards the view sticks and changes only via the header
+/// toggle, menu, or shortcuts.
 pub const TREEMAP_AUTO_EDGES: usize = 64;
 
 /// Default view for an edge count: treemap above the threshold.
@@ -83,7 +85,8 @@ struct TopRank {
 
 /// Everything the treemap needs for one frame: the Leiden communities
 /// (largest first, shared with hit-testing via the same `Rc`), truncated
-/// names per displayed node, and the hover/selection to outline.
+/// names per displayed node, and the hover/selection to outline. The
+/// sunburst reuses the same snapshot plus `center_label` for its root disc.
 #[derive(Clone)]
 struct TreeSnapshot {
     tree: Rc<Vec<clusters::Community>>,
@@ -95,6 +98,9 @@ struct TreeSnapshot {
     label_font: String,
     label_font_size: f32,
     summary: String,
+    /// Root of the displayed graph for the sunburst center disc: the
+    /// focused node when drilled in, else the node count.
+    center_label: String,
 }
 
 pub struct RootView {
@@ -104,8 +110,11 @@ pub struct RootView {
     full: GraphData,
     model: GraphModel,
     camera: Camera,
-    /// Center-pane view, switched by the header toggle.
+    /// Center-pane view: chosen once at startup by edge count, then sticky
+    /// (header toggle / menu / shortcuts only).
     view_mode: ViewMode,
+    /// Whether the one-shot startup default has been applied.
+    auto_view_done: bool,
     /// Currently displayed graph, in model order: full scan, Cypher result,
     /// or 1-hop neighborhood. Analytics (Leiden/PageRank) run over this.
     shown: GraphData,
@@ -206,6 +215,7 @@ impl RootView {
             model: GraphModel::default(),
             camera: Camera::default(),
             view_mode: ViewMode::Graph,
+            auto_view_done: false,
             shown: GraphData::default(),
             communities: Vec::new(),
             cluster_modularity: 0.0,
@@ -318,7 +328,7 @@ impl RootView {
                 self.panning = None;
                 self.search_results.clear();
                 self.running = !self.schema_mode;
-                self.view_mode = auto_view_mode(data.links.len());
+                self.maybe_auto_view(data.links.len());
                 self.shown = data;
                 self.refresh_analytics();
                 self.set_status(msg, cx);
@@ -368,7 +378,7 @@ impl RootView {
         if focused.is_some() {
             self.running = true;
         }
-        self.view_mode = auto_view_mode(data.links.len());
+        self.maybe_auto_view(data.links.len());
         self.shown = data;
         self.refresh_analytics();
         self.set_status(status, cx);
@@ -512,6 +522,15 @@ impl RootView {
         cx.notify();
     }
 
+    /// One-shot startup default: pick the view from the edge count the
+    /// first time a graph is shown; later graphs keep the current view.
+    fn maybe_auto_view(&mut self, edge_count: usize) {
+        if !self.auto_view_done {
+            self.view_mode = auto_view_mode(edge_count);
+            self.auto_view_done = true;
+        }
+    }
+
     pub fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
         self.right_open = !self.right_open;
         cx.notify();
@@ -607,6 +626,35 @@ impl RootView {
             .find(|t| t.rect.contains(lx, ly))
     }
 
+    /// Sunburst wedges for the current canvas, shared by paint +
+    /// hit-testing so both always agree.
+    fn sunburst_layout(&self) -> (Vec<clusters::SunburstWedge>, f32, f32, f32) {
+        let (vw, vh) = self.canvas_size();
+        let (cx, cy, radius) = clusters::sunburst_frame(vw, vh);
+        let wedges = clusters::layout_sunburst(&self.tree, radius);
+        (wedges, cx, cy, radius)
+    }
+
+    /// Sunburst hit under a canvas-local point: center circle, wedge, or
+    /// miss (outside the disc).
+    fn pick_sunburst(&self, lx: f32, ly: f32) -> Option<clusters::SunburstHit> {
+        let (wedges, cx, cy, radius) = self.sunburst_layout();
+        clusters::pick_sunburst(&wedges, cx, cy, radius, lx, ly)
+    }
+
+    /// Displayed-node index for a sunburst hit: the member arc itself, or
+    /// the heaviest member when the community arc (or center) was hit.
+    fn sunburst_hit_node(&self, hit: clusters::SunburstHit) -> Option<usize> {
+        match hit {
+            clusters::SunburstHit::Center => None,
+            clusters::SunburstHit::Wedge { community, node } => node.or_else(|| {
+                self.tree
+                    .get(community)
+                    .and_then(|c| c.members.first().copied())
+            }),
+        }
+    }
+
     /// Displayed-node index shown for a tile: the member cell itself, or
     /// the heaviest member when the community header was hit.
     fn treemap_tile_node(&self, tile: &clusters::Tile) -> Option<usize> {
@@ -621,6 +669,11 @@ impl RootView {
         let selected_community = self
             .selected
             .and_then(|i| self.tree.iter().position(|c| c.members.contains(&i)));
+        let center_label = self
+            .trail
+            .last()
+            .map(|c| c.label.clone())
+            .unwrap_or_else(|| format!("{} nodes", self.shown.nodes.len()));
         TreeSnapshot {
             tree: self.tree.clone(),
             names: self.tree_names.clone(),
@@ -631,6 +684,7 @@ impl RootView {
             label_font: self.label_font.clone(),
             label_font_size: self.label_font_size,
             summary: self.cluster_status.clone(),
+            center_label,
         }
     }
 
@@ -822,7 +876,7 @@ impl RootView {
                     self.frame_initial(None);
                     self.running = !data.nodes.is_empty() && !self.schema_mode;
                     let (nn, ne) = (data.nodes.len(), data.links.len());
-                    self.view_mode = auto_view_mode(ne);
+                    self.maybe_auto_view(ne);
                     self.shown = data;
                     self.refresh_analytics();
                     self.set_status(format!("Cypher: {nn} nodes, {ne} edges"), cx);
@@ -1088,10 +1142,14 @@ impl RootView {
                     .child(label.to_string()),
             );
         }
-        // View toggle: graph ↔ Leiden treemap. The active view reads as a
-        // filled pill; the other as a quiet button.
+        // View toggle: graph ↔ Leiden treemap ↔ Leiden sunburst. The active
+        // view reads as a filled pill; the others as quiet buttons.
         let mut toggle = div().flex().flex_row().gap_1();
-        for (label, mode) in [("Graph", ViewMode::Graph), ("Treemap", ViewMode::Treemap)] {
+        for (label, mode) in [
+            ("Graph", ViewMode::Graph),
+            ("Treemap", ViewMode::Treemap),
+            ("Sunburst", ViewMode::Sunburst),
+        ] {
             let active = self.view_mode == mode;
             toggle = toggle.child(
                 div()
@@ -1563,7 +1621,7 @@ impl RootView {
     /// Collapsible right pane: top 10 nodes by PageRank over the displayed
     /// graph, plus the Leiden community summary. Clicking a row focuses the
     /// node's 1-hop neighborhood; clicking a community selects its heaviest
-    /// member and jumps to the treemap.
+    /// member (the view sticks — switch it via the header toggle).
     fn render_insights(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div()
             .flex()
@@ -1656,7 +1714,7 @@ impl RootView {
                         cx.listener(move |view, _, _, cx| {
                             if let Some(m) = first {
                                 view.selected = Some(m);
-                                view.set_view_mode(ViewMode::Treemap, cx);
+                                cx.notify();
                             }
                         }),
                     )
@@ -1731,6 +1789,75 @@ impl RootView {
                 }
             }))
     }
+
+    fn render_sunburst_canvas(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let snap = self.tree_snapshot(theme);
+        let origin_cell = self.canvas_origin.clone();
+        let size_cell = self.canvas_size.clone();
+        div()
+            .flex_1()
+            .h_full()
+            .bg(theme.inset)
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        origin_cell.set(bounds.origin);
+                        size_cell.set(bounds.size);
+                        (snap, bounds)
+                    },
+                    move |_bounds, (snap, bounds), window, cx| {
+                        paint_sunburst(&snap, bounds, window, cx);
+                    },
+                )
+                .flex_1()
+                .h_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseDownEvent, _, cx| {
+                    let (lx, ly) = view.to_local(ev.position);
+                    let Some(hit) = view.pick_sunburst(lx, ly) else {
+                        view.treemap_hover = None;
+                        cx.notify();
+                        return;
+                    };
+                    // Center circle steps one level up the trail.
+                    if hit == clusters::SunburstHit::Center {
+                        if !view.trail.is_empty() {
+                            view.go_parent(cx);
+                        } else {
+                            view.treemap_hover = None;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    let node = view.sunburst_hit_node(hit);
+                    if ev.click_count >= 2 {
+                        if let Some(i) = node {
+                            if let Some(nd) = view.shown.nodes.get(i) {
+                                let id = nd.id.clone();
+                                view.focus_node(&id, cx);
+                            }
+                        }
+                        return;
+                    }
+                    view.selected = node;
+                    view.treemap_hover = node;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                let (lx, ly) = view.to_local(ev.position);
+                let h = view
+                    .pick_sunburst(lx, ly)
+                    .and_then(|hit| view.sunburst_hit_node(hit));
+                if h != view.treemap_hover {
+                    view.treemap_hover = h;
+                    cx.notify();
+                }
+            }))
+    }
 }
 
 impl Render for RootView {
@@ -1795,6 +1922,7 @@ impl Render for RootView {
         let center = match self.view_mode {
             ViewMode::Graph => self.render_graph_canvas(theme, cx),
             ViewMode::Treemap => self.render_treemap_canvas(theme, cx),
+            ViewMode::Sunburst => self.render_sunburst_canvas(theme, cx),
         };
         let insights = if self.right_open {
             Some(self.render_insights(theme, cx))
@@ -2655,4 +2783,318 @@ fn paint_tree_text(
         return;
     }
     let _ = shaped.paint(point(px(x), px(y)), px(14.), window, cx);
+}
+
+/// Polygon for a sunburst wedge: outer arc sampled forward, inner arc back.
+/// Canvas-local points (the caller offsets by the paint origin).
+fn sunburst_polygon(w: &clusters::SunburstWedge, cx: f32, cy: f32) -> Vec<Point<Pixels>> {
+    let steps = ((w.span() / 0.06).ceil() as usize).clamp(3, 64);
+    let mut pts = Vec::with_capacity(2 * (steps + 1));
+    for i in 0..=steps {
+        let a = w.start + w.span() * i as f32 / steps as f32;
+        pts.push(point(
+            px(cx + w.outer * a.cos()),
+            px(cy + w.outer * a.sin()),
+        ));
+    }
+    for i in (0..=steps).rev() {
+        let a = w.start + w.span() * i as f32 / steps as f32;
+        pts.push(point(
+            px(cx + w.inner * a.cos()),
+            px(cy + w.inner * a.sin()),
+        ));
+    }
+    pts
+}
+
+/// Bostock-style tint: members share their community hue, fading lighter
+/// as member rank falls so adjacent arcs stay distinguishable.
+fn member_shade(base: Hsla, rank: usize, total: usize) -> Hsla {
+    let t = if total > 1 {
+        rank as f32 / (total - 1) as f32
+    } else {
+        0.0
+    };
+    Hsla {
+        h: base.h,
+        s: (base.s * (1.0 - 0.25 * t)).max(0.0),
+        l: (base.l + 0.14 * t).min(0.92),
+        a: base.a,
+    }
+}
+
+/// Sunburst of the Leiden communities: the same hierarchy as the treemap,
+/// radial instead of rectangular. The center disc is the root of the
+/// displayed graph; the inner ring holds one arc per community and the
+/// outer ring fans out community members, each slice proportional to its
+/// PageRank weight. Clicking the center steps one level up the drill-down
+/// trail. Wedges are painted as filled arc polygons (not composed
+/// elements), with selection/hover as stroked outlines on top.
+fn paint_sunburst(snap: &TreeSnapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    let font_size = px(snap.label_font_size);
+
+    let (mcx, mcy, radius) = clusters::sunburst_frame(vw, vh);
+    let wedges = clusters::layout_sunburst(&snap.tree, radius);
+    // Canvas-local → absolute.
+    let placed: Vec<Vec<Point<Pixels>>> = wedges
+        .iter()
+        .map(|w| {
+            sunburst_polygon(w, mcx, mcy)
+                .into_iter()
+                .map(|p| point(px(f32::from(p.x) + ox), px(f32::from(p.y) + oy)))
+                .collect()
+        })
+        .collect();
+    if wedges.is_empty() {
+        let text: SharedString = if snap.tree.is_empty() {
+            snap.summary.clone().into()
+        } else {
+            "Sunburst arcs too small — load a smaller graph or resize.".into()
+        };
+        let run = TextRun {
+            len: text.len(),
+            font: font(&snap.label_font),
+            color: snap.theme.secondary,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let w = f32::from(shaped.width);
+        let h = f32::from(shaped.ascent + shaped.descent);
+        let _ = shaped.paint(
+            point(px(ox + (vw - w) / 2.0), px(oy + (vh - h) / 2.0)),
+            px(14.),
+            window,
+            cx,
+        );
+        return;
+    }
+
+    // Root disc: the whole displayed graph, with an accent rim. This is
+    // what the center-click "up" affordance points at.
+    let root_r = radius * clusters::SUNBURST_CENTER_FRAC;
+    let mut disc_pts = Vec::with_capacity(65);
+    for k in 0..=64 {
+        let a = k as f32 / 64.0 * std::f32::consts::TAU;
+        disc_pts.push(point(
+            px(ox + mcx + root_r * a.cos()),
+            px(oy + mcy + root_r * a.sin()),
+        ));
+    }
+    let mut disc_path = PathBuilder::fill();
+    disc_path.add_polygon(&disc_pts, true);
+    if let Ok(path) = disc_path.build() {
+        window.paint_path(path, snap.theme.surface);
+    }
+    let mut disc_rim = PathBuilder::stroke(px(1.5));
+    disc_rim.add_polygon(&disc_pts, true);
+    if let Ok(path) = disc_rim.build() {
+        window.paint_path(path, snap.theme.accent);
+    }
+    paint_centered_text(
+        snap,
+        snap.theme.foreground,
+        &snap.center_label,
+        ox + mcx,
+        oy + mcy,
+        root_r * 1.6,
+        window,
+        cx,
+    );
+
+    // Fills first, then separators, then selection strokes, so rings never
+    // cover their outlines. Member rank within each community drives the
+    // tint gradient (layout emits members heaviest-first).
+    let mut member_rank = vec![0usize; snap.tree.len()];
+    let mut strokes: Vec<(u8, usize, f32, Hsla)> = Vec::new();
+    for (i, w) in wedges.iter().enumerate() {
+        let base = node_color(&snap.theme, w.community);
+        let fill = match w.node {
+            None => base,
+            Some(_) => {
+                let total = snap
+                    .tree
+                    .get(w.community)
+                    .map(|c| c.members.len())
+                    .unwrap_or(1);
+                let rank = member_rank[w.community].min(total.saturating_sub(1));
+                member_rank[w.community] += 1;
+                member_shade(base, rank, total)
+            }
+        };
+        let mut fill_path = PathBuilder::fill();
+        fill_path.add_polygon(&placed[i], true);
+        if let Ok(path) = fill_path.build() {
+            window.paint_path(path, fill);
+        }
+        let node_here = w.node.filter(|n| Some(*n) == snap.hover_node);
+        let stroke = if w.node.is_some() && w.node == snap.selected_node {
+            Some((3u8, i, 2.0, snap.theme.bright))
+        } else if node_here.is_some() {
+            Some((2, i, 1.0, snap.theme.bright))
+        } else if Some(w.community) == snap.selected_community {
+            Some((1, i, 1.5, highlight(&snap.theme)))
+        } else {
+            None
+        };
+        if let Some(s) = stroke {
+            strokes.push(s);
+        }
+    }
+    // Hairline separators between slices, like the reference's gaps.
+    for pts in &placed {
+        let mut sep = PathBuilder::stroke(px(1.));
+        sep.add_polygon(pts, true);
+        if let Ok(path) = sep.build() {
+            window.paint_path(path, snap.theme.inset);
+        }
+    }
+    strokes.sort_by_key(|(rank, ..)| *rank);
+    for (_, i, width, color) in strokes {
+        let mut stroke_path = PathBuilder::stroke(px(width));
+        stroke_path.add_polygon(&placed[i], true);
+        if let Ok(path) = stroke_path.build() {
+            window.paint_path(path, color);
+        }
+    }
+
+    // Labels, centered on each wedge: every readable community arc, then
+    // the largest member arcs first so the cap keeps informative names.
+    for w in wedges.iter().filter(|w| w.node.is_none()) {
+        if w.arc_len() < 48.0 {
+            continue;
+        }
+        let count = snap
+            .tree
+            .get(w.community)
+            .map(|c| c.members.len())
+            .unwrap_or(0);
+        let label = format!("C{} · {count}", w.community + 1);
+        let a = w.mid_angle();
+        let r = w.mid_radius();
+        paint_centered_text(
+            snap,
+            snap.theme.bright,
+            &label,
+            ox + mcx + r * a.cos(),
+            oy + mcy + r * a.sin(),
+            w.arc_len().min((w.outer - w.inner) * 2.0),
+            window,
+            cx,
+        );
+    }
+    let mut members: Vec<&clusters::SunburstWedge> =
+        wedges.iter().filter(|w| w.node.is_some()).collect();
+    members.sort_by(|a, b| {
+        b.arc_len()
+            .partial_cmp(&a.arc_len())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for w in members.into_iter().take(60) {
+        if w.arc_len() < 56.0 {
+            continue;
+        }
+        let Some(i) = w.node else { continue };
+        let Some(name) = snap.names.get(i) else {
+            continue;
+        };
+        let a = w.mid_angle();
+        let r = w.mid_radius();
+        paint_centered_text(
+            snap,
+            snap.theme.bright,
+            name,
+            ox + mcx + r * a.cos(),
+            oy + mcy + r * a.sin(),
+            w.arc_len() - 8.0,
+            window,
+            cx,
+        );
+    }
+
+    // Summary pill, bottom-left over the disc.
+    let text: SharedString = snap.summary.clone().into();
+    let run = TextRun {
+        len: text.len(),
+        font: font(&snap.label_font),
+        color: snap.theme.secondary,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, font_size, &[run], None);
+    let w = f32::from(shaped.width);
+    let h = f32::from(shaped.ascent + shaped.descent);
+    let pad_x = 6.0;
+    let pad_y = 3.0;
+    window.paint_quad(PaintQuad {
+        bounds: Bounds::new(
+            point(px(ox + 8.0), px(oy + vh - h - pad_y * 2.0 - 8.0)),
+            size(px(w + pad_x * 2.0), px(h + pad_y * 2.0)),
+        ),
+        corner_radii: Corners::all(px(4.)),
+        background: snap.theme.inset.opacity(0.88).into(),
+        border_widths: Edges::default(),
+        border_color: transparent_black(),
+        border_style: BorderStyle::Solid,
+    });
+    let _ = shaped.paint(
+        point(
+            px(ox + 8.0 + pad_x),
+            px(oy + vh - h - pad_y * 2.0 - 8.0 + pad_y),
+        ),
+        px(14.),
+        window,
+        cx,
+    );
+}
+
+/// One sunburst label, centered on its wedge and painted only when the
+/// shaped text fits — nothing may bleed into the neighbour.
+#[allow(clippy::too_many_arguments)]
+fn paint_centered_text(
+    snap: &TreeSnapshot,
+    color: Hsla,
+    label: &str,
+    cx_px: f32,
+    cy_px: f32,
+    max_w: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if max_w < 20.0 {
+        return;
+    }
+    let text: SharedString = label.to_string().into();
+    let run = TextRun {
+        len: text.len(),
+        font: font(&snap.label_font),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, px(snap.label_font_size), &[run], None);
+    let w = f32::from(shaped.width);
+    let h = f32::from(shaped.ascent + shaped.descent);
+    if w > max_w {
+        return;
+    }
+    let _ = shaped.paint(
+        point(px(cx_px - w / 2.0), px(cy_px - h / 2.0)),
+        px(14.),
+        window,
+        cx,
+    );
 }

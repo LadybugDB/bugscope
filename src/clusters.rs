@@ -314,6 +314,175 @@ pub fn hit(tiles: &[Tile], x: f32, y: f32) -> Option<&Tile> {
     tiles.iter().rev().find(|tile| tile.rect.contains(x, y))
 }
 
+/// Sunburst (radial partition) over Leiden communities: pure geometry.
+///
+/// The inner ring holds one arc per community, sized by community weight;
+/// the outer ring subdivides each community's span into member arcs sized
+/// by member weight. Angles start at the top (−π/2) and run clockwise in
+/// screen space (y down). Painting + canvas wiring live in `ui.rs`.
+#[derive(Clone, Debug)]
+pub struct SunburstWedge {
+    /// Position of the community in the layout's community list.
+    pub community: usize,
+    /// `Some(node_idx)` for a member arc, `None` for a community arc.
+    pub node: Option<usize>,
+    /// Angular span in radians, measured clockwise from the top.
+    pub start: f32,
+    pub end: f32,
+    /// Absolute radii in canvas pixels.
+    pub inner: f32,
+    pub outer: f32,
+}
+
+impl SunburstWedge {
+    pub fn span(&self) -> f32 {
+        (self.end - self.start).max(0.0)
+    }
+
+    pub fn mid_angle(&self) -> f32 {
+        (self.start + self.end) / 2.0
+    }
+
+    pub fn mid_radius(&self) -> f32 {
+        (self.inner + self.outer) / 2.0
+    }
+
+    /// Arc length at the mid radius — the readability/hit metric,
+    /// mirroring `min_tile` in the treemap layout.
+    pub fn arc_len(&self) -> f32 {
+        self.span() * self.mid_radius()
+    }
+}
+
+/// Center + radius for the sunburst in a viewport, shared by paint +
+/// hit-testing so both always agree.
+pub fn sunburst_frame(vw: f32, vh: f32) -> (f32, f32, f32) {
+    let w = vw.max(50.0);
+    let h = vh.max(50.0);
+    (w / 2.0, h / 2.0, (w.min(h) / 2.0 - 8.0).max(20.0))
+}
+
+/// Fraction of the radius kept as the center circle (the "up" affordance).
+pub const SUNBURST_CENTER_FRAC: f32 = 0.30;
+
+/// Lay out `communities` as sunburst wedges for a `radius`-px sunburst.
+/// Member arcs narrower than ~2px at their mid radius are dropped — they
+/// can neither be read nor hit, like sub-`min_tile` treemap cells.
+pub fn layout_sunburst(communities: &[Community], radius: f32) -> Vec<SunburstWedge> {
+    let mut wedges = Vec::new();
+    if communities.is_empty() || radius <= 0.0 {
+        return wedges;
+    }
+    let total: f64 = communities.iter().map(|c| c.weight.max(0.0)).sum();
+    let n = communities.len();
+    let two_pi = std::f32::consts::TAU;
+    let base = -std::f32::consts::FRAC_PI_2;
+    let (c_inner, c_outer) = (radius * SUNBURST_CENTER_FRAC, radius * 0.62);
+    let (m_inner, m_outer) = (radius * 0.64, radius * 0.97);
+    let mut a = base;
+    for (pos, comm) in communities.iter().enumerate() {
+        let share = if total > 0.0 {
+            (comm.weight.max(0.0) / total) as f32
+        } else {
+            1.0 / n.max(1) as f32
+        };
+        let (a0, a1) = (a, a + share * two_pi);
+        a = a1;
+        if a1 <= a0 {
+            continue;
+        }
+        wedges.push(SunburstWedge {
+            community: pos,
+            node: None,
+            start: a0,
+            end: a1,
+            inner: c_inner,
+            outer: c_outer,
+        });
+        let mtotal: f64 = comm.weights.iter().map(|w| (*w).max(0.0)).sum();
+        let mcount = comm.members.len().max(1) as f64;
+        let mut ma = a0;
+        for (k, &m) in comm.members.iter().enumerate() {
+            let w = comm.weights.get(k).copied().unwrap_or(1.0).max(0.0);
+            let mspan = if mtotal > 0.0 {
+                (w / mtotal) as f32 * (a1 - a0)
+            } else {
+                (a1 - a0) / mcount as f32
+            };
+            let (m0, m1) = (ma, ma + mspan);
+            ma = m1;
+            if m1 <= m0 {
+                continue;
+            }
+            let wedge = SunburstWedge {
+                community: pos,
+                node: Some(m),
+                start: m0,
+                end: m1,
+                inner: m_inner,
+                outer: m_outer,
+            };
+            if wedge.arc_len() < 2.0 {
+                continue;
+            }
+            wedges.push(wedge);
+        }
+    }
+    wedges
+}
+
+/// Polar pick result for a canvas-local point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SunburstHit {
+    /// Inside the center circle — the "up" affordance.
+    Center,
+    /// A wedge: community position + optional member node index.
+    Wedge {
+        community: usize,
+        node: Option<usize>,
+    },
+}
+
+/// Pick the sunburst at a canvas-local point. `radius` is the outer radius
+/// from [`sunburst_frame`]; points outside it miss (`None`).
+pub fn pick_sunburst(
+    wedges: &[SunburstWedge],
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    x: f32,
+    y: f32,
+) -> Option<SunburstHit> {
+    let dx = x - cx;
+    let dy = y - cy;
+    let r = dx.hypot(dy);
+    if r > radius {
+        return None;
+    }
+    if r < radius * SUNBURST_CENTER_FRAC {
+        return Some(SunburstHit::Center);
+    }
+    let base = -std::f32::consts::FRAC_PI_2;
+    let mut a = dy.atan2(dx) - base;
+    while a < 0.0 {
+        a += std::f32::consts::TAU;
+    }
+    while a >= std::f32::consts::TAU {
+        a -= std::f32::consts::TAU;
+    }
+    let a = a + base;
+    // Outer (member) wedges are emitted after their community arc, so
+    // reverse order prefers the most specific ring — like `hit` above.
+    wedges
+        .iter()
+        .rev()
+        .find(|w| a >= w.start && a < w.end && r >= w.inner && r <= w.outer)
+        .map(|w| SunburstHit::Wedge {
+            community: w.community,
+            node: w.node,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +576,115 @@ mod tests {
         let found = hit(&tiles, cx, cy).expect("a hit");
         assert_eq!(found.node, cell.node);
         assert!(hit(&tiles, -50.0, -50.0).is_none());
+    }
+
+    #[test]
+    fn sunburst_spans_partition_the_circle() {
+        let cs = two_cliques();
+        let wedges = layout_sunburst(&cs, 250.0);
+        let comm_spans: f32 = wedges
+            .iter()
+            .filter(|w| w.node.is_none())
+            .map(|w| w.span())
+            .sum();
+        assert!(
+            (comm_spans - std::f32::consts::TAU).abs() < 1e-3,
+            "community spans cover the circle: {comm_spans}"
+        );
+        // 2 community arcs + 8 member arcs, all members kept at this size.
+        assert_eq!(wedges.iter().filter(|w| w.node.is_none()).count(), 2);
+        assert_eq!(wedges.iter().filter(|w| w.node.is_some()).count(), 8);
+        // Every member span sits inside its parent community span.
+        for m in wedges.iter().filter(|w| w.node.is_some()) {
+            let parent = wedges
+                .iter()
+                .find(|w| w.node.is_none() && w.community == m.community)
+                .expect("parent arc");
+            assert!(m.start >= parent.start - 1e-4 && m.end <= parent.end + 1e-4);
+        }
+    }
+
+    #[test]
+    fn sunburst_pick_resolves_rings() {
+        let cs = two_cliques();
+        let radius = 250.0;
+        let wedges = layout_sunburst(&cs, radius);
+        let (cx, cy, _) = (400.0, 250.0, radius);
+        // Center circle → up affordance; outside → miss.
+        assert_eq!(
+            pick_sunburst(&wedges, cx, cy, radius, cx, cy),
+            Some(SunburstHit::Center)
+        );
+        assert_eq!(
+            pick_sunburst(&wedges, cx, cy, radius, cx + radius + 50.0, cy),
+            None
+        );
+        // A point safely inside the first community arc → that arc. (The
+        // exact midpoint can sit on a shared span boundary in f32.)
+        let first = wedges.iter().find(|w| w.node.is_none()).unwrap();
+        let probe_a = first.start + first.span() * 0.25;
+        let mid_r = first.mid_radius();
+        let x = cx + mid_r * probe_a.cos();
+        let y = cy + mid_r * probe_a.sin();
+        assert_eq!(
+            pick_sunburst(&wedges, cx, cy, radius, x, y),
+            Some(SunburstHit::Wedge {
+                community: first.community,
+                node: None,
+            })
+        );
+        // A member arc midpoint resolves to the member.
+        let member = wedges.iter().find(|w| w.node.is_some()).unwrap();
+        let (ma, mr) = (member.mid_angle(), member.mid_radius());
+        let x = cx + mr * ma.cos();
+        let y = cy + mr * ma.sin();
+        assert_eq!(
+            pick_sunburst(&wedges, cx, cy, radius, x, y),
+            Some(SunburstHit::Wedge {
+                community: member.community,
+                node: member.node,
+            })
+        );
+    }
+
+    #[test]
+    fn sunburst_rings_nest_root_community_member() {
+        let cs = two_cliques();
+        let radius = 250.0;
+        let wedges = layout_sunburst(&cs, radius);
+        // Community ring starts where the root disc ends; members sit
+        // outside their parent ring — root → community → member.
+        for w in wedges.iter().filter(|w| w.node.is_none()) {
+            assert!((w.inner - radius * SUNBURST_CENTER_FRAC).abs() < 1e-3);
+        }
+        for m in wedges.iter().filter(|w| w.node.is_some()) {
+            let parent = wedges
+                .iter()
+                .find(|w| w.node.is_none() && w.community == m.community)
+                .expect("parent arc");
+            assert!(m.inner >= parent.outer - 1e-4);
+            assert!(m.outer <= radius + 1e-3);
+        }
+    }
+
+    #[test]
+    fn sunburst_drops_unreadable_members() {
+        // One heavy node + 200 dust nodes: dust arcs are sub-pixel.
+        let mut assignment = vec![0u64; 201];
+        let mut weights = vec![0.0001f64; 201];
+        assignment[0] = 0;
+        weights[0] = 1000.0;
+        let cs = build_communities(201, &assignment, Some(&weights));
+        assert_eq!(cs.len(), 1);
+        let wedges = layout_sunburst(&cs, 250.0);
+        let members = wedges.iter().filter(|w| w.node.is_some()).count();
+        assert!(members < 201, "dust filtered: {members} kept");
+        assert!(
+            wedges.iter().any(|w| w.node == Some(0)),
+            "heavy member kept"
+        );
+        assert!(layout_sunburst(&[], 250.0).is_empty());
+        assert!(layout_sunburst(&cs, 0.0).is_empty());
     }
 
     #[test]

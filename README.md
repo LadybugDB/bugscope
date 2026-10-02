@@ -15,7 +15,7 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 - **Breadcrumbs + dot-commands** - Drill-down trail under the header (`Root › A › B`, cached jumps) plus query-box `.root` / `.parent` (`.up`/`.back`) and `.schema` / `.data` (schema view without the menu).
 - **Schema View** - Header `Data`/`Schema` toggle (or `.schema` / `.data` in the query box, `File → Toggle Schema View` menu) to switch between node tables and the edge graph. The breadcrumb badge (`schema ✕`) is also a one-click way back to data.
 - **Live Layout** - Force simulation (repulsion + springs + damping) runs at 30 Hz and settles when the layout goes quiet; pause/resume any time.
-- **Leiden Treemap** - Header toggle switches the canvas between the graph and a squarified treemap of Leiden communities (in-process icebug Leiden, same family as `GDS_LEIDEN`); tile area follows PageRank weight. Double-click drills into a neighborhood. Graphs with more than 64 edges open in the treemap by default (smaller ones in the graph view); the toggle still overrides for the current view.
+- **Leiden Treemap + Sunburst** - Header toggle (or `⌘1`/`⌘2`/`⌘3`) switches the canvas between the graph, a squarified treemap of Leiden communities, and a classic sunburst of the same communities (in-process icebug Leiden, same family as `GDS_LEIDEN`): the center disc is the root of the displayed graph, rings move outward with hierarchy depth (communities, then members), and every slice is proportional to PageRank weight with members tinted from their community hue. Double-click drills into a neighborhood; clicking the sunburst center steps one level up the trail. At startup, graphs with more than 64 edges open in the treemap (smaller ones in the graph view); the choice then sticks — navigating never switches views, only the header toggle, menu, or `⌘1`/`⌘2`/`⌘3` do.
 - **Insights Pane** - Collapsible right pane with the top 10 nodes by PageRank plus the Leiden community summary; clicking a row focuses (PageRank) or selects (community) it.
 
 ## Usage
@@ -117,7 +117,7 @@ The backend runs the same Cypher as the Tauri commands (`MATCH (a)-[r]->(b) RETU
 
 ## Deliberately out of scope for v1
 
-Summary-space PageRank sidecars, LLM cluster naming, Voronoi overlay, the lever panel, Arrow IPC transport — all were web-renderer or sidecar concerns in bugscope-tauri. The native port loads the edge graph directly and lays it out live. The sunburst view is skipped for now (arc-heavy painting in GPUI needs more scaffolding than the treemap's rects).
+Summary-space PageRank sidecars, LLM cluster naming, Voronoi overlay, the lever panel, Arrow IPC transport — all were web-renderer or sidecar concerns in bugscope-tauri. The native port loads the edge graph directly and lays it out live.
 
 ### Troubleshooting
 
