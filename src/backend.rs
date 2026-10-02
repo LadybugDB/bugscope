@@ -152,6 +152,12 @@ fn graph_node_from_value(val: &Value) -> Option<GraphNode> {
 }
 
 pub fn open_connection(path: &str) -> Result<Connection<'_>> {
+    // NOTE: if this DB ever ran `LOAD <ext>`, ladybug WAL-logs it and
+    // replays the load on every open — a stale cached extension build
+    // (symbol skew vs liblbug) then fails EVERY open of that file, and no
+    // path/rpath change can fix it. The failing cache path is in the error;
+    // replacing it with a symbol-matching build unblocks the file. See
+    // README troubleshooting.
     let db = Database::new(path, SystemConfig::default())
         .with_context(|| format!("failed to open database {path}"))?;
     // Leak the Database so the Connection can outlive this call, mirroring the
