@@ -821,31 +821,401 @@ pub fn schema_isolated_query(node_types: &[String], limit: Option<usize>) -> Opt
     Some(q)
 }
 
-/// Substring search over node properties — port of `search_nodes` fallback path.
+/// Substring search over node properties, fastest source first. The first
+/// non-empty tier wins per table; a miss falls through to the next:
+///
+/// 1. ART exact/prefix: when the database ships an ART index on a table's
+///    `STRING` columns, that table is queried with sargable equality and
+///    prefix predicates over the indexed columns
+///    (`n.`p` = 'Term' OR n.`p` = 'term' OR STARTS_WITH(...) ...`). Equality
+///    on an ART-indexed column is served straight from the index
+///    (`PRIMARY_KEY_SCAN_NODE_TABLE ... Index: ART` — no table scan); the
+///    prefix disjuncts scan today and ride the index once the planner serves
+///    range probes. Read-only discovery via `CALL SHOW_INDEXES`, exactly
+///    like FTS — an index is never created here.
+/// 2. Full-text search: remaining tables with a pre-existing FTS index go
+///    through `CALL QUERY_FTS_INDEX` (token/BM25 recall, not substring
+///    recall; shared exact-first ranking instead of the score). The FTS
+///    extension is loaded on demand but an index is never built.
+/// 3. Pushed-down `CONTAINS`: per-table `LOWER(CAST(...)) CONTAINS` scan —
+///    the recall net. Filtering runs inside the engine; only matches cross.
+/// 4. Legacy full scan per table, filtered in Rust. Also the designated path
+///    for terms containing `:` (internal `table:offset` ids have no
+///    server-side spelling).
+///
+/// ART is preferred because it lives in the main repo and is far more
+/// storage-efficient than FTS; FTS stays as the generic fallback. Any tier
+/// failing falls through to the next, so results never depend on the faster
+/// paths working.
 pub fn search_nodes(conn: &Connection, query: &str) -> Result<Vec<GraphNode>> {
-    let q = query.trim().to_lowercase();
+    let trimmed = query.trim();
+    let q = trimmed.to_lowercase();
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let mut result = conn.query(&format!("MATCH (n) RETURN n LIMIT {SEARCH_SCAN_LIMIT}"))?;
+    if q.contains(':') {
+        return search_nodes_legacy(conn, query, &q);
+    }
+    let catalog = table_catalog(conn).unwrap_or_default();
+    let node_tables: Vec<String> = catalog
+        .iter()
+        .filter(|(_, _, kind)| kind == "NODE")
+        .map(|(_, name, _)| name.clone())
+        .collect();
+    if node_tables.is_empty() {
+        return search_nodes_legacy(conn, query, &q);
+    }
+    // Index discovery: existing ART columns and FTS indexes by table.
+    // Best-effort and read-only — without them every table simply scans.
+    // ART needs no extension; FTS does (`LOAD fts`, else `INSTALL`+`LOAD`).
+    let mut art_by_table: HashMap<String, Vec<String>> = HashMap::new();
+    for col in art_columns(conn) {
+        art_by_table
+            .entry(col.table.clone())
+            .or_default()
+            .push(col.property.clone());
+    }
+    let mut fts_by_table: HashMap<String, Vec<FtsIndex>> = HashMap::new();
+    if ensure_fts_extension(conn) {
+        for idx in fts_indexes(conn) {
+            fts_by_table.entry(idx.table.clone()).or_default().push(idx);
+        }
+    }
     let mut matches = Vec::new();
-    'rows: for row in &mut result {
+    'tables: for table in &node_tables {
+        let before = matches.len();
+        // Tier 1: ART exact/prefix over ART-indexed STRING columns.
+        if let Some(cols) = art_by_table.get(table) {
+            if let Ok(props) = table_properties(conn, table) {
+                let string_cols: Vec<String> = props
+                    .iter()
+                    .filter(|(p, t)| t.eq_ignore_ascii_case("STRING") && cols.contains(p))
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                if !string_cols.is_empty() {
+                    let _ = search_nodes_art_table(
+                        conn,
+                        table,
+                        &string_cols,
+                        trimmed,
+                        &q,
+                        &mut matches,
+                    );
+                }
+            }
+        }
+        // Tier 2: FTS — only when tier 1 found nothing.
+        if matches.len() == before {
+            if let Some(indexes) = fts_by_table.get(table) {
+                if !indexes.is_empty() {
+                    let queried =
+                        search_nodes_fts_table(conn, table, indexes, trimmed, &mut matches).is_ok();
+                    // No FTS recall (or a failed call): tier 3 keeps recall.
+                    // NOTE: only discovered indexes are ever queried. A
+                    // *failed* QUERY_FTS_INDEX is an engine bug that can
+                    // poison teardown (process abort on drop), so
+                    // unreachable calls stay out.
+                    if (!queried || matches.len() == before)
+                        && search_nodes_server_table(conn, table, &q, &mut matches).is_err()
+                    {
+                        let _ = search_nodes_legacy_table(conn, table, &q, &mut matches);
+                    }
+                }
+            }
+        }
+        // Tiers 3/4: pushed CONTAINS, then legacy — when no index hit.
+        // The FTS arm above already ran tier 3 itself on a miss, so only
+        // tables without FTS indexes reach this.
+        if matches.len() == before
+            && fts_by_table.get(table).is_none_or(|v| v.is_empty())
+            && search_nodes_server_table(conn, table, &q, &mut matches).is_err()
+        {
+            let _ = search_nodes_legacy_table(conn, table, &q, &mut matches);
+        }
+        if matches.len() >= SEARCH_RESULT_LIMIT {
+            break 'tables;
+        }
+    }
+    // Tiers can overlap on error-partial pushes; dedupe before ranking.
+    let mut seen: HashSet<String> = HashSet::new();
+    matches.retain(|n| seen.insert(n.id.clone()));
+    sort_search_results(&mut matches, query);
+    matches.truncate(SEARCH_RESULT_LIMIT);
+    Ok(matches)
+}
+
+/// An existing full-text-search index on a node table. Discovered read-only
+/// via `SHOW_INDEXES`; never created by this app.
+#[derive(Debug, Clone)]
+pub struct FtsIndex {
+    pub table: String,
+    pub name: String,
+}
+
+/// Install the FTS extension from the official repo
+/// (`https://extension.ladybugdb.com`). A no-op when already installed.
+/// Returns false when the download fails (e.g. offline). Never fails the caller.
+/// This installs/loads the extension module only — it never builds an index.
+pub fn install_fts_extension(conn: &Connection) -> bool {
+    conn.query("INSTALL fts").is_ok()
+}
+
+/// Load the FTS extension on this connection. Returns true when the
+/// `QUERY_FTS_INDEX` surface is available. Never fails the caller.
+/// Mirrors [`ensure_algo_extension`]: per-connection load, `INSTALL` on
+/// demand, `BUGSCOPE_FTS_EXTENSION` escape hatch for local builds.
+/// Loads the module only — index creation stays out of scope by design.
+pub fn ensure_fts_extension(conn: &Connection) -> bool {
+    if let Some(path) = std::env::var_os("BUGSCOPE_FTS_EXTENSION").map(PathBuf::from) {
+        let full = path.to_string_lossy().replace('\\', "/");
+        if conn.query(&format!("LOAD EXTENSION '{full}'")).is_ok() {
+            return true;
+        }
+        let stem = full
+            .strip_suffix(".lbug_extension")
+            .unwrap_or(&full)
+            .to_string();
+        if conn.query(&format!("LOAD EXTENSION '{stem}'")).is_ok() {
+            return true;
+        }
+    }
+    if conn.query("LOAD fts").is_ok() {
+        return true;
+    }
+    if install_fts_extension(conn) {
+        return conn.query("LOAD fts").is_ok();
+    }
+    false
+}
+
+/// Existing FTS indexes from `CALL SHOW_INDEXES`, filtered to
+/// `index type = FTS`. Read-only discovery; never creates anything.
+pub fn fts_indexes(conn: &Connection) -> Vec<FtsIndex> {
+    let mut out = Vec::new();
+    let Ok(mut result) = conn.query("CALL SHOW_INDEXES() RETURN *") else {
+        return out;
+    };
+    for row in &mut result {
+        let Some(parsed) = parse_show_index_row(&row) else {
+            continue;
+        };
+        if !parsed.kind.eq_ignore_ascii_case("fts") {
+            continue;
+        }
+        out.push(FtsIndex {
+            table: parsed.table,
+            name: parsed.name,
+        });
+    }
+    out
+}
+
+/// One ART-indexed column: `property` of `table`. Discovered read-only via
+/// `SHOW_INDEXES`; never created by this app.
+#[derive(Debug, Clone)]
+pub struct ArtColumn {
+    pub table: String,
+    pub property: String,
+}
+
+/// Existing ART-indexed columns from `CALL SHOW_INDEXES`, filtered to
+/// `index type = ART` with their indexed properties exploded.
+/// Read-only discovery; never creates anything.
+pub fn art_columns(conn: &Connection) -> Vec<ArtColumn> {
+    let mut out = Vec::new();
+    let Ok(mut result) = conn.query("CALL SHOW_INDEXES() RETURN *") else {
+        return out;
+    };
+    for row in &mut result {
+        let Some(parsed) = parse_show_index_row(&row) else {
+            continue;
+        };
+        if !parsed.kind.eq_ignore_ascii_case("art") {
+            continue;
+        }
+        for property in parsed.properties {
+            if property.is_empty() {
+                continue;
+            }
+            out.push(ArtColumn {
+                table: parsed.table.clone(),
+                property,
+            });
+        }
+    }
+    out
+}
+
+/// One `SHOW_INDEXES` row: (table, index, type, properties, ...).
+/// Columns are (table, index, type, properties, extension loaded,
+/// definition); the tail is ignored. Pure function so the filter is
+/// unit-testable without an engine.
+struct ShowIndex {
+    table: String,
+    name: String,
+    kind: String,
+    properties: Vec<String>,
+}
+
+fn parse_show_index_row(row: &[Value]) -> Option<ShowIndex> {
+    if row.len() < 3 {
+        return None;
+    }
+    let (Value::String(table), Value::String(name), Value::String(kind)) =
+        (&row[0], &row[1], &row[2])
+    else {
+        return None;
+    };
+    if table.is_empty() || name.is_empty() || kind.is_empty() {
+        return None;
+    }
+    let properties = match row.get(3) {
+        Some(Value::List(_, items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(ShowIndex {
+        table: table.clone(),
+        name: name.clone(),
+        kind: kind.clone(),
+        properties,
+    })
+}
+
+/// Tier 1: exact + prefix matches over ART-indexed STRING columns.
+/// Predicates stay sargable on the raw column (`=` and `STARTS_WITH`, both
+/// the typed and lowercased constant) so the planner can answer equality
+/// from the ART index without scanning. Rows are post-filtered with the
+/// exact legacy predicate. `Err` on any engine failure so the caller can
+/// fall through to the next tier.
+fn search_nodes_art_table(
+    conn: &Connection,
+    table: &str,
+    cols: &[String],
+    term: &str,
+    q: &str,
+    matches: &mut Vec<GraphNode>,
+) -> Result<()> {
+    let mut result = conn.query(&art_match_query(table, cols, term, q))?;
+    for row in &mut result {
         for val in row.iter() {
             let Some(n) = graph_node_from_value(val) else {
                 continue;
             };
-            if n.name.to_lowercase().contains(&q)
-                || n.id.to_lowercase().contains(&q)
-                || n.label.to_lowercase().contains(&q)
-                || n.properties.values().any(|v| v.to_lowercase().contains(&q))
-            {
+            if search_node_matches(&n, q) {
                 matches.push(n);
                 if matches.len() >= SEARCH_RESULT_LIMIT {
-                    break 'rows;
+                    return Ok(());
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Pure builder for the ART tier query (unit-tested shape; the engine
+/// decides whether the ART index serves it).
+fn art_match_query(table: &str, cols: &[String], term: &str, lower: &str) -> String {
+    let consts: Vec<&str> = if lower != term {
+        vec![term, lower]
+    } else {
+        vec![term]
+    };
+    let mut preds = Vec::new();
+    for c in cols {
+        let col = format!("n.{}", escape_cypher_label(c));
+        for k in &consts {
+            let lit = cypher_string_literal(k);
+            preds.push(format!("{col} = {lit}"));
+            preds.push(format!("STARTS_WITH({col}, {lit})"));
+        }
+    }
+    format!(
+        "MATCH (n:{}) WHERE {} RETURN n LIMIT {}",
+        escape_cypher_label(table),
+        preds.join(" OR "),
+        SEARCH_RESULT_LIMIT
+    )
+}
+
+/// Tier 1: query every FTS index on `table` (`top := 50` each), unioned and
+/// deduped by node id. No substring post-filter: FTS recall (stems, token
+/// matches) is the point of using the index. `Err` on any engine failure so
+/// the caller can fall back to tier 2.
+fn search_nodes_fts_table(
+    conn: &Connection,
+    table: &str,
+    indexes: &[FtsIndex],
+    term: &str,
+    matches: &mut Vec<GraphNode>,
+) -> Result<()> {
+    let mut seen: HashSet<String> = matches.iter().map(|n| n.id.clone()).collect();
+    for idx in indexes {
+        let mut result = conn.query(&format!(
+            "CALL QUERY_FTS_INDEX({}, {}, {}, top := {}) RETURN node, score",
+            cypher_string_literal(table),
+            cypher_string_literal(&idx.name),
+            cypher_string_literal(term),
+            SEARCH_RESULT_LIMIT
+        ))?;
+        for row in &mut result {
+            let Some(val) = row.first() else {
+                continue;
+            };
+            let Some(n) = graph_node_from_value(val) else {
+                continue;
+            };
+            if seen.insert(n.id.clone()) {
+                matches.push(n);
+                if matches.len() >= SEARCH_RESULT_LIMIT {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cypher string literal: backslashes first, then single quotes.
+fn cypher_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// `(property name, type name)` rows from `CALL TABLE_INFO`.
+fn table_properties(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut result = conn.query(&format!(
+        "CALL TABLE_INFO({}) RETURN *",
+        cypher_string_literal(table)
+    ))?;
+    for row in &mut result {
+        if row.len() < 3 {
+            continue;
+        }
+        let (Value::String(name), Value::String(typ)) = (&row[1], &row[2]) else {
+            continue;
+        };
+        out.push((name.clone(), typ.clone()));
+    }
+    Ok(out)
+}
+
+/// The exact legacy predicate, shared by every path: case-insensitive
+/// substring over display name, internal id, label, and all properties.
+fn search_node_matches(n: &GraphNode, q: &str) -> bool {
+    n.name.to_lowercase().contains(q)
+        || n.id.to_lowercase().contains(q)
+        || n.label.to_lowercase().contains(q)
+        || n.properties.values().any(|v| v.to_lowercase().contains(q))
+}
+
+/// Legacy ranking, shared by every path: exact name/id first, then by name.
+fn sort_search_results(matches: &mut [GraphNode], query: &str) {
     matches.sort_by(|a, b| {
         let a_exact = a.name.eq_ignore_ascii_case(query) || a.id.eq_ignore_ascii_case(query);
         let b_exact = b.name.eq_ignore_ascii_case(query) || b.id.eq_ignore_ascii_case(query);
@@ -853,6 +1223,102 @@ pub fn search_nodes(conn: &Connection, query: &str) -> Result<Vec<GraphNode>> {
             .cmp(&a_exact)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+}
+
+/// Server-side search of one node table. Returns `Err` on any engine
+/// failure so the caller can fall back per table. Rows are post-filtered
+/// with the exact legacy predicate: engine `CAST AS STRING` formatting can
+/// drift from the Rust rendering on exotic types, and the post-filter keeps
+/// the fast path from ever returning rows the legacy scan wouldn't.
+fn search_nodes_server_table(
+    conn: &Connection,
+    table: &str,
+    q: &str,
+    matches: &mut Vec<GraphNode>,
+) -> Result<()> {
+    let props = table_properties(conn, table)?;
+    if props.is_empty() {
+        return Ok(());
+    }
+    let lit = cypher_string_literal(q);
+    let mut preds: Vec<String> = props
+        .iter()
+        .map(|(p, _)| {
+            format!(
+                "LOWER(CAST(n:{} AS STRING)) CONTAINS {lit}",
+                escape_cypher_label(p)
+            )
+        })
+        .collect();
+    preds.push(format!("LOWER(label(n)) CONTAINS {lit}"));
+    let mut result = conn.query(&format!(
+        "MATCH (n:{}) WHERE {} RETURN n LIMIT {}",
+        escape_cypher_label(table),
+        preds.join(" OR "),
+        SEARCH_RESULT_LIMIT
+    ))?;
+    for row in &mut result {
+        for val in row.iter() {
+            let Some(n) = graph_node_from_value(val) else {
+                continue;
+            };
+            if search_node_matches(&n, q) {
+                matches.push(n);
+                if matches.len() >= SEARCH_RESULT_LIMIT {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Legacy scan of one node table with the exact legacy predicate.
+fn search_nodes_legacy_table(
+    conn: &Connection,
+    table: &str,
+    q: &str,
+    matches: &mut Vec<GraphNode>,
+) -> Result<()> {
+    let mut result = conn.query(&format!(
+        "MATCH (n:{}) RETURN n LIMIT {SEARCH_SCAN_LIMIT}",
+        escape_cypher_label(table)
+    ))?;
+    for row in &mut result {
+        for val in row.iter() {
+            let Some(n) = graph_node_from_value(val) else {
+                continue;
+            };
+            if search_node_matches(&n, q) {
+                matches.push(n);
+                if matches.len() >= SEARCH_RESULT_LIMIT {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Legacy full scan: every node materialized, filtered in Rust. Kept as the
+/// fallback (and for `:` terms matching internal ids).
+fn search_nodes_legacy(conn: &Connection, query: &str, q: &str) -> Result<Vec<GraphNode>> {
+    let mut result = conn.query(&format!("MATCH (n) RETURN n LIMIT {SEARCH_SCAN_LIMIT}"))?;
+    let mut matches = Vec::new();
+    'rows: for row in &mut result {
+        for val in row.iter() {
+            let Some(n) = graph_node_from_value(val) else {
+                continue;
+            };
+            if search_node_matches(&n, q) {
+                matches.push(n);
+                if matches.len() >= SEARCH_RESULT_LIMIT {
+                    break 'rows;
+                }
+            }
+        }
+    }
+    sort_search_results(&mut matches, query);
     Ok(matches)
 }
 
@@ -1173,6 +1639,77 @@ mod tests {
             Some("MATCH (n:Person) WHERE NOT (n)--() RETURN n LIMIT 50".to_string())
         );
         assert_eq!(schema_isolated_query(&[], None), None);
+    }
+
+    #[test]
+    fn show_index_row_parsing_and_filters() {
+        let row = |cells: Vec<Value>| parse_show_index_row(&cells);
+        let s = |v: &str| Value::String(v.to_string());
+        // FTS row: table + name + kind + decoded properties.
+        let fts = row(vec![
+            s("Book"),
+            s("book_index"),
+            s("FTS"),
+            Value::List(lbug::LogicalType::String, vec![s("title")]),
+            Value::Bool(true),
+            s("CALL CREATE_FTS_INDEX('Book', 'book_index', ['title'])"),
+        ])
+        .expect("fts row parses");
+        assert_eq!(fts.table, "Book");
+        assert_eq!(fts.name, "book_index");
+        assert!(fts.kind.eq_ignore_ascii_case("fts"));
+        assert_eq!(fts.properties, vec!["title".to_string()]);
+        // ART row parses the same way; the kind filter selects it.
+        let art = row(vec![
+            s("P"),
+            s("pname"),
+            s("ART"),
+            Value::List(lbug::LogicalType::String, vec![s("name"), Value::Int64(7)]),
+            Value::Bool(true),
+            s(""),
+        ])
+        .expect("art row parses");
+        assert!(art.kind.eq_ignore_ascii_case("art"));
+        assert!(!art.kind.eq_ignore_ascii_case("fts"));
+        // Non-string properties are skipped, not fatal.
+        assert_eq!(art.properties, vec!["name".to_string()]);
+        // Missing properties column tolerates older shapes.
+        let bare = row(vec![s("T"), s("_PK"), s("HASH")]).expect("short row parses");
+        assert!(bare.properties.is_empty());
+        // Malformed rows never parse.
+        assert!(row(vec![s("T"), s("i")]).is_none());
+        assert!(row(vec![s(""), s("i"), s("FTS")]).is_none());
+        assert!(row(vec![s("T"), s(""), s("FTS")]).is_none());
+        assert!(row(vec![s("T"), s("i"), s("")]).is_none());
+        assert!(row(vec![Value::UInt64(0), s("i"), s("FTS")]).is_none());
+    }
+
+    #[test]
+    fn art_match_query_shapes() {
+        let cols = vec!["name".to_string()];
+        // Mixed case: both the typed and lowercased constants, exact then
+        // prefix per column — all sargable on the raw column.
+        assert_eq!(
+            art_match_query("P", &cols, "Smith", "smith"),
+            "MATCH (n:P) WHERE n.name = 'Smith' OR STARTS_WITH(n.name, 'Smith') \
+             OR n.name = 'smith' OR STARTS_WITH(n.name, 'smith') \
+             RETURN n LIMIT 50"
+        );
+        // Already lowercase: constants deduped.
+        assert_eq!(
+            art_match_query("P", &cols, "smith", "smith"),
+            "MATCH (n:P) WHERE n.name = 'smith' OR STARTS_WITH(n.name, 'smith') \
+             RETURN n LIMIT 50"
+        );
+        // Multiple columns, escaped identifiers and literals.
+        assert_eq!(
+            art_match_query("T", &["a".to_string(), "my prop".to_string()], "O'B", "o'b"),
+            "MATCH (n:T) WHERE n.a = 'O\\'B' OR STARTS_WITH(n.a, 'O\\'B') \
+             OR n.a = 'o\\'b' OR STARTS_WITH(n.a, 'o\\'b') \
+             OR n.`my prop` = 'O\\'B' OR STARTS_WITH(n.`my prop`, 'O\\'B') \
+             OR n.`my prop` = 'o\\'b' OR STARTS_WITH(n.`my prop`, 'o\\'b') \
+             RETURN n LIMIT 50"
+        );
     }
 
     fn open_ephemeral() -> (tempfile::TempDir, Database) {
