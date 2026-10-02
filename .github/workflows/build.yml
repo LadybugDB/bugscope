@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,8 +31,14 @@ jobs:
         run: |
           # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          # LLVM repo for libomp matching the icebug prebuilt binaries.
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
+          echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
+          wget https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
+          sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
@@ -65,6 +72,12 @@ jobs:
           path: ~/.cargo/registry/src/**/lbug-*/.cache
           key: lbug-prebuilt-${{ env.LBUG_VERSION }}-${{ runner.os }}
           restore-keys: lbug-prebuilt-
+
+      - name: Download icebug prebuilt
+        run: bash scripts/download_icebug.sh
+
+      - name: Download shared liblbug
+        run: bash scripts/download-liblbug.sh
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -118,15 +131,21 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: matrix.platform == 'macos-latest'
-        run: brew install libomp openssl
+        run: brew install libomp apache-arrow cmake openssl
 
       - name: Install dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           # lbug's C++ bridge needs <format> (C++20): jammy's gcc-11 is too old.
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          # LLVM repo for libomp matching the icebug prebuilt binaries.
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
+          echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
+          wget https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
+          sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
@@ -154,6 +173,44 @@ jobs:
           Get-ChildItem $stage | Select-Object Name, Length
           echo "LIB=$stage" >> "$env:GITHUB_ENV"
 
+      - name: Create vcpkg manifest (Windows)
+        if: matrix.platform == 'windows-2022'
+        shell: bash
+        run: |
+          cat > vcpkg.json << 'EOF'
+          {
+            "name": "bugscope-deps",
+            "version": "1.0.0",
+            "dependencies": [
+              "arrow",
+              "pkgconf"
+            ]
+          }
+          EOF
+
+      - name: Setup vcpkg (Windows)
+        if: matrix.platform == 'windows-2022'
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '14d83b1c34655a6af6f044aa1679f668c0b0b70e'
+
+      - name: Authenticate vcpkg NuGet (Windows)
+        if: matrix.platform == 'windows-2022'
+        shell: pwsh
+        run: |
+          $nuget = & $env:VCPKG_ROOT/vcpkg fetch nuget | Out-String
+          $nuget = $nuget.Trim()
+          & $nuget sources add -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" -Name "GitHubPackages" -Username "${{ github.repository_owner }}" -Password "${{ secrets.GITHUB_TOKEN }}" -StorePasswordInClearText -Verbosity detailed
+          & $nuget setapikey "${{ secrets.GITHUB_TOKEN }}" -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+
+      - name: Install vcpkg packages (Windows)
+        if: matrix.platform == 'windows-2022'
+        shell: pwsh
+        run: |
+          & $env:VCPKG_ROOT/vcpkg install --recurse --clean-after-build --triplet x64-windows
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite'
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -171,6 +228,55 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Download icebug prebuilt
+        shell: bash
+        run: bash scripts/download_icebug.sh
+
+      - name: Download shared liblbug
+        shell: bash
+        run: bash scripts/download-liblbug.sh
+
+      - name: Vendor arrow/openmp runtimes (macOS/Linux)
+        if: matrix.platform != 'windows-2022'
+        shell: bash
+        # The INSTALL'd algo extension references @rpath/libarrow, resolved
+        # against our rpaths: vendor the system libs next to libnetworkit.
+        run: bash scripts/vendor_arrow.sh
+
+      - name: Configure macOS build env
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          # Apple clang doesn't search Homebrew libomp without this (icebug's
+          # cxx bridge includes networkit headers needing omp.h). Mirrors
+          # ../bugscope's CXXFLAGS on its macOS build step.
+          echo "CXXFLAGS=-I/opt/homebrew/opt/libomp/include" >> "$GITHUB_ENV"
+
+      - name: Configure Windows build env
+        if: matrix.platform == 'windows-2022'
+        shell: bash
+        run: |
+          echo "PKG_CONFIG_PATH=$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/std:c++20" >> "$GITHUB_ENV"
+
+      - name: Test GDS_PAGE_RANK
+        shell: bash
+        run: |
+          # The test INSTALLs the algo extension from the official repo and
+          # LOADs it at runtime: its libarrow dep resolves via our rpaths
+          # (vendored above) on Unix, via PATH (vcpkg) on Windows.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="$(cygpath -w "$GITHUB_WORKSPACE/icebug/lib");$(cygpath -w "$GITHUB_WORKSPACE/liblbug");$(cygpath -w "$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin");$PATH"
+            export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/lib/pkgconfig"
+            export CXXFLAGS="/std:c++20"
+          else
+            export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/icebug/lib:$GITHUB_WORKSPACE/liblbug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+          # --lib --test selects only these targets so the GUI binary
+          # itself is not linked here (it gets built in the next step).
+          cargo test --release --target ${{ matrix.target }} --lib --test gds_page_rank
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -191,6 +297,8 @@ jobs:
           mkdir -p dist/Bugscope.app/Contents/MacOS dist/Bugscope.app/Contents/Resources
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/Bugscope.app/Contents/MacOS/bugscope
           sed "s|@VERSION@|${version}|g" packaging/macos/Info.plist > dist/Bugscope.app/Contents/Info.plist
+          # Bundle icebug shared libs + algo extension (GDS_* via Cypher).
+          bash scripts/stage_macos_bundle.sh dist/Bugscope.app
           codesign --deep --force -s - dist/Bugscope.app
           archive="dist/bugscope-${version}-${{ matrix.target }}-macos.zip"
           ditto -c -k --keepParent dist/Bugscope.app "$archive"
@@ -209,6 +317,17 @@ jobs:
           rm -rf dist && mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
           strip "dist/$name/${{ matrix.binary }}"
+          # Bundle icebug shared libs + algo extension (GDS_* via Cypher).
+          # $ORIGIN/icebug/lib and $ORIGIN are baked rpaths (see .cargo/config.toml).
+          mkdir -p "dist/$name/icebug" "dist/$name/liblbug"
+          cp -r icebug/lib "dist/$name/icebug/"
+          cp liblbug/liblbug.so* "dist/$name/liblbug/"
+          # Best-effort: vendor libomp/libarrow so the tarball runs without
+          # system installs (the exe uses RPATH, not RUNPATH, so transitive
+          # deps resolve from these dirs too).
+          for dep in $(ldd "dist/$name/${{ matrix.binary }}" | grep -oE '/[^ ]*lib(arrow|omp)[^ ]*\.so[^ ]*' | sort -u); do
+            cp -f -n "$dep" "dist/$name/icebug/lib/" 2>/dev/null || true
+          done
           cp README.md "dist/$name/"
           echo "$version" > "dist/$name/VERSION"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
@@ -227,6 +346,14 @@ jobs:
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}", README.md "dist/$name/"
+          # Bundle icebug DLLs + algo extension (GDS_* via Cypher) next to the exe.
+          New-Item -ItemType Directory -Force "dist/$name/icebug/lib" | Out-Null
+          New-Item -ItemType Directory -Force "dist/$name/liblbug" | Out-Null
+          Get-ChildItem "icebug/lib" -Filter *.dll -Recurse | ForEach-Object { Copy-Item $_.FullName "dist/$name/icebug/lib/" }
+          Get-ChildItem "liblbug" -Filter *.dll | ForEach-Object { Copy-Item $_.FullName "dist/$name/liblbug/" }
+          # The INSTALL'd algo extension loads arrow dynamically: ship the
+          # vcpkg arrow DLLs next to the binary (on PATH at runtime).
+          Get-ChildItem "vcpkg_installed/x64-windows/bin" -Filter arrow*.dll | ForEach-Object { Copy-Item $_.FullName "dist/$name/icebug/lib/" }
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
