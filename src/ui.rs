@@ -47,6 +47,22 @@ pub enum ViewMode {
     Treemap,
 }
 
+/// Auto-switch threshold: a displayed graph with more than this many edges
+/// opens in the treemap view by default (the Leiden overview scales better
+/// than the force graph); smaller ones open in the graph view. Applies on
+/// every graph change (load, Cypher, drill-down); the header toggle still
+/// overrides for the current view.
+pub const TREEMAP_AUTO_EDGES: usize = 64;
+
+/// Default view for an edge count: treemap above the threshold.
+pub fn auto_view_mode(edge_count: usize) -> ViewMode {
+    if edge_count > TREEMAP_AUTO_EDGES {
+        ViewMode::Treemap
+    } else {
+        ViewMode::Graph
+    }
+}
+
 /// One step of the drill-down trail: a focused 1-hop neighborhood.
 /// `label` is captured at focus time so breadcrumbs stay readable even
 /// after `full` is replaced (Cypher / reload).
@@ -302,6 +318,7 @@ impl RootView {
                 self.panning = None;
                 self.search_results.clear();
                 self.running = !self.schema_mode;
+                self.view_mode = auto_view_mode(data.links.len());
                 self.shown = data;
                 self.refresh_analytics();
                 self.set_status(msg, cx);
@@ -351,6 +368,7 @@ impl RootView {
         if focused.is_some() {
             self.running = true;
         }
+        self.view_mode = auto_view_mode(data.links.len());
         self.shown = data;
         self.refresh_analytics();
         self.set_status(status, cx);
@@ -804,6 +822,7 @@ impl RootView {
                     self.frame_initial(None);
                     self.running = !data.nodes.is_empty() && !self.schema_mode;
                     let (nn, ne) = (data.nodes.len(), data.links.len());
+                    self.view_mode = auto_view_mode(ne);
                     self.shown = data;
                     self.refresh_analytics();
                     self.set_status(format!("Cypher: {nn} nodes, {ne} edges"), cx);
