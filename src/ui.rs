@@ -333,7 +333,11 @@ impl RootView {
                 self.refresh_analytics();
                 self.set_status(msg, cx);
             }
-            Err(e) => self.set_status(format!("Load failed: {e:#}"), cx),
+            Err(e) => {
+                // Also stderr: window status is invisible on headless runs.
+                eprintln!("bugscope: load failed: {e:#}");
+                self.set_status(format!("Load failed: {e:#}"), cx)
+            }
         }
     }
 
@@ -882,7 +886,10 @@ impl RootView {
                     self.set_status(format!("Cypher: {nn} nodes, {ne} edges"), cx);
                 }
             }
-            Err(e) => self.set_status(format!("Query failed: {e:#}"), cx),
+            Err(e) => {
+                eprintln!("bugscope: query failed: {e:#}");
+                self.set_status(format!("Query failed: {e:#}"), cx)
+            }
         }
     }
 
