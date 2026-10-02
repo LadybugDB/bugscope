@@ -3,6 +3,7 @@
 
 use crate::backend::{self, DatabaseInfo, GraphData, GraphNode};
 use crate::cli::CliOptions;
+use crate::clusters;
 use crate::model::{node_size, Camera, GraphModel, Vec2};
 use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
@@ -38,6 +39,39 @@ struct SnapNode {
     name: String,
 }
 
+/// Center-pane view: force-directed graph or Leiden treemap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Graph,
+    Treemap,
+}
+
+/// One row of the Top PageRank list in the insights pane.
+#[derive(Clone)]
+struct TopRank {
+    id: String,
+    name: String,
+    label: String,
+    score: f64,
+}
+
+/// Everything the treemap needs for one frame: the Leiden communities
+/// (largest first, shared with hit-testing via the same `Rc`), truncated
+/// names per displayed node, and the hover/selection to outline.
+#[derive(Clone)]
+struct TreeSnapshot {
+    tree: Rc<Vec<clusters::Community>>,
+    names: Rc<Vec<String>>,
+    theme: Theme,
+    hover_node: Option<usize>,
+    selected_node: Option<usize>,
+    selected_community: Option<usize>,
+    label_font: String,
+    label_font_size: f32,
+    summary: String,
+}
+
 pub struct RootView {
     databases: Vec<DatabaseInfo>,
     selected_db: Option<usize>,
@@ -45,6 +79,26 @@ pub struct RootView {
     full: GraphData,
     model: GraphModel,
     camera: Camera,
+    /// Center-pane view, switched by the header toggle.
+    view_mode: ViewMode,
+    /// Currently displayed graph, in model order: full scan, Cypher result,
+    /// or 1-hop neighborhood. Analytics (Leiden/PageRank) run over this.
+    shown: GraphData,
+    /// Leiden community per displayed node + modularity + status line.
+    communities: Vec<u64>,
+    cluster_modularity: f64,
+    cluster_status: String,
+    /// PageRank score per displayed node, and the top 10 with names.
+    scores: Vec<f64>,
+    top_ranks: Vec<TopRank>,
+    /// Leiden communities largest-first with truncated names, shared by
+    /// paint + hit-testing so both always agree.
+    tree: Rc<Vec<clusters::Community>>,
+    tree_names: Rc<Vec<String>>,
+    /// Displayed-node index under the treemap cursor.
+    treemap_hover: Option<usize>,
+    /// Collapsible right insights pane (Top PageRank + Leiden summary).
+    right_open: bool,
     status: String,
     query: String,
     /// Byte offset of the text cursor inside `query` (always a char boundary).
@@ -122,6 +176,17 @@ impl RootView {
             full: GraphData::default(),
             model: GraphModel::default(),
             camera: Camera::default(),
+            view_mode: ViewMode::Graph,
+            shown: GraphData::default(),
+            communities: Vec::new(),
+            cluster_modularity: 0.0,
+            cluster_status: "No graph loaded.".to_string(),
+            scores: Vec::new(),
+            top_ranks: Vec::new(),
+            tree: Rc::new(Vec::new()),
+            tree_names: Rc::new(Vec::new()),
+            treemap_hover: None,
+            right_open: true,
             status: "Pick a database to begin.".to_string(),
             query: String::new(),
             query_cursor: 0,
@@ -217,6 +282,8 @@ impl RootView {
                 self.focused = None;
                 self.selected = None;
                 self.running = !self.schema_mode;
+                self.shown = data;
+                self.refresh_analytics();
                 self.set_status(msg, cx);
             }
             Err(e) => self.set_status(format!("Load failed: {e:#}"), cx),
@@ -272,6 +339,134 @@ impl RootView {
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         cx.notify();
+    }
+
+    /// Header toggle + menu actions for the center-pane view.
+    pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.view_mode = mode;
+        cx.notify();
+    }
+
+    pub fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+        self.right_open = !self.right_open;
+        cx.notify();
+    }
+
+    /// Recompute Leiden communities + PageRank over the displayed graph.
+    /// Runs synchronously: loaders cap the graph at 10–20k nodes, where
+    /// both algorithms finish in well under a second.
+    fn refresh_analytics(&mut self) {
+        let n = self.shown.nodes.len();
+        if n == 0 {
+            self.communities.clear();
+            self.scores.clear();
+            self.top_ranks.clear();
+            self.cluster_modularity = 0.0;
+            self.cluster_status = "No graph loaded.".to_string();
+            self.tree = Rc::new(Vec::new());
+            self.tree_names = Rc::new(Vec::new());
+            self.treemap_hover = None;
+            return;
+        }
+        let (assignment, modularity, _) = backend::graphr_leiden_full(&self.shown);
+        self.communities = assignment;
+        self.cluster_modularity = modularity;
+        let mut distinct = self.communities.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        self.cluster_status = format!(
+            "{} Leiden communities · Q={:.2}",
+            distinct.len(),
+            modularity
+        );
+        let ranks = backend::graphr_page_rank(&self.shown);
+        let score_of: std::collections::HashMap<&str, f64> =
+            ranks.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        self.scores = self
+            .shown
+            .nodes
+            .iter()
+            .map(|nd| score_of.get(nd.id.as_str()).copied().unwrap_or(0.0))
+            .collect();
+        let by_id: std::collections::HashMap<&str, &GraphNode> = self
+            .shown
+            .nodes
+            .iter()
+            .map(|nd| (nd.id.as_str(), nd))
+            .collect();
+        self.top_ranks = ranks
+            .into_iter()
+            .take(10)
+            .filter_map(|(id, score)| {
+                by_id.get(id.as_str()).map(|nd| TopRank {
+                    id: id.clone(),
+                    name: nd.name.clone(),
+                    label: nd.label.clone(),
+                    score,
+                })
+            })
+            .collect();
+        let tree = clusters::build_communities(n, &self.communities, Some(&self.scores));
+        let names = self
+            .shown
+            .nodes
+            .iter()
+            .map(|nd| truncate_label(&nd.name))
+            .collect();
+        self.tree = Rc::new(tree);
+        self.tree_names = Rc::new(names);
+        if self.treemap_hover.map(|i| i >= n).unwrap_or(false) {
+            self.treemap_hover = None;
+        }
+        if self.selected.map(|i| i >= n).unwrap_or(false) {
+            self.selected = None;
+        }
+    }
+
+    /// Squarified tiles for a viewport, shared by paint + hit-testing.
+    fn tree_tiles(vw: f32, vh: f32, tree: &[clusters::Community]) -> Vec<clusters::Tile> {
+        clusters::layout_treemap(
+            tree,
+            clusters::Rect::new(0.0, 0.0, vw.max(50.0), vh.max(50.0)),
+            5.0,
+            20.0,
+        )
+    }
+
+    /// Deepest treemap tile under a canvas-local point.
+    fn pick_treemap(&self, lx: f32, ly: f32) -> Option<clusters::Tile> {
+        let (vw, vh) = self.canvas_size();
+        Self::tree_tiles(vw, vh, &self.tree)
+            .into_iter()
+            .rev()
+            .find(|t| t.rect.contains(lx, ly))
+    }
+
+    /// Displayed-node index shown for a tile: the member cell itself, or
+    /// the heaviest member when the community header was hit.
+    fn treemap_tile_node(&self, tile: &clusters::Tile) -> Option<usize> {
+        tile.node.or_else(|| {
+            self.tree
+                .get(tile.community)
+                .and_then(|c| c.members.first().copied())
+        })
+    }
+
+    fn tree_snapshot(&self, theme: Theme) -> TreeSnapshot {
+        let selected_community = self
+            .selected
+            .and_then(|i| self.tree.iter().position(|c| c.members.contains(&i)));
+        TreeSnapshot {
+            tree: self.tree.clone(),
+            names: self.tree_names.clone(),
+            theme,
+            hover_node: self.treemap_hover,
+            selected_node: self.selected,
+            selected_community,
+            label_font: self.label_font.clone(),
+            label_font_size: self.label_font_size,
+            summary: self.cluster_status.clone(),
+        }
     }
 
     pub fn toggle_preferences(&mut self, cx: &mut Context<Self>) {
@@ -428,14 +623,10 @@ impl RootView {
                     self.model.settle();
                     self.frame_initial(None);
                     self.running = !data.nodes.is_empty() && !self.schema_mode;
-                    self.set_status(
-                        format!(
-                            "Cypher: {} nodes, {} edges",
-                            data.nodes.len(),
-                            data.links.len()
-                        ),
-                        cx,
-                    );
+                    let (nn, ne) = (data.nodes.len(), data.links.len());
+                    self.shown = data;
+                    self.refresh_analytics();
+                    self.set_status(format!("Cypher: {nn} nodes, {ne} edges"), cx);
                 }
             }
             Err(e) => self.set_status(format!("Query failed: {e:#}"), cx),
@@ -453,6 +644,8 @@ impl RootView {
         self.model.settle();
         self.frame_initial(Some(node_id));
         self.running = true;
+        self.shown = view;
+        self.refresh_analytics();
         self.set_status(format!("Neighborhood of {node_id}"), cx);
     }
 
@@ -555,7 +748,7 @@ impl RootView {
         }
     }
 
-    fn render_header(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let db_name = self
             .selected_db
             .and_then(|id| self.databases.get(id))
@@ -565,6 +758,35 @@ impl RootView {
         // The theme button flips between the two palettes; the glyph shows
         // what you get when you click (sun on dark, moon on light).
         let theme_button = if theme.dark { "☀" } else { "☾" };
+        // View toggle: graph ↔ Leiden treemap. The active view reads as a
+        // filled pill; the other as a quiet button.
+        let mut toggle = div().flex().flex_row().gap_1();
+        for (label, mode) in [("Graph", ViewMode::Graph), ("Treemap", ViewMode::Treemap)] {
+            let active = self.view_mode == mode;
+            toggle = toggle.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(if active {
+                        theme.accent
+                    } else {
+                        theme.selection
+                    })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| view.set_view_mode(mode, cx)),
+                    )
+                    .child(label.to_string()),
+            );
+        }
         div()
             .flex()
             .flex_row()
@@ -577,25 +799,33 @@ impl RootView {
             .child(div().font_weight(FontWeight::BOLD).child("Bugscope"))
             .child(div().text_sm().child(format!("{db_name} · {status}")))
             .child(
-                div().flex_1().flex().flex_row().justify_end().child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.selection)
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _, window, cx| {
-                                let current = view
-                                    .dark_override
-                                    .unwrap_or_else(|| Theme::current(window).dark);
-                                view.dark_override = Some(!current);
-                                cx.notify();
-                            }),
-                        )
-                        .child(theme_button),
-                ),
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle)
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme.selection)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, window, cx| {
+                                    let current = view
+                                        .dark_override
+                                        .unwrap_or_else(|| Theme::current(window).dark);
+                                    view.dark_override = Some(!current);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(theme_button),
+                    ),
             )
     }
 
@@ -748,7 +978,7 @@ impl RootView {
         (f32::from(s.width), f32::from(s.height))
     }
 
-    fn render_graph_canvas(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_graph_canvas(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let snap = self.snapshot(theme);
         let origin_cell = self.canvas_origin.clone();
         let size_cell = self.canvas_size.clone();
@@ -848,6 +1078,213 @@ impl RootView {
                 cx.notify();
             }))
     }
+
+    /// Divider gutter between the canvas and the insights pane, mirroring
+    /// the left sidebar divider. Always rendered so the pane can be
+    /// reopened when hidden.
+    fn render_right_divider(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        // Chevron points the way the bar will go.
+        let glyph = if self.right_open { "»" } else { "«" };
+        let line = || div().flex_1().w(px(1.)).bg(theme.border);
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w(px(18.))
+            .h_full()
+            .py_1()
+            .child(line())
+            .child(
+                div()
+                    .px_1()
+                    .text_xs()
+                    .rounded_md()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.secondary)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.toggle_right_pane(cx)),
+                    )
+                    .child(glyph),
+            )
+            .child(line())
+    }
+
+    /// Collapsible right pane: top 10 nodes by PageRank over the displayed
+    /// graph, plus the Leiden community summary. Clicking a row focuses the
+    /// node's 1-hop neighborhood; clicking a community selects its heaviest
+    /// member and jumps to the treemap.
+    fn render_insights(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .w(px(260.))
+            .h_full()
+            .id("insights")
+            .overflow_y_scroll()
+            .bg(theme.surface)
+            .text_color(theme.foreground)
+            .text_sm()
+            .child(div().font_weight(FontWeight::BOLD).child("Insights"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child(self.cluster_status.clone()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Top PageRank"),
+            );
+        if self.top_ranks.is_empty() {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("Load a graph to rank nodes."),
+            );
+        }
+        for (rank, top) in self.top_ranks.clone().into_iter().enumerate() {
+            let id = top.id.clone();
+            let row = format!("#{} {} · {}", rank + 1, top.name, top.label);
+            let score = format!("{:.4}", top.score);
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.focus_node(&id.clone(), cx);
+                        }),
+                    )
+                    .child(div().flex_1().child(row))
+                    .child(div().text_xs().text_color(theme.secondary).child(score)),
+            );
+        }
+        col = col.child(
+            div()
+                .pt_2()
+                .font_weight(FontWeight::BOLD)
+                .child("Leiden communities"),
+        );
+        if self.tree.is_empty() {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("No communities yet."),
+            );
+        }
+        for (pos, comm) in self.tree.iter().enumerate() {
+            let first = comm.members.first().copied();
+            let label = format!("C{} · {} nodes", pos + 1, comm.members.len());
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.selection))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            if let Some(m) = first {
+                                view.selected = Some(m);
+                                view.set_view_mode(ViewMode::Treemap, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .rounded_sm()
+                            .bg(node_color(&theme, pos)),
+                    )
+                    .child(div().flex_1().child(label)),
+            );
+        }
+        col
+    }
+
+    fn render_treemap_canvas(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let snap = self.tree_snapshot(theme);
+        let origin_cell = self.canvas_origin.clone();
+        let size_cell = self.canvas_size.clone();
+        div()
+            .flex_1()
+            .h_full()
+            .bg(theme.inset)
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        origin_cell.set(bounds.origin);
+                        size_cell.set(bounds.size);
+                        (snap, bounds)
+                    },
+                    move |_bounds, (snap, bounds), window, cx| {
+                        paint_treemap(&snap, bounds, window, cx);
+                    },
+                )
+                .flex_1()
+                .h_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseDownEvent, _, cx| {
+                    let (lx, ly) = view.to_local(ev.position);
+                    let Some(tile) = view.pick_treemap(lx, ly) else {
+                        view.treemap_hover = None;
+                        cx.notify();
+                        return;
+                    };
+                    let node = view.treemap_tile_node(&tile);
+                    if ev.click_count >= 2 {
+                        if let Some(i) = node {
+                            if let Some(nd) = view.shown.nodes.get(i) {
+                                let id = nd.id.clone();
+                                view.focus_node(&id, cx);
+                            }
+                        }
+                        return;
+                    }
+                    view.selected = node;
+                    view.treemap_hover = node;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                let (lx, ly) = view.to_local(ev.position);
+                let h = view
+                    .pick_treemap(lx, ly)
+                    .and_then(|t| view.treemap_tile_node(&t));
+                if h != view.treemap_hover {
+                    view.treemap_hover = h;
+                    cx.notify();
+                }
+            }))
+    }
 }
 
 impl Render for RootView {
@@ -908,6 +1345,15 @@ impl Render for RootView {
         } else {
             None
         };
+        let center = match self.view_mode {
+            ViewMode::Graph => self.render_graph_canvas(theme, cx),
+            ViewMode::Treemap => self.render_treemap_canvas(theme, cx),
+        };
+        let insights = if self.right_open {
+            Some(self.render_insights(theme, cx))
+        } else {
+            None
+        };
         div()
             .flex()
             .flex_col()
@@ -924,7 +1370,9 @@ impl Render for RootView {
                     .min_h_0()
                     .children(sidebar)
                     .child(self.render_divider(theme, cx))
-                    .child(self.render_graph_canvas(theme, cx)),
+                    .child(center)
+                    .child(self.render_right_divider(theme, cx))
+                    .children(insights),
             )
             // Compact query bar at the bottom: `/foo` searches, anything
             // else runs as Cypher. Enter submits; Escape clears.
@@ -1515,4 +1963,247 @@ fn paint_labels(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx
             cx,
         );
     }
+}
+
+/// Treemap of the Leiden communities, disktree-style: tiles are painted, not
+/// composed from elements (thousands of rects would spend the frame in
+/// layout). Each community gets a header band with its name over member cells
+/// tinted by community hue; the selected node's community reads as an amber
+/// ring on every one of its cells, like the graph view's hot edges.
+fn paint_treemap(snap: &TreeSnapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let vw = f32::from(bounds.size.width);
+    let vh = f32::from(bounds.size.height);
+    let ox = f32::from(bounds.origin.x);
+    let oy = f32::from(bounds.origin.y);
+    let font_size = px(snap.label_font_size);
+
+    let tiles = RootView::tree_tiles(vw, vh, &snap.tree);
+    if tiles.is_empty() {
+        // Empty state: centered hint instead of a blank canvas.
+        let text: SharedString = if snap.tree.is_empty() {
+            snap.summary.clone().into()
+        } else {
+            "Treemap tiles too small — load a smaller graph or resize.".into()
+        };
+        let run = TextRun {
+            len: text.len(),
+            font: font(&snap.label_font),
+            color: snap.theme.secondary,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let w = f32::from(shaped.width);
+        let h = f32::from(shaped.ascent + shaped.descent);
+        let _ = shaped.paint(
+            point(px(ox + (vw - w) / 2.0), px(oy + (vh - h) / 2.0)),
+            px(14.),
+            window,
+            cx,
+        );
+        return;
+    }
+
+    // Fills first; outlines after every fill so member cells never cover
+    // their community's selection ring (same ordering trick as disktree).
+    let mut outlines: Vec<(u8, Bounds<Pixels>, f32, Hsla)> = Vec::new();
+    for tile in &tiles {
+        let fill = node_color(&snap.theme, tile.community);
+        let quad_bounds = Bounds::new(
+            point(px(ox + tile.rect.x), px(oy + tile.rect.y)),
+            size(px(tile.rect.w), px(tile.rect.h)),
+        );
+        if tile.header {
+            window.paint_quad(PaintQuad {
+                bounds: quad_bounds,
+                corner_radii: Corners::all(px(3.)),
+                background: snap.theme.surface.into(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::Solid,
+            });
+            // Community strip: a thin slab of the hue across the top, so the
+            // first level of structure reads before any detail.
+            let strip = Bounds::new(
+                quad_bounds.origin,
+                size(
+                    quad_bounds.size.width,
+                    px(2.0f32.min(f32::from(quad_bounds.size.height))),
+                ),
+            );
+            window.paint_quad(PaintQuad {
+                bounds: strip,
+                corner_radii: Corners::default(),
+                background: fill.into(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::Solid,
+            });
+        } else {
+            window.paint_quad(PaintQuad {
+                bounds: quad_bounds,
+                corner_radii: Corners::all(px(3.)),
+                background: fill.into(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::Solid,
+            });
+        }
+        let node_here = tile.node.filter(|n| Some(*n) == snap.hover_node);
+        let ring = Bounds::new(
+            point(px(ox + tile.rect.x), px(oy + tile.rect.y)),
+            size(px(tile.rect.w), px(tile.rect.h)),
+        );
+        let outline = if tile.node.is_some() && tile.node == snap.selected_node {
+            Some((3u8, ring, 2.0, snap.theme.bright))
+        } else if node_here.is_some() {
+            Some((2, ring, 1.0, snap.theme.bright))
+        } else if Some(tile.community) == snap.selected_community {
+            Some((1, ring, 1.5, highlight(&snap.theme)))
+        } else {
+            None
+        };
+        if let Some((rank, ring, width, color)) = outline {
+            outlines.push((rank, ring, width, color));
+        }
+    }
+    outlines.sort_by_key(|(rank, ..)| *rank);
+    for (_, ring, width, color) in outlines {
+        window.paint_quad(PaintQuad {
+            bounds: ring,
+            corner_radii: Corners::all(px(3.)),
+            background: transparent_black().into(),
+            border_widths: Edges::all(px(width)),
+            border_color: color,
+            border_style: BorderStyle::Solid,
+        });
+    }
+
+    // Labels: every header names its community; member cells label when the
+    // text fits, largest first so the cap keeps informative names.
+    let mut cells: Vec<&clusters::Tile> = tiles
+        .iter()
+        .filter(|t| !t.header && t.node.is_some())
+        .collect();
+    cells.sort_by(|a, b| {
+        b.rect
+            .area()
+            .partial_cmp(&a.rect.area())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for tile in &tiles {
+        if !tile.header {
+            continue;
+        }
+        let count = snap
+            .tree
+            .get(tile.community)
+            .map(|c| c.members.len())
+            .unwrap_or(0);
+        let label = format!("C{} · {count} nodes", tile.community + 1);
+        paint_tree_text(
+            snap,
+            &label,
+            ox + tile.rect.x + 6.0,
+            oy + tile.rect.y + 3.0,
+            tile.rect.w - 12.0,
+            snap.theme.bright,
+            window,
+            cx,
+        );
+    }
+    for tile in cells.into_iter().take(150) {
+        if tile.rect.w < 56.0 || tile.rect.h < 18.0 {
+            continue;
+        }
+        let Some(i) = tile.node else { continue };
+        let Some(name) = snap.names.get(i) else {
+            continue;
+        };
+        paint_tree_text(
+            snap,
+            name,
+            ox + tile.rect.x + 5.0,
+            oy + tile.rect.y + 3.0,
+            tile.rect.w - 10.0,
+            snap.theme.bright,
+            window,
+            cx,
+        );
+    }
+
+    // Summary pill, bottom-left over the mosaic.
+    let text: SharedString = snap.summary.clone().into();
+    let run = TextRun {
+        len: text.len(),
+        font: font(&snap.label_font),
+        color: snap.theme.secondary,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, font_size, &[run], None);
+    let w = f32::from(shaped.width);
+    let h = f32::from(shaped.ascent + shaped.descent);
+    let pad_x = 6.0;
+    let pad_y = 3.0;
+    window.paint_quad(PaintQuad {
+        bounds: Bounds::new(
+            point(px(ox + 8.0), px(oy + vh - h - pad_y * 2.0 - 8.0)),
+            size(px(w + pad_x * 2.0), px(h + pad_y * 2.0)),
+        ),
+        corner_radii: Corners::all(px(4.)),
+        background: snap.theme.inset.opacity(0.88).into(),
+        border_widths: Edges::default(),
+        border_color: transparent_black(),
+        border_style: BorderStyle::Solid,
+    });
+    let _ = shaped.paint(
+        point(
+            px(ox + 8.0 + pad_x),
+            px(oy + vh - h - pad_y * 2.0 - 8.0 + pad_y),
+        ),
+        px(14.),
+        window,
+        cx,
+    );
+}
+
+/// One treemap label, painted only when the shaped text fits its tile —
+/// nothing may bleed into the neighbour.
+#[allow(clippy::too_many_arguments)]
+fn paint_tree_text(
+    snap: &TreeSnapshot,
+    label: &str,
+    x: f32,
+    y: f32,
+    max_w: f32,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if max_w < 20.0 {
+        return;
+    }
+    let text: SharedString = label.to_string().into();
+    let run = TextRun {
+        len: text.len(),
+        font: font(&snap.label_font),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, px(snap.label_font_size), &[run], None);
+    if f32::from(shaped.width) > max_w {
+        return;
+    }
+    let _ = shaped.paint(point(px(x), px(y)), px(14.), window, cx);
 }
