@@ -9,7 +9,7 @@ icebug-analytics = ["dep:icebug"]
 
 [dependencies]
 gpui = "0.2"
-lbug = { version = "0.21.1", features = ["arrow"] }
+lbug = { version = "0.21.2", features = ["arrow"] }
 icebug = { version = "=13.2.0", optional = true }
 # Pinned to 55 to match lbug's `arrow` (0.21.x uses arrow 55): lbug hands us
 # Arrow batches built with its own arrow, so our decode types must be the
