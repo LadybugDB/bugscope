@@ -15,7 +15,7 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 - **Breadcrumbs + dot-commands** - Drill-down trail under the header (`Root › A › B`, cached jumps) plus query-box `.root` / `.parent` (`.up`/`.back`) and `.schema` / `.data` (schema view without the menu).
 - **Schema View** - Header `Data`/`Schema` toggle (or `.schema` / `.data` in the query box, `File → Toggle Schema View` menu) to switch between node tables and the edge graph. The breadcrumb badge (`schema ✕`) is also a one-click way back to data.
 - **Live Layout** - Force simulation (repulsion + springs + damping) runs at 30 Hz and settles when the layout goes quiet; pause/resume any time.
-- **Leiden Treemap** - Header toggle switches the canvas between the graph and a squarified treemap of Leiden communities (in-process icebug Leiden, same family as `GDS_LEIDEN`); tile area follows PageRank weight. Double-click drills into a neighborhood.
+- **Leiden Treemap** - Header toggle switches the canvas between the graph and a squarified treemap of Leiden communities (in-process icebug Leiden, same family as `GDS_LEIDEN`); tile area follows PageRank weight. Double-click drills into a neighborhood. Graphs with more than 64 edges open in the treemap by default (smaller ones in the graph view); the toggle still overrides for the current view.
 - **Insights Pane** - Collapsible right pane with the top 10 nodes by PageRank plus the Leiden community summary; clicking a row focuses (PageRank) or selects (community) it.
 
 ## Usage
