@@ -20,8 +20,19 @@ ICEBUG_DIR = { value = "icebug", relative = true }
 # - macOS .app bundles stage them under Contents/Frameworks
 # - cargo dev/test binaries resolve ../../../ entries
 #   (target/{debug,release}/deps/ -> repo root)
+# Absolute well-known rpaths (macOS only): the algo extension is downloaded
+# at runtime and its own LC_RPATHs point at its build machine, so its
+# @rpath deps (libarrow, libomp, libnetworkit) expand against *this*
+# binary's rpaths. These entries let it resolve from Homebrew / system
+# locations with no DYLD_LIBRARY_PATH. Missing dirs are harmless.
 [target.aarch64-apple-darwin]
 rustflags = [
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/lib",
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/apache-arrow/lib",
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/libomp/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/opt/apache-arrow/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/opt/libomp/lib",
   "-C", "link-arg=-Wl,-rpath,@executable_path",
   "-C", "link-arg=-Wl,-rpath,@executable_path/icebug/lib",
   "-C", "link-arg=-Wl,-rpath,@executable_path/liblbug",
@@ -37,6 +48,12 @@ rustflags = [
 
 [target.x86_64-apple-darwin]
 rustflags = [
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/lib",
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/apache-arrow/lib",
+  "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/libomp/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/opt/apache-arrow/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/opt/libomp/lib",
   "-C", "link-arg=-Wl,-rpath,@executable_path",
   "-C", "link-arg=-Wl,-rpath,@executable_path/icebug/lib",
   "-C", "link-arg=-Wl,-rpath,@executable_path/liblbug",

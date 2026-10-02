@@ -71,6 +71,26 @@ change_if_present() {
   fi
 }
 
+# Well-known system/Homebrew locations, so the runtime-downloaded algo
+# extension (whose own LC_RPATHs point at its build machine) resolves its
+# @rpath deps with no DYLD_LIBRARY_PATH. Absolute LC_RPATH entries are
+# honored by dyld and harmless when the dir is absent.
+WELL_KNOWN_RPATHS=(
+  /opt/homebrew/lib
+  /opt/homebrew/opt/apache-arrow/lib
+  /opt/homebrew/opt/libomp/lib
+  /usr/local/lib
+  /usr/local/opt/apache-arrow/lib
+  /usr/local/opt/libomp/lib
+)
+
+add_rpath_if_missing() {
+  local file="$1" rpath="$2"
+  if ! otool -l "$file" | grep -A 2 LC_RPATH | grep -Fq "path $rpath "; then
+    install_name_tool -add_rpath "$rpath" "$file"
+  fi
+}
+
 patch_binary() {
   local binary="$1"
   while IFS= read -r dep; do
@@ -88,6 +108,14 @@ patch_binary "$BINARY"
 for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
   install_name_tool -id "@rpath/$(basename "$dylib")" "$dylib"
   patch_binary "$dylib"
+done
+# The shipped binary (and each bundled dylib, for transitive deps) also
+# searches Homebrew / system locations.
+for rpath in "${WELL_KNOWN_RPATHS[@]}"; do
+  add_rpath_if_missing "$BINARY" "$rpath"
+  for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    add_rpath_if_missing "$dylib" "$rpath"
+  done
 done
 chmod -w "$FRAMEWORKS_DIR"/*.dylib 2>/dev/null || true
 
