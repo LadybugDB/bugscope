@@ -11,8 +11,9 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 - **Visual Encoding** - Node size reflects connection count (more connections = larger nodes), and colors differentiate entity types.
 - **Dark/Light Mode** - Follows the system appearance automatically, same themes as the Tauri app.
 - **Relationship Labels** - Hover over edges to see the type of relationship between connected nodes.
-- **Search + Focus** - Substring search over node properties; click a match to focus its 1-hop neighborhood.
-- **Schema View** - Toggle to see node tables instead of the edge graph.
+- **Search + Focus** - Substring search over node properties (`/foo`, bare `/` clears); click a match to focus its 1-hop neighborhood.
+- **Breadcrumbs + dot-commands** - Drill-down trail under the header (`Root › A › B`, cached jumps) plus query-box `.root` / `.parent` (`.up`/`.back`) and `.schema` / `.data` (schema view without the menu).
+- **Schema View** - Header `Data`/`Schema` toggle (or `.schema` / `.data` in the query box, `File → Toggle Schema View` menu) to switch between node tables and the edge graph. The breadcrumb badge (`schema ✕`) is also a one-click way back to data.
 - **Live Layout** - Force simulation (repulsion + springs + damping) runs at 30 Hz and settles when the layout goes quiet; pause/resume any time.
 - **Leiden Treemap** - Header toggle switches the canvas between the graph and a squarified treemap of Leiden communities (in-process icebug Leiden, same family as `GDS_LEIDEN`); tile area follows PageRank weight. Double-click drills into a neighborhood.
 - **Insights Pane** - Collapsible right pane with the top 10 nodes by PageRank plus the Leiden community summary; clicking a row focuses (PageRank) or selects (community) it.
@@ -25,8 +26,23 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 4. Scroll to zoom in/out (zooms at the cursor), click and drag the canvas to pan
 5. Hover over nodes to see their labels
 6. Hover over edges to see relationship types
-7. Double-click a node (or select it and choose "Expand neighborhood") to focus its 1-hop neighborhood
+7. Double-click a node (or select it and choose "Expand neighborhood") to focus its 1-hop neighborhood.
+   Each focus pushes the breadcrumb trail under the header (`Root › A › B`):
+   click any crumb to jump back, or use `↑ Parent` / `⟲ Root` on the right.
 8. Type in the query box and press Enter to search; click a match to focus it
+9. Switch between the data graph and the schema (table) view with the header `Data`/`Schema` toggle, `.schema` / `.data` in the query box, or `File → Toggle Schema View`
+
+### Query box: search, Cypher, and dot-commands
+
+| Input | Effect |
+|---|---|
+| `/foo` | Substring search over node `name`/`title`/`label`/`id` + properties. Matches list in the sidebar; starting a new search first resets any zoom so matches are in full-graph context. |
+| `/` (bare slash) | Clears text-search state: sidebar matches + any search zoom/selection, back to the root view. |
+| `.root` | Breadcrumb root: clear the drill-down trail, show the full graph (or current Cypher result) from cache — no DB reload. |
+| `.parent` (aliases: `.up`, `.back`) | One step up the trail (`B` → `A` → root). Reports `Already at root` at the top. |
+| `.schema` / `.schema on` | Switch to the schema view (node tables + rel connectivity). Already there → resets to the schema root. Same as the header `Schema` pill. |
+| `.data` / `.graph` (also `.schema off`) | Leave the schema view, back to the data graph. Same as the header `Data` pill or clicking the `schema ✕` badge in the breadcrumb bar. `.schema toggle` flips either way. |
+| anything else | Runs as read Cypher and replaces the graph (new root, trail cleared). Unknown `.foo` is rejected with the valid list — it never runs as Cypher. |
 
 ## Prerequisites
 

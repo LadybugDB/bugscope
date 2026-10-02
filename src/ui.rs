@@ -47,6 +47,15 @@ pub enum ViewMode {
     Treemap,
 }
 
+/// One step of the drill-down trail: a focused 1-hop neighborhood.
+/// `label` is captured at focus time so breadcrumbs stay readable even
+/// after `full` is replaced (Cypher / reload).
+#[derive(Clone)]
+struct Crumb {
+    id: String,
+    label: String,
+}
+
 /// One row of the Top PageRank list in the insights pane.
 #[derive(Clone)]
 struct TopRank {
@@ -105,6 +114,10 @@ pub struct RootView {
     query_cursor: usize,
     search_results: Vec<GraphNode>,
     focused: Option<String>,
+    /// Drill-down trail: focus history, empty = root (`full`).
+    /// Each entry is a 1-hop `focus_node` step; breadcrumbs + `.root` /
+    /// `.parent` navigate it without a DB reload.
+    trail: Vec<Crumb>,
     hovered: Option<usize>,
     selected: Option<usize>,
     schema_mode: bool,
@@ -192,6 +205,7 @@ impl RootView {
             query_cursor: 0,
             search_results: Vec::new(),
             focused: None,
+            trail: Vec::new(),
             hovered: None,
             selected: None,
             schema_mode: opts.schema_mode,
@@ -280,7 +294,13 @@ impl RootView {
                 self.model.settle();
                 self.frame_initial(None);
                 self.focused = None;
+                self.trail.clear();
                 self.selected = None;
+                self.hovered = None;
+                self.treemap_hover = None;
+                self.drag_node = None;
+                self.panning = None;
+                self.search_results.clear();
                 self.running = !self.schema_mode;
                 self.shown = data;
                 self.refresh_analytics();
@@ -288,6 +308,133 @@ impl RootView {
             }
             Err(e) => self.set_status(format!("Load failed: {e:#}"), cx),
         }
+    }
+
+    /// Display name for a breadcrumb: node name when known, else the id.
+    fn crumb_label(&self, node_id: &str) -> String {
+        self.full
+            .nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .map(|n| truncate_label(&n.name))
+            .or_else(|| {
+                self.shown
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == node_id)
+                    .map(|n| truncate_label(&n.name))
+            })
+            .unwrap_or_else(|| truncate_label(node_id))
+    }
+
+    /// Show `data` without touching the DB: the shared tail of every
+    /// trail navigation (`go_root` / `go_parent` / breadcrumb jump).
+    fn display(
+        &mut self,
+        data: GraphData,
+        focused: Option<String>,
+        status: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused = focused.clone();
+        self.selected = None;
+        self.hovered = None;
+        self.treemap_hover = None;
+        self.drag_node = None;
+        self.panning = None;
+        self.model.load(&data);
+        self.model.settle();
+        self.frame_initial(focused.as_deref());
+        self.running = !self.schema_mode && !data.nodes.is_empty();
+        // Focus keeps the layout alive so the neighborhood settles
+        // around the centered node; root reuses the settle above.
+        if focused.is_some() {
+            self.running = true;
+        }
+        self.shown = data;
+        self.refresh_analytics();
+        self.set_status(status, cx);
+    }
+
+    fn db_name(&self) -> String {
+        self.selected_db
+            .and_then(|id| self.databases.get(id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "graph".to_string())
+    }
+
+    /// Re-apply the current trail after it was mutated (pop / truncate).
+    /// Uses the cached `full` graph — no DB round-trip.
+    fn apply_trail(&mut self, cx: &mut Context<Self>) {
+        let Some(last) = self.trail.last().cloned() else {
+            let data = self.full.clone();
+            let msg = format!(
+                "{}: {} nodes, {} edges",
+                self.db_name(),
+                data.nodes.len(),
+                data.links.len()
+            );
+            self.display(data, None, msg, cx);
+            return;
+        };
+        let view = backend::neighborhood(&self.full, &last.id);
+        if view.nodes.is_empty() {
+            self.set_status(format!("Node {} not in loaded graph", last.id), cx);
+            return;
+        }
+        self.display(
+            view,
+            Some(last.id.clone()),
+            format!("Neighborhood of {}", last.label),
+            cx,
+        );
+    }
+
+    /// Breadcrumb / `.root`: back to the full graph (or Cypher result).
+    pub fn go_root(&mut self, cx: &mut Context<Self>) {
+        if self.trail.is_empty() && self.focused.is_none() {
+            self.set_status("Already at root", cx);
+            return;
+        }
+        self.trail.clear();
+        self.apply_trail(cx);
+    }
+
+    /// Breadcrumb / `.parent`: one step up the drill-down trail.
+    pub fn go_parent(&mut self, cx: &mut Context<Self>) {
+        if self.trail.is_empty() {
+            self.set_status("Already at root", cx);
+            return;
+        }
+        self.trail.pop();
+        self.apply_trail(cx);
+    }
+
+    /// Jump to breadcrumb `index` (`None` = root).
+    pub fn go_to_crumb(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        match index {
+            None => self.go_root(cx),
+            Some(i) if i + 1 >= self.trail.len() => {
+                // Already on (or past) this crumb — no-op, don't re-settle.
+            }
+            Some(i) => {
+                self.trail.truncate(i + 1);
+                self.apply_trail(cx);
+            }
+        }
+    }
+
+    /// `.schema [on|off]`: deterministically enter/leave the schema view.
+    /// No arg (or `on`) enters it; `off`/`data`/`graph` leaves it.
+    pub fn set_schema_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.schema_mode == enabled {
+            // Already there — still reset any drill-down so `.schema`
+            // always lands on the schema root.
+            self.go_root(cx);
+            return;
+        }
+        self.schema_mode = enabled;
+        self.load_graph(cx);
     }
 
     pub fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
@@ -567,18 +714,24 @@ impl RootView {
         }
     }
 
-    /// Enter in the query bar: `/foo` searches node names/properties,
-    /// anything else runs as a Cypher query and replaces the graph.
+    /// Enter in the query bar: dot-commands (`.root` / `.parent` /
+    /// `.schema`), `/foo` node search, or Cypher (replaces the graph).
+    /// Bare `/` clears text-search state (matches + search zoom).
     fn run_query(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_db else { return };
-        let Some(db) = self.databases.get(id) else {
-            return;
-        };
         let raw = self.query.clone();
         let raw = raw.trim().to_string();
         if raw.is_empty() {
             return;
         }
+        // Dot-commands first — they never need a database handle.
+        if raw.starts_with('.') {
+            self.run_dot_command(&raw, cx);
+            return;
+        }
+        let Some(id) = self.selected_db else { return };
+        let Some(db) = self.databases.get(id) else {
+            return;
+        };
         let is_search = raw.starts_with('/');
         let mut term = raw.trim_start_matches('/').trim().to_string();
         // Accept both `/rdf` and `/search rdf` (the old hint text
@@ -587,6 +740,14 @@ impl RootView {
             if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                 term = rest.trim().to_string();
             }
+        }
+        if is_search && term.is_empty() {
+            // Bare `/`: clear matches + any search zoom, back to root.
+            self.clear_text_search(cx);
+            self.query.clear();
+            self.query_cursor = 0;
+            cx.notify();
+            return;
         }
         if term.is_empty() {
             return;
@@ -606,6 +767,24 @@ impl RootView {
         match work {
             Ok(data) => {
                 if is_search {
+                    // A new text search starts from the root so matches
+                    // are in full-graph context: drop any previous
+                    // search-driven zoom/selection first.
+                    if self.focused.is_some() || !self.trail.is_empty() {
+                        self.trail.clear();
+                        let root = self.full.clone();
+                        let msg = format!(
+                            "{}: {} nodes, {} edges",
+                            self.db_name(),
+                            root.nodes.len(),
+                            root.links.len()
+                        );
+                        self.display(root, None, msg, cx);
+                    } else {
+                        self.selected = None;
+                        self.hovered = None;
+                        self.treemap_hover = None;
+                    }
                     let n = data.nodes.len();
                     self.search_results = data.nodes;
                     if n > 0 {
@@ -616,6 +795,7 @@ impl RootView {
                     self.set_status(format!("{n} matches for {term} — click to focus"), cx);
                 } else {
                     self.search_results.clear();
+                    self.trail.clear();
                     self.focused = None;
                     self.selected = None;
                     self.full = data.clone();
@@ -633,20 +813,122 @@ impl RootView {
         }
     }
 
+    /// `.root` / `.parent` / `.schema` / `.data` — query-box navigation commands.
+    /// Unknown `.foo` reports the valid set instead of running Cypher.
+    fn run_dot_command(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let mut parts = raw.split_whitespace();
+        let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("").to_ascii_lowercase();
+        let clear_input = |view: &mut Self, cx: &mut Context<Self>| {
+            view.query.clear();
+            view.query_cursor = 0;
+            cx.notify();
+        };
+        match cmd.as_str() {
+            ".root" => {
+                self.go_root(cx);
+                clear_input(self, cx);
+            }
+            ".parent" | ".up" | ".back" => {
+                self.go_parent(cx);
+                clear_input(self, cx);
+            }
+            ".schema" => {
+                let enabled = match arg.as_str() {
+                    "" | "on" | "schema" => true,
+                    "off" | "data" | "graph" | "no" => false,
+                    "toggle" => !self.schema_mode,
+                    _ => {
+                        self.set_status(
+                            format!("Unknown .schema arg {arg:?} — try .schema, .schema on/off"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                self.set_schema_mode(enabled, cx);
+                clear_input(self, cx);
+            }
+            // First-class way back from `.schema`: `.data` == `.schema off`.
+            ".data" | ".graph" => {
+                if !arg.is_empty() {
+                    self.set_status(format!("Unknown .data arg {arg:?} — try .data"), cx);
+                    return;
+                }
+                self.set_schema_mode(false, cx);
+                clear_input(self, cx);
+            }
+            _ => {
+                self.set_status(
+                    "Unknown command — try .root, .parent, .data, .schema".to_string(),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Bare-`/` behavior: drop text-search matches + any zoom/selection
+    /// so the next `/foo` starts from a clean root view.
+    fn clear_text_search(&mut self, cx: &mut Context<Self>) {
+        self.search_results.clear();
+        if self.trail.is_empty() && self.focused.is_none() {
+            self.selected = None;
+            self.hovered = None;
+            self.treemap_hover = None;
+            self.set_status("Search cleared", cx);
+            return;
+        }
+        self.trail.clear();
+        let root = self.full.clone();
+        let msg = format!(
+            "{}: {} nodes, {} edges — search cleared",
+            self.db_name(),
+            root.nodes.len(),
+            root.links.len()
+        );
+        self.display(root, None, msg, cx);
+    }
+
     fn focus_node(&mut self, node_id: &str, cx: &mut Context<Self>) {
         let view = backend::neighborhood(&self.full, node_id);
         if view.nodes.is_empty() {
             self.set_status(format!("Node {node_id} not in loaded graph"), cx);
             return;
         }
-        self.focused = Some(node_id.to_string());
-        self.model.load(&view);
-        self.model.settle();
-        self.frame_initial(Some(node_id));
-        self.running = true;
-        self.shown = view;
-        self.refresh_analytics();
-        self.set_status(format!("Neighborhood of {node_id}"), cx);
+        // Push the drill-down step (skip duplicates from double-clicks).
+        // The label is captured now so breadcrumbs survive later `full`
+        // replacements (Cypher / reload).
+        if self
+            .trail
+            .last()
+            .map(|c| c.id.as_str() != node_id)
+            .unwrap_or(true)
+        {
+            let label = self.crumb_label(node_id);
+            self.trail.push(Crumb {
+                id: node_id.to_string(),
+                label: label.clone(),
+            });
+            self.display(
+                view,
+                Some(node_id.to_string()),
+                format!("Neighborhood of {label}"),
+                cx,
+            );
+        } else {
+            self.display(
+                view,
+                Some(node_id.to_string()),
+                format!(
+                    "Neighborhood of {}",
+                    self.trail
+                        .last()
+                        .map(|c| c.label.clone())
+                        .unwrap_or_else(|| node_id.to_string())
+                ),
+                cx,
+            );
+        }
     }
 
     /// Default framing: zoomed in on the densest viewport with labels on.
@@ -758,6 +1040,35 @@ impl RootView {
         // The theme button flips between the two palettes; the glyph shows
         // what you get when you click (sun on dark, moon on light).
         let theme_button = if theme.dark { "☀" } else { "☾" };
+        // Data ↔ schema toggle: same control language as the view toggle.
+        // Active side reads as a filled pill; the other as a quiet button.
+        let mut schema_toggle = div().flex().flex_row().gap_1();
+        for (label, enabled) in [("Data", false), ("Schema", true)] {
+            let active = self.schema_mode == enabled;
+            schema_toggle = schema_toggle.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(if active {
+                        theme.accent
+                    } else {
+                        theme.selection
+                    })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| view.set_schema_mode(enabled, cx)),
+                    )
+                    .child(label.to_string()),
+            );
+        }
         // View toggle: graph ↔ Leiden treemap. The active view reads as a
         // filled pill; the other as a quiet button.
         let mut toggle = div().flex().flex_row().gap_1();
@@ -806,6 +1117,7 @@ impl RootView {
                     .justify_end()
                     .items_center()
                     .gap_2()
+                    .child(schema_toggle)
                     .child(toggle)
                     .child(
                         div()
@@ -827,6 +1139,121 @@ impl RootView {
                             .child(theme_button),
                     ),
             )
+    }
+
+    /// Breadcrumb bar under the header: `Root › A › B` for the drill-down
+    /// trail. Clicking a crumb jumps there (cached, no DB reload); the
+    /// trailing `↑` / `⟲` shortcuts mirror `.parent` / `.root`.
+    fn render_breadcrumbs(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let trail = self.trail.clone();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .bg(theme.surface)
+            .text_color(theme.foreground)
+            .text_xs();
+        // Root crumb: active pill at root, clickable shortcut above it.
+        let at_root = trail.is_empty();
+        let root_el = div()
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .bg(if at_root {
+                theme.accent
+            } else {
+                theme.selection
+            })
+            .text_color(if at_root {
+                theme.on_accent
+            } else {
+                theme.foreground
+            })
+            .cursor_pointer()
+            .hover(|s| s.bg(if at_root { theme.accent } else { theme.border }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| view.go_root(cx)),
+            )
+            .child("Root".to_string());
+        row = row.child(root_el);
+        for (i, crumb) in trail.iter().enumerate() {
+            let last = i + 1 == trail.len();
+            row = row.child(div().text_color(theme.secondary).child("›".to_string()));
+            let label = crumb.label.clone();
+            let el = div()
+                .px_2()
+                .py(px(2.))
+                .rounded_md()
+                .bg(if last { theme.accent } else { theme.selection })
+                .text_color(if last {
+                    theme.on_accent
+                } else {
+                    theme.foreground
+                })
+                .cursor_pointer()
+                .hover(|s| s.bg(if last { theme.accent } else { theme.border }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| view.go_to_crumb(Some(i), cx)),
+                )
+                .child(label);
+            row = row.child(el);
+        }
+        if self.schema_mode {
+            // Clickable way back: the badge leaves the schema view.
+            row = row.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.on_accent)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.border))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.set_schema_mode(false, cx)),
+                    )
+                    .child("schema ✕".to_string()),
+            );
+        }
+        if !at_root {
+            row = row.child(div().flex_1());
+            row = row.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(theme.selection)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.border))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.go_parent(cx)),
+                    )
+                    .child("↑ Parent".to_string()),
+            );
+            row = row.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(theme.selection)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.border))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| view.go_root(cx)),
+                    )
+                    .child("⟲ Root".to_string()),
+            );
+        }
+        row
     }
 
     /// Divider gutter between the sidebar and the canvas: a 1px line split
@@ -1318,7 +1745,8 @@ impl Render for RootView {
             }
         } else if self.query.is_empty() && !qfocused {
             (
-                "/rdf searches nodes · anything else is Cypher — Enter".to_string(),
+                "/foo search · / clears · .root .parent .schema .data · else Cypher — Enter"
+                    .to_string(),
                 String::new(),
                 String::new(),
             )
@@ -1362,6 +1790,7 @@ impl Render for RootView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(self.render_header(theme, cx))
+            .child(self.render_breadcrumbs(theme, cx))
             .child(
                 div()
                     .flex()
@@ -1374,7 +1803,8 @@ impl Render for RootView {
                     .child(self.render_right_divider(theme, cx))
                     .children(insights),
             )
-            // Compact query bar at the bottom: `/foo` searches, anything
+            // Compact query bar at the bottom: `/foo` searches, bare `/`
+            // clears, `.root` / `.parent` / `.schema` / `.data` navigate, anything
             // else runs as Cypher. Enter submits; Escape clears.
             .child(
                 div()
