@@ -1,2 +1,6 @@
 /target/
 *.lbdb
+/icebug/
+/liblbug/
+# Locally built algo extension (dev only; CI/app use INSTALL from the official repo).
+/extensions/
