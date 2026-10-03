@@ -4,6 +4,7 @@
 use crate::backend::{self, DatabaseInfo, GraphData, GraphNode};
 use crate::cli::CliOptions;
 use crate::clusters;
+use crate::decorations;
 use crate::model::{node_size, Camera, GraphModel, Vec2};
 use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
@@ -1371,7 +1372,7 @@ impl RootView {
         }
     }
 
-    fn render_header(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+    fn render_header(&mut self, theme: Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let db_name = self
             .selected_db
             .and_then(|id| self.databases.get(id))
@@ -1452,14 +1453,21 @@ impl RootView {
             .py_2()
             .bg(theme.surface)
             .text_color(theme.foreground)
-            .child(div().font_weight(FontWeight::BOLD).child("Bugscope"))
-            .child(div().text_sm().child(format!("{db_name} · {status}")))
-            .child(
+            .child(decorations::drag_area(
                 div()
                     .flex_1()
                     .flex()
                     .flex_row()
-                    .justify_end()
+                    .items_center()
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::BOLD).child("Bugscope"))
+                    .child(div().text_sm().child(format!("{db_name} · {status}"))),
+                window,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
                     .items_center()
                     .gap_2()
                     .child(schema_toggle)
@@ -1482,7 +1490,8 @@ impl RootView {
                                 }),
                             )
                             .child(theme_button),
-                    ),
+                    )
+                    .children(decorations::window_buttons(theme, window)),
             )
     }
 
@@ -2452,14 +2461,14 @@ impl Render for RootView {
         } else {
             None
         };
-        div()
+        let root = div()
             .flex()
             .flex_col()
             .size_full()
             .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(self.render_header(theme, cx))
+            .child(self.render_header(theme, window, cx))
             .child(self.render_breadcrumbs(theme, cx))
             .child(
                 div()
@@ -2585,7 +2594,8 @@ impl Render for RootView {
                             .child(query_content),
                     ),
             )
-            .children(self.render_preferences_modal(theme, cx))
+            .children(self.render_preferences_modal(theme, cx));
+        decorations::client_frame(root, theme, window)
     }
 }
 
