@@ -35,6 +35,13 @@ fn with_view(cx: &mut App, f: impl FnOnce(&mut RootView, &mut Context<RootView>)
 }
 
 fn main() {
+    // Windows: broaden the DLL search path before anything backend-adjacent
+    // loads (LOAD EXTENSION + transitive arrow/bz2/brotli/lz4 deps). This
+    // only helps *runtime* loads — load-time DLLs need the flat zip layout
+    // from scripts/stage_windows_bundle.sh, resolved before main runs.
+    #[cfg(windows)]
+    bugscope::windows_dll::init();
+
     let args: Vec<String> = std::env::args().collect();
     let opts = match parse_cli(&args) {
         Ok(None) => return, // --help / --version already printed
