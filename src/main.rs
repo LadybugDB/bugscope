@@ -123,6 +123,8 @@ fn main() {
                     title: Some("Bugscope".into()),
                     ..Default::default()
                 }),
+                // See `decorations`: GNOME on Wayland draws no frame for us.
+                window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
                 ..Default::default()
             },
             {

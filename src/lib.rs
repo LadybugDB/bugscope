@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cli;
 pub mod clusters;
+pub mod decorations;
 pub mod model;
 pub mod theme;
 pub mod ui;
