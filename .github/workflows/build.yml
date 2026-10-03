@@ -364,14 +364,17 @@ jobs:
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}", README.md "dist/$name/"
-          # Bundle icebug DLLs + algo extension (GDS_* via Cypher) next to the exe.
-          New-Item -ItemType Directory -Force "dist/$name/icebug/lib" | Out-Null
-          New-Item -ItemType Directory -Force "dist/$name/liblbug" | Out-Null
-          Get-ChildItem "icebug/lib" -Filter *.dll -Recurse | ForEach-Object { Copy-Item $_.FullName "dist/$name/icebug/lib/" }
-          Get-ChildItem "liblbug" -Filter *.dll | ForEach-Object { Copy-Item $_.FullName "dist/$name/liblbug/" }
-          # The INSTALL'd algo extension loads arrow dynamically: ship the
-          # vcpkg arrow DLLs next to the binary (on PATH at runtime).
-          Get-ChildItem "vcpkg_installed/x64-windows/bin" -Filter arrow*.dll | ForEach-Object { Copy-Item $_.FullName "dist/$name/icebug/lib/" }
+          # Windows has no RPATH: the loader only looks next to the exe, in
+          # System32, and on PATH — never in our icebug/lib + liblbug
+          # subdirs. stage_windows_bundle.sh copies every runtime DLL flat
+          # next to the exe (lbug_shared, networkit_state, arrow AND its
+          # bz2/brotli/lz4/... family from vcpkg, plus OpenSSL when
+          # dynamically linked) and fails the build if a known dep is
+          # missing. See https://github.com/LadybugDB/bugscope/issues/5.
+          $vcpkgBin = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\x64-windows\bin'
+          $osslBin = Join-Path $env:OPENSSL_DIR 'bin'
+          bash scripts/stage_windows_bundle.sh "dist/$name" "$vcpkgBin" "$osslBin" "$env:OPENSSL_DIR"
+          Get-ChildItem "dist/$name" -Filter *.dll | Select-Object Name, Length
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
