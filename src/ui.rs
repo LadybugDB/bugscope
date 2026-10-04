@@ -1452,9 +1452,7 @@ impl RootView {
                 "File" => self.file_menu_panel(theme, cx),
                 _ => self.view_menu_panel(theme, cx),
             };
-            wrap = wrap.child(
-                deferred(anchored().anchor(Corner::TopLeft).child(panel)),
-            );
+            wrap = wrap.child(deferred(anchored().anchor(Corner::TopLeft).child(panel)));
         }
         wrap
     }
