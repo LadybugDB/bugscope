@@ -174,6 +174,11 @@ pub struct RootView {
     schema_mode: bool,
     sidebar_open: bool,
     show_preferences: bool,
+    /// Open in-app menu (`"File"` / `"View"`), `None` when closed. Only
+    /// used off macOS: `cx.set_menus` draws a native bar on macOS but just
+    /// stores the menus on Windows/Linux, so the app draws its own there
+    /// (`render_menu_bar`).
+    open_menu: Option<String>,
     /// `Some(true)` = force dark, `Some(false)` = light, `None` = follow OS.
     dark_override: Option<bool>,
     /// Label typeface + size for canvas labels (Preferences window).
@@ -267,6 +272,7 @@ impl RootView {
             schema_mode: opts.schema_mode,
             sidebar_open: false,
             show_preferences: false,
+            open_menu: None,
             dark_override: None,
             label_font: ".SystemUIFont".to_string(),
             label_font_size: 11.0,
@@ -1372,6 +1378,244 @@ impl RootView {
         }
     }
 
+    /// In-app menu bar for Windows/Linux: `cx.set_menus` (see `main.rs`)
+    /// only draws a native bar on macOS — on other platforms GPUI stores
+    /// the menus without displaying anything, so without this the File/View
+    /// commands would be unreachable there. Mirrors the native menus item
+    /// for item (plus Preferences/Quit, which live in the app menu on macOS
+    /// and have no native home off it). Returns `None` on macOS.
+    fn render_menu_bar(&mut self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        if cfg!(target_os = "macos") {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(28.))
+                .px_2()
+                .gap_1()
+                .bg(theme.surface)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_color(theme.foreground)
+                .text_sm()
+                .child(self.menu_dropdown("File", theme, cx))
+                .child(self.menu_dropdown("View", theme, cx)),
+        )
+    }
+
+    /// One top-level menu: a title button plus its dropdown panel while
+    /// open. The panel is `deferred` + `anchored` so it paints above the
+    /// header/canvas below instead of underneath them; `on_mouse_down_out`
+    /// on the wrapper closes the menu when anything else is clicked (panel
+    /// picks still run — they close the menu themselves after acting).
+    fn menu_dropdown(&mut self, name: &str, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let open = self.open_menu.as_deref() == Some(name);
+        let mut title = div()
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.selection))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let name = name.to_string();
+                    move |view, _, _, cx| {
+                        if view.open_menu.as_deref() == Some(&name) {
+                            view.open_menu = None;
+                        } else {
+                            view.open_menu = Some(name.clone());
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(name.to_string());
+        if open {
+            title = title.bg(theme.selection);
+        }
+        let mut wrap = div()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                if view.open_menu.is_some() {
+                    view.open_menu = None;
+                    cx.notify();
+                }
+            }))
+            .child(title);
+        if open {
+            let panel = match name {
+                "File" => self.file_menu_panel(theme, cx),
+                _ => self.view_menu_panel(theme, cx),
+            };
+            wrap = wrap.child(deferred(anchored().anchor(Corner::TopLeft).child(panel)));
+        }
+        wrap
+    }
+
+    /// Shared dropdown panel styling for the in-app menu bar.
+    fn menu_panel(theme: Theme) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .min_w(px(250.))
+            .py_1()
+            .rounded_md()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .text_color(theme.foreground)
+            .shadow(vec![BoxShadow {
+                color: hsla(0., 0., 0., 0.4),
+                blur_radius: px(12.),
+                spread_radius: px(0.),
+                offset: point(px(0.), px(2.)),
+            }])
+    }
+
+    /// One clickable menu row: label left, shortcut hint right. Runs the
+    /// action and closes the menu.
+    fn menu_row(
+        label: &str,
+        shortcut: Option<&str>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .mx_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.selection))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _, _, cx| {
+                    view.open_menu = None;
+                    on_pick(view, cx);
+                }),
+            )
+            .child(label.to_string())
+            .children(shortcut.map(|s| {
+                div()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child(s.to_string())
+            }))
+    }
+
+    fn menu_separator(theme: Theme) -> Div {
+        div().h(px(1.)).my_1().mx_3().bg(theme.border)
+    }
+
+    /// `File` dropdown: same entries as the native File menu, plus the
+    /// Preferences/Quit entries that live in the app menu on macOS.
+    fn file_menu_panel(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        Self::menu_panel(theme)
+            .child(Self::menu_row(
+                "Open Database…",
+                Some("Ctrl+O"),
+                theme,
+                cx,
+                |view, cx| view.open_file_dialog(cx),
+            ))
+            .child(Self::menu_row(
+                "Reload Graph",
+                Some("Ctrl+R"),
+                theme,
+                cx,
+                |view, cx| view.load_graph(cx),
+            ))
+            .child(Self::menu_separator(theme))
+            .child(Self::menu_row(
+                "Toggle Schema View",
+                None,
+                theme,
+                cx,
+                |view, cx| view.toggle_schema(cx),
+            ))
+            .child(Self::menu_separator(theme))
+            .child(Self::menu_row(
+                "Preferences…",
+                Some("Ctrl+,"),
+                theme,
+                cx,
+                |view, cx| view.toggle_preferences(cx),
+            ))
+            .child(Self::menu_row("Quit", None, theme, cx, |_view, cx| {
+                cx.quit()
+            }))
+    }
+
+    /// `View` dropdown: same entries as the native View menu.
+    fn view_menu_panel(&mut self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        Self::menu_panel(theme)
+            .child(Self::menu_row(
+                "Pause/Resume Layout",
+                None,
+                theme,
+                cx,
+                |view, cx| view.toggle_layout(cx),
+            ))
+            .child(Self::menu_row(
+                "Toggle Light/Dark Theme",
+                None,
+                theme,
+                cx,
+                |view, cx| view.toggle_theme(cx),
+            ))
+            .child(Self::menu_row(
+                "Toggle Sidebar",
+                Some("Ctrl+B"),
+                theme,
+                cx,
+                |view, cx| view.toggle_sidebar(cx),
+            ))
+            .child(Self::menu_row(
+                "Toggle Insights Pane",
+                Some("Ctrl+I"),
+                theme,
+                cx,
+                |view, cx| view.toggle_right_pane(cx),
+            ))
+            .child(Self::menu_separator(theme))
+            .child(Self::menu_row(
+                "Graph View",
+                Some("Ctrl+1"),
+                theme,
+                cx,
+                |view, cx| view.set_view_mode(ViewMode::Graph, cx),
+            ))
+            .child(Self::menu_row(
+                "Treemap (Leiden) View",
+                Some("Ctrl+2"),
+                theme,
+                cx,
+                |view, cx| view.set_view_mode(ViewMode::Treemap, cx),
+            ))
+            .child(Self::menu_row(
+                "Sunburst (Leiden) View",
+                Some("Ctrl+3"),
+                theme,
+                cx,
+                |view, cx| view.set_view_mode(ViewMode::Sunburst, cx),
+            ))
+            .child(Self::menu_separator(theme))
+            .child(Self::menu_row("Reset View", None, theme, cx, |view, cx| {
+                view.reset_view(cx)
+            }))
+    }
+
     fn render_header(&mut self, theme: Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let db_name = self
             .selected_db
@@ -2468,6 +2712,10 @@ impl Render for RootView {
             .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
+            // In-app menu bar on Windows/Linux (None on macOS, which has
+            // the native bar). Must come before the header so tab order
+            // and layout match the platform convention.
+            .children(self.render_menu_bar(theme, cx))
             .child(self.render_header(theme, window, cx))
             .child(self.render_breadcrumbs(theme, cx))
             .child(
