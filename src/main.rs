@@ -73,15 +73,20 @@ fn main() {
         cx.on_action(|_: &ResetView, cx| with_view(cx, |v, cx| v.reset_view(cx)));
         cx.on_action(|_: &OpenPreferences, cx| with_view(cx, |v, cx| v.toggle_preferences(cx)));
         cx.on_action(|_: &Quit, cx| cx.quit());
+        // `secondary` is Cmd on macOS and Ctrl on Windows/Linux, so one
+        // binding serves every platform. (Bare `cmd-` would mean the
+        // Windows/Super key off macOS.) Windows/Linux reach the same
+        // commands through the in-app menu bar (`RootView::render_menu_bar`)
+        // because `set_menus` below only draws a native bar on macOS.
         cx.bind_keys([
-            KeyBinding::new("cmd-o", OpenFile, None),
-            KeyBinding::new("cmd-r", ReloadGraph, None),
-            KeyBinding::new("cmd-b", ToggleSidebar, None),
-            KeyBinding::new("cmd-i", ToggleInsights, None),
-            KeyBinding::new("cmd-1", ViewGraph, None),
-            KeyBinding::new("cmd-2", ViewTreemap, None),
-            KeyBinding::new("cmd-3", ViewSunburst, None),
-            KeyBinding::new("cmd-,", OpenPreferences, None),
+            KeyBinding::new("secondary-o", OpenFile, None),
+            KeyBinding::new("secondary-r", ReloadGraph, None),
+            KeyBinding::new("secondary-b", ToggleSidebar, None),
+            KeyBinding::new("secondary-i", ToggleInsights, None),
+            KeyBinding::new("secondary-1", ViewGraph, None),
+            KeyBinding::new("secondary-2", ViewTreemap, None),
+            KeyBinding::new("secondary-3", ViewSunburst, None),
+            KeyBinding::new("secondary-,", OpenPreferences, None),
         ]);
         cx.set_menus(vec![
             Menu {
