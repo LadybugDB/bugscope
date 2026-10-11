@@ -340,11 +340,28 @@ jobs:
           mkdir -p "dist/$name/icebug" "dist/$name/liblbug"
           cp -r icebug/lib "dist/$name/icebug/"
           cp liblbug/liblbug.so* "dist/$name/liblbug/"
-          # Best-effort: vendor libomp/libarrow so the tarball runs without
-          # system installs (the exe uses RPATH, not RUNPATH, so transitive
-          # deps resolve from these dirs too).
-          for dep in $(ldd "dist/$name/${{ matrix.binary }}" | grep -oE '/[^ ]*lib(arrow|omp)[^ ]*\.so[^ ]*' | sort -u); do
+          # Best-effort: vendor every non-system shared dep (libarrow and its
+          # transitive closure: aws-sdk, brotli, lz4, snappy, zstd, ... — the
+          # same class of bug as macOS #10 where only the top-level libs
+          # were staged) so the tarball runs without system installs (the
+          # exe uses RPATH, not RUNPATH, so transitive deps resolve from
+          # these dirs too).
+          for dep in $(ldd "dist/$name/${{ matrix.binary }}" | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do
+            case "$dep" in
+              /lib/*|/usr/lib/*|/lib64/*|/usr/lib64/*) continue ;;
+              linux-vdso*|ld-linux*) continue ;;
+            esac
             cp -f -n "$dep" "dist/$name/icebug/lib/" 2>/dev/null || true
+          done
+          for lib in "dist/$name/icebug/lib"/*.so* "dist/$name/liblbug"/*.so*; do
+            [ -f "$lib" ] || continue
+            for dep in $(ldd "$lib" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do
+              case "$dep" in
+                /lib/*|/usr/lib/*|/lib64/*|/usr/lib64/*) continue ;;
+                linux-vdso*|ld-linux*) continue ;;
+              esac
+              cp -f -n "$dep" "dist/$name/icebug/lib/" 2>/dev/null || true
+            done
           done
           cp README.md "dist/$name/"
           echo "$version" > "dist/$name/VERSION"
