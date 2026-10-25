@@ -12,7 +12,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REPOSITORY="${ICEBUG_GITHUB_REPOSITORY:-Ladybug-Memory/icebug}"
 TARGET_DIR="${ICEBUG_TARGET_DIR:-$PROJECT_DIR/icebug}"
-VERSION="${ICEBUG_VERSION:-13.2}"
+VERSION="${ICEBUG_VERSION:-13.4}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
