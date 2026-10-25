@@ -12,10 +12,19 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REPOSITORY="${ICEBUG_GITHUB_REPOSITORY:-Ladybug-Memory/icebug}"
 TARGET_DIR="${ICEBUG_TARGET_DIR:-$PROJECT_DIR/icebug}"
-VERSION="${ICEBUG_VERSION:-13.4}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+
+# Linux CI pairs the 0.22.0 algo extension with NetworKit 13.5 (its
+# prebuilt links libarrow.so.2600, hence the Arrow 26 apt pin in CI);
+# macOS/Windows stay on 13.4 with the Arrow 25 setup. Overridable per
+# run via ICEBUG_VERSION.
+case "$OS" in
+  Linux) DEFAULT_VERSION="13.5" ;;
+  *) DEFAULT_VERSION="13.4" ;;
+esac
+VERSION="${ICEBUG_VERSION:-$DEFAULT_VERSION}"
 
 case "$OS" in
   Darwin)
