@@ -340,6 +340,14 @@ pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
     }
     let (out_indices, out_indptr) = pack(outgoing);
     let (in_indices, in_indptr) = pack(incoming);
+    // No (non-self-loop) edges: the CSR index arrays are empty and must
+    // never cross the FFI (empty Arrow buffers segfault inside icebug —
+    // e.g. node-only Cypher results like `MATCH (n) RETURN n LIMIT 10`).
+    // An edgeless graph carries no rank signal; report no ranking, matching
+    // the no-`icebug-analytics` fallback.
+    if out_indices.is_empty() {
+        return Vec::new();
+    }
     let Ok(graph) = icebug::GraphR::from_directed_csr(
         n,
         UInt64Array::from(out_indices),
@@ -1570,6 +1578,11 @@ pub fn graphr_leiden_full(data: &GraphData) -> (Vec<u64>, f64, u64) {
         indices.extend(neighbors);
     }
     indptr.push(indices.len() as u64);
+    // Self-loop-only (or dangling) links pack to an empty index array,
+    // which must never cross the FFI (see `graphr_page_rank`).
+    if indices.is_empty() {
+        return (vec![0; n], 0.0, 1);
+    }
     let Ok(graph) = icebug::GraphR::from_csr(
         n as u64,
         false,
