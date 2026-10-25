@@ -95,14 +95,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
-        run: |
-          # The algo extension served by INSTALL algo is currently ABI-
-          # incompatible with pinned lbug 0.21.2: its GDS calls segfault
-          # inside native code (signal 11, no graceful error), killing the
-          # whole test harness. Skip those tests until upstream publishes
-          # compatible bits; re-enable by dropping the --skip flags.
-          # local_leiden_two_cliques (in-process icebug) still runs.
-          cargo test -- --skip gds_leiden_two_cliques --skip gds_page_rank_star --skip gds_page_rank_stale_projection_serves_live_storage
+        run: cargo test
 
   build:
     needs: lint
@@ -299,9 +292,6 @@ jobs:
           # The test INSTALLs the algo extension from the official repo and
           # LOADs it at runtime: its libarrow dep resolves via our rpaths
           # (vendored above) on Unix, via PATH (vcpkg) on Windows.
-          # NOTE: the currently served algo builds segfault inside native
-          # code against pinned lbug 0.21.2 (see lint job) — same skip here
-          # until upstream publishes compatible bits.
           if [ "$RUNNER_OS" = "Windows" ]; then
             # NB: networkit_state.dll lives in the icebug/lib/networkit
             # subdir (the win prebuilt splits GlobalState out of the static
@@ -314,7 +304,7 @@ jobs:
           fi
           # --lib --test selects only these targets so the GUI binary
           # itself is not linked here (it gets built in the next step).
-          cargo test --release --target ${{ matrix.target }} --lib --test gds_page_rank -- --skip gds_page_rank_star --skip gds_page_rank_stale_projection_serves_live_storage
+          cargo test --release --target ${{ matrix.target }} --lib --test gds_page_rank
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
