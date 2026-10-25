@@ -9,11 +9,13 @@
 //!     (ports of `App.tsx`, `HeaderBar`, `Sidebar`, `QueryBox`, `GraphView`,
 //!     `renderer.ts` node-disc + edge-body programs drawn on a `canvas`).
 
+pub mod adbc;
 pub mod backend;
 pub mod cli;
 pub mod clusters;
 pub mod decorations;
 pub mod model;
+pub mod recents;
 pub mod theme;
 pub mod ui;
 pub mod windows_dll;
