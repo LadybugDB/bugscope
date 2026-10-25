@@ -302,7 +302,7 @@ pub fn ensure_algo_extension(conn: &Connection) -> bool {
 /// an empty ranking (callers show an empty Top PageRank list).
 #[cfg(feature = "icebug-analytics")]
 pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
-    // icebug 13.2.0 speaks arrow 56: build with the alias, not the
+    // icebug 13.5.0 speaks arrow 56: build with the alias, not the
     // lbug-pinned `arrow` (55).
     use arrow56::array::UInt64Array;
     let index: HashMap<&str, u64> = data
@@ -1996,7 +1996,7 @@ pub fn graphr_page_rank(data: &GraphData) -> Vec<(String, f64)> {
 /// equality matters.
 #[cfg(feature = "icebug-analytics")]
 pub fn graphr_leiden_full(data: &GraphData) -> (Vec<u64>, f64, u64) {
-    // icebug 13.2.0 speaks arrow 56: build with the alias, not the
+    // icebug 13.5.0 speaks arrow 56: build with the alias, not the
     // lbug-pinned `arrow` (55).
     use arrow56::array::UInt64Array;
     let n = data.nodes.len();

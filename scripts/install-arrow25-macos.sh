@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Apache Arrow 25 on macOS CI from a pinned Homebrew formula.
 #
-# The icebug prebuilt (scripts/download_icebug.sh, ICEBUG_VERSION 13.2)
+# The icebug prebuilt (scripts/download_icebug.sh, ICEBUG_VERSION 13.5)
 # links `@rpath`-style `libarrow.2500.dylib` (Arrow 25.x), but Homebrew core
 # only ever carries the latest release (26.x as of Oct 2026) and has no
 # versioned `apache-arrow@25` formula. Installing latest would give
