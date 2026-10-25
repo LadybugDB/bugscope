@@ -16,15 +16,12 @@ TARGET_DIR="${ICEBUG_TARGET_DIR:-$PROJECT_DIR/icebug}"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-# Linux CI pairs the 0.22.0 algo extension with NetworKit 13.5 (its
-# prebuilt links libarrow.so.2600, hence the Arrow 26 apt pin in CI);
-# macOS/Windows stay on 13.4 with the Arrow 25 setup. Overridable per
-# run via ICEBUG_VERSION.
-case "$OS" in
-  Linux) DEFAULT_VERSION="13.5" ;;
-  *) DEFAULT_VERSION="13.4" ;;
-esac
-VERSION="${ICEBUG_VERSION:-$DEFAULT_VERSION}"
+# 13.5 pairs with the served 0.22.0 algo extension (its GDS entry points
+# need NetworKit symbols added after 13.2). The macOS/Windows 13.5 builds
+# link libarrow.2500, so the Arrow 25 setup there is unchanged; the Linux
+# 13.5 build links libarrow.so.2600 (a release-pipeline mistake upstream,
+# hence the Arrow 26 apt pin in CI). Overridable per run via ICEBUG_VERSION.
+VERSION="${ICEBUG_VERSION:-13.5}"
 
 case "$OS" in
   Darwin)
