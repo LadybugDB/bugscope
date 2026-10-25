@@ -1410,25 +1410,476 @@ fn search_nodes_legacy(conn: &Connection, query: &str, q: &str) -> Result<Vec<Gr
     Ok(matches)
 }
 
+// ---------------------------------------------------------------------------
+// `alias.*` fallback for graph extraction
+// ---------------------------------------------------------------------------
+//
+// `RETURN a.*` flattens to scalar columns (`a.pid`, `a.name`, …) with no
+// identity and no endpoints, so the graph extractor finds nothing — and no
+// primary-key matching can recover the edges, because the rows simply do
+// not say which two nodes each relationship connects. When the final
+// top-level projection consists of `alias.*` items, re-running the same
+// (read-only) MATCH with bare aliases yields the bound nodes/relationships:
+//
+//   MATCH (a)-[b]->(c) RETURN a.*, b.*, c.* LIMIT 10
+//     -> MATCH (a)-[b]->(c) RETURN a, b, c LIMIT 10
+//
+// Returns `None` when there is nothing to rewrite, so non-`.*` queries never
+// execute twice. Pure function, unit-tested below.
+
+/// Clauses that veto the re-run: executing the query a second time must
+/// never duplicate writes (`CREATE (n) … RETURN n.*` would create the node
+/// twice). The safe direction is to skip the fallback.
+const UNSTAR_WRITE_KEYWORDS: &[&[u8]] = &[
+    b"CREATE", b"MERGE", b"DELETE", b"DETACH", b"SET", b"REMOVE", b"DROP", b"LOAD",
+];
+
+/// Result-list terminators: the first top-level one ends the select list.
+const UNSTAR_TAIL_KEYWORDS: &[&[u8]] = &[
+    b"SKIP",
+    b"LIMIT",
+    b"OFFSET",
+    b"UNION",
+    b"EXCEPT",
+    b"INTERSECT",
+];
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// ASCII keyword match with Cypher word boundaries: the previous byte must
+/// not continue an identifier (the `.`/`:`/`$`/backtick guard rejects
+/// property access, labels, and parameters such as `n.SET` or `:CREATE`),
+/// and neither may the next byte.
+fn keyword_at(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    if bytes.len() < i + kw.len() || !bytes[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    if i > 0 {
+        let p = bytes[i - 1];
+        if is_word_byte(p) || p == b'$' || p == b'.' || p == b':' || p == b'`' {
+            return false;
+        }
+    }
+    if let Some(&n) = bytes.get(i + kw.len()) {
+        if is_word_byte(n) {
+            return false;
+        }
+    }
+    true
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Skip one `//…↵` or `/*…*/` comment; `i` is at the opening `/`.
+fn skip_comment(bytes: &[u8], mut i: usize) -> usize {
+    let n = bytes.len();
+    if bytes[i + 1] == b'/' {
+        while i < n && bytes[i] != b'\n' {
+            i += 1;
+        }
+        i
+    } else {
+        i += 2;
+        while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+            i += 1;
+        }
+        (i + 2).min(n)
+    }
+}
+
+/// Skip a `'...'`/`"..."` literal; `i` is at the opening quote. Handles
+/// backslash and doubled-quote escapes.
+fn skip_quoted(bytes: &[u8], quote: u8, mut i: usize) -> usize {
+    let n = bytes.len();
+    i += 1;
+    while i < n {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            if i + 1 < n && bytes[i + 1] == quote {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Skip a `` `...` `` identifier; `i` is at the opening backtick. A doubled
+/// backtick is an escaped backtick.
+fn skip_backticked(bytes: &[u8], mut i: usize) -> usize {
+    let n = bytes.len();
+    i += 1;
+    while i < n {
+        if bytes[i] == b'`' {
+            if i + 1 < n && bytes[i + 1] == b'`' {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        let j = skip_ws(bytes, i);
+        if j + 1 < bytes.len() && bytes[j] == b'/' && (bytes[j + 1] == b'/' || bytes[j + 1] == b'*')
+        {
+            i = skip_comment(bytes, j);
+            continue;
+        }
+        return j;
+    }
+}
+
+/// Whole-query scan: any write keyword (any depth — the safe direction is
+/// to skip the fallback), plus every top-level `RETURN` position.
+fn scan_query(bytes: &[u8]) -> (bool, Vec<usize>) {
+    let n = bytes.len();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut has_write = false;
+    let mut top_returns = Vec::new();
+    while i < n {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < n && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            i = skip_quoted(bytes, b, i);
+            continue;
+        }
+        if b == b'`' {
+            i = skip_backticked(bytes, i);
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if b.is_ascii_alphabetic() || b == b'_' => {
+                if depth == 0 && keyword_at(bytes, i, b"RETURN") {
+                    top_returns.push(i);
+                }
+                if !has_write {
+                    for w in UNSTAR_WRITE_KEYWORDS {
+                        if keyword_at(bytes, i, w) {
+                            has_write = true;
+                            break;
+                        }
+                    }
+                }
+                while i < n && is_word_byte(bytes[i]) {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (has_write, top_returns)
+}
+
+/// End of the select list: first top-level result-list keyword or `;`.
+/// `ORDER` only counts with a following `BY`, so an alias literally named
+/// `order` (`RETURN order.*`) is not mistaken for a clause.
+fn split_select_tail(bytes: &[u8], start: usize) -> usize {
+    let n = bytes.len();
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < n {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < n && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
+            i = skip_comment(bytes, i);
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            i = skip_quoted(bytes, b, i);
+            continue;
+        }
+        if b == b'`' {
+            i = skip_backticked(bytes, i);
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b';' if depth == 0 => return i,
+            _ if depth == 0 && (b.is_ascii_alphabetic() || b == b'_') => {
+                let mut hit = false;
+                for w in UNSTAR_TAIL_KEYWORDS {
+                    if keyword_at(bytes, i, w) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit && keyword_at(bytes, i, b"ORDER") {
+                    let j = skip_ws(bytes, i + 5);
+                    if keyword_at(bytes, j, b"BY") {
+                        hit = true;
+                    }
+                }
+                if hit {
+                    return i;
+                }
+                while i < n && is_word_byte(bytes[i]) {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Split `[start, end)` on top-level commas (quote/bracket-aware). All
+/// split points are ASCII delimiters, hence valid `str` boundaries.
+fn split_top_commas(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = start;
+    let mut depth = 0usize;
+    let mut item_start = start;
+    while i < end {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < end && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
+            i = skip_comment(bytes, i).min(end);
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            i = skip_quoted(bytes, b, i).min(end);
+            continue;
+        }
+        if b == b'`' {
+            i = skip_backticked(bytes, i).min(end);
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                out.push((item_start, i));
+                i += 1;
+                item_start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out.push((item_start, end));
+    out
+}
+
+/// Rewrite one select item `alias.* [AS name]` to the bare alias.
+/// Returns `None` for anything else (`count(*)`, `*`, property access…).
+fn rewrite_star_item(item: &str) -> Option<String> {
+    let t = item.trim();
+    let b = t.as_bytes();
+    let (alias, rest) = if b.first() == Some(&b'`') {
+        let mut j = 1;
+        while j < b.len() {
+            if b[j] == b'`' {
+                if j + 1 < b.len() && b[j + 1] == b'`' {
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            j += 1;
+        }
+        if j >= b.len() {
+            return None;
+        }
+        (t[..j + 1].to_string(), &t[j + 1..])
+    } else {
+        let mut j = 0;
+        while j < b.len() && is_word_byte(b[j]) {
+            j += 1;
+        }
+        if j == 0 {
+            return None;
+        }
+        (t[..j].to_string(), &t[j..])
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('.')?.trim_start();
+    let rest = rest.strip_prefix('*')?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(alias);
+    }
+    // Optional `AS name` suffix; anything else is left alone.
+    let after_as = rest
+        .get(..2)
+        .filter(|p| p.eq_ignore_ascii_case("as"))
+        .and_then(|_| rest.get(2..))
+        .filter(|r| r.starts_with(|c: char| c.is_whitespace()))?;
+    let name = after_as.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let nb = name.as_bytes();
+    let name_end = if nb.first() == Some(&b'`') {
+        let mut j = 1;
+        while j < nb.len() {
+            if nb[j] == b'`' {
+                if j + 1 < nb.len() && nb[j + 1] == b'`' {
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            j += 1;
+        }
+        if j >= nb.len() {
+            return None;
+        }
+        j + 1
+    } else {
+        let mut j = 0;
+        while j < nb.len() && is_word_byte(nb[j]) {
+            j += 1;
+        }
+        if j == 0 {
+            return None;
+        }
+        j
+    };
+    if !name[name_end..].trim().is_empty() {
+        return None;
+    }
+    Some(format!("{alias} AS {}", &name[..name_end]))
+}
+
+/// Rewrite the final top-level `RETURN alias.*, …` projection to bare
+/// aliases (see the module note above). Returns `None` when the query has
+/// no `alias.*` item or when it is not provably read-only.
+pub fn unstar_projection(query: &str) -> Option<String> {
+    let bytes = query.as_bytes();
+    let (has_write, top_returns) = scan_query(bytes);
+    if has_write {
+        return None;
+    }
+    let &ret = top_returns.last()?;
+    let mut pos = skip_trivia(bytes, ret + 6);
+    if keyword_at(bytes, pos, b"DISTINCT") {
+        pos = skip_trivia(bytes, pos + 8);
+    }
+    let select_start = pos;
+    let tail_start = split_select_tail(bytes, select_start);
+    let mut items = Vec::new();
+    let mut changed = false;
+    for (s, e) in split_top_commas(bytes, select_start, tail_start) {
+        let item = &query[s..e];
+        if let Some(r) = rewrite_star_item(item) {
+            changed = true;
+            items.push(r);
+        } else {
+            items.push(item.trim().to_string());
+        }
+    }
+    if !changed {
+        return None;
+    }
+    // The tail starts at its keyword (`LIMIT …`), but the whitespace that
+    // separated it from the last item was trimmed away with that item.
+    let tail = &query[tail_start..];
+    let mut rewritten = format!("{}{}", &query[..select_start], items.join(", "));
+    if !tail.is_empty() {
+        if !tail.starts_with(';') {
+            rewritten.push(' ');
+        }
+        rewritten.push_str(tail);
+    }
+    Some(rewritten)
+}
+
 /// Run an arbitrary read Cypher query and build a graph from the result:
 /// every returned `Node` becomes a node, every `Rel` a link (with endpoint
 /// nodes seeded from the rel's internal ids if not returned themselves),
 /// recursive rels contribute both. Scalar-only results yield an empty graph.
 pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
-    const CYPHER_NODE_LIMIT: usize = 20_000;
     let mut nodes: HashMap<String, GraphNode> = HashMap::new();
     let mut links = Vec::new();
-    let seed = |nodes: &mut HashMap<String, GraphNode>, id: &InternalID| {
-        let key = format!("{id}");
-        nodes.entry(key.clone()).or_insert_with(|| GraphNode {
-            id: key,
-            name: format!("{id}"),
-            label: String::new(),
-            properties: HashMap::new(),
-        });
-    };
     let mut result = conn.query(query)?;
-    'rows: for row in &mut result {
+    absorb_graph_rows(&mut result, &mut nodes, &mut links);
+    // `alias.*` projections flatten to identity-free scalar columns, so a
+    // bare `RETURN a.*, b.*` extracts no graph. Re-run the same (read-only)
+    // MATCH with bare aliases and merge: the explorer then shows the matched
+    // subgraph instead of nothing. Never re-executes anything that can write.
+    if let Some(retry) = unstar_projection(query) {
+        match conn.query(&retry) {
+            Ok(mut retry_result) => {
+                absorb_graph_rows(&mut retry_result, &mut nodes, &mut links);
+                dedupe_graph_links(&mut links);
+            }
+            Err(e) => {
+                eprintln!("bugscope: unstarred re-run failed ({retry:?}): {e:#}");
+            }
+        }
+    }
+    Ok(GraphData {
+        nodes: nodes.into_values().collect(),
+        links,
+    })
+}
+
+/// Seed an id-only node for a rel endpoint that wasn't returned itself.
+fn seed_graph_node(nodes: &mut HashMap<String, GraphNode>, id: &InternalID) {
+    let key = format!("{id}");
+    nodes.entry(key.clone()).or_insert_with(|| GraphNode {
+        id: key.clone(),
+        name: key,
+        label: String::new(),
+        properties: HashMap::new(),
+    });
+}
+
+/// Row loop shared by both tiers of [`run_cypher`]: every `Node` becomes a
+/// node, every `Rel` a link (endpoints seeded from internal ids), recursive
+/// rels contribute both. Caps keep huge results bounded.
+fn absorb_graph_rows(
+    result: &mut dyn Iterator<Item = Vec<Value>>,
+    nodes: &mut HashMap<String, GraphNode>,
+    links: &mut Vec<GraphLink>,
+) {
+    const CYPHER_NODE_LIMIT: usize = 20_000;
+    'rows: for row in result {
         for val in row.iter() {
             match val {
                 Value::Node(_) => {
@@ -1441,8 +1892,8 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                 }
                 Value::Rel(rel) => {
                     let (src, dst) = (rel.get_src_node(), rel.get_dst_node());
-                    seed(&mut nodes, src);
-                    seed(&mut nodes, dst);
+                    seed_graph_node(nodes, src);
+                    seed_graph_node(nodes, dst);
                     if links.len() >= EDGE_SCAN_LIMIT {
                         break 'rows;
                     }
@@ -1458,12 +1909,12 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
                     rels: rr,
                 } => {
                     for n in rn {
-                        seed(&mut nodes, n.get_node_id());
+                        seed_graph_node(nodes, n.get_node_id());
                     }
                     for r in rr {
                         let (src, dst) = (r.get_src_node(), r.get_dst_node());
-                        seed(&mut nodes, src);
-                        seed(&mut nodes, dst);
+                        seed_graph_node(nodes, src);
+                        seed_graph_node(nodes, dst);
                         if links.len() >= EDGE_SCAN_LIMIT {
                             break 'rows;
                         }
@@ -1479,10 +1930,12 @@ pub fn run_cypher(conn: &Connection, query: &str) -> Result<GraphData> {
             }
         }
     }
-    Ok(GraphData {
-        nodes: nodes.into_values().collect(),
-        links,
-    })
+}
+
+/// Drop structural duplicate links merged from both [`run_cypher`] tiers.
+fn dedupe_graph_links(links: &mut Vec<GraphLink>) {
+    let mut seen = HashSet::new();
+    links.retain(|l| seen.insert((l.source.clone(), l.target.clone(), l.label.clone())));
 }
 
 /// 1-hop neighborhood of `focus` — port of `get_node_neighborhood`.
@@ -1681,6 +2134,65 @@ pub fn gds_leiden_communities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unstar_projection_rewrites() {
+        // The motivating case: maps carry no identity/endpoints, so the
+        // graph needs the bare aliases.
+        assert_eq!(
+            unstar_projection("MATCH (a)-[b]->(c) RETURN a.*, b.*, c.* LIMIT 10"),
+            Some("MATCH (a)-[b]->(c) RETURN a, b, c LIMIT 10".to_string())
+        );
+        // Trailing semicolon and ORDER BY survive verbatim.
+        assert_eq!(
+            unstar_projection("MATCH (a)-[b]->(c) RETURN a.*, b.* ORDER BY b.x LIMIT 10;"),
+            Some("MATCH (a)-[b]->(c) RETURN a, b ORDER BY b.x LIMIT 10;".to_string())
+        );
+        // Backticked aliases, AS renaming, DISTINCT, lowercase keywords.
+        assert_eq!(
+            unstar_projection("MATCH (n:`My Node`) RETURN `My Node`.*"),
+            Some("MATCH (n:`My Node`) RETURN `My Node`".to_string())
+        );
+        assert_eq!(
+            unstar_projection("MATCH (a) RETURN a.* AS m"),
+            Some("MATCH (a) RETURN a AS m".to_string())
+        );
+        assert_eq!(
+            unstar_projection("MATCH (a) RETURN DISTINCT a.*"),
+            Some("MATCH (a) RETURN DISTINCT a".to_string())
+        );
+        assert_eq!(
+            unstar_projection("match (a) return a.* limit 5"),
+            Some("match (a) return a limit 5".to_string())
+        );
+        // Unaffected shapes: no second execution for these.
+        assert_eq!(unstar_projection("MATCH (a) RETURN a, b"), None);
+        assert_eq!(unstar_projection("MATCH (n) RETURN *"), None);
+        assert_eq!(unstar_projection("MATCH (n) RETURN count(*)"), None);
+        assert_eq!(unstar_projection("MATCH (a) RETURN a.name, a.pid"), None);
+        // Writes never re-run, even with a `.*` projection.
+        assert_eq!(unstar_projection("CREATE (n:N {pid: 1}) RETURN n.*"), None);
+        assert_eq!(unstar_projection("MATCH (n) SET n.x = 1 RETURN n.*"), None);
+        assert_eq!(
+            unstar_projection("MATCH (a)-[r]->(b) DELETE r RETURN a.*"),
+            None
+        );
+        // `RETURN` inside strings/comments does not confuse the scanner.
+        assert_eq!(
+            unstar_projection("MATCH (a) RETURN '(' AS p, a.*"),
+            Some("MATCH (a) RETURN '(' AS p, a".to_string())
+        );
+        assert_eq!(
+            unstar_projection("// RETURN x\nMATCH (a) RETURN a.*"),
+            Some("// RETURN x\nMATCH (a) RETURN a".to_string())
+        );
+        // Subquery RETURNs are left alone; only the final top-level one
+        // is rewritten.
+        assert_eq!(
+            unstar_projection("CALL { MATCH (x) RETURN x.* } MATCH (a) RETURN a.*"),
+            Some("CALL { MATCH (x) RETURN x.* } MATCH (a) RETURN a".to_string())
+        );
+    }
 
     #[test]
     fn schema_subset_query_shapes() {
