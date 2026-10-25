@@ -149,7 +149,7 @@ stage_transitive_deps() {
     for t in "${targets[@]}"; do
       # A dylib's own install-ID (otool -D) is listed as the first otool -L
       # line but is not a dependency: staging it would duplicate the file
-      # under the ID basename (e.g. liblbug.0.21.1.dylib's ID
+      # under the ID basename (e.g. liblbug.0.21.2.dylib's ID
       # @rpath/liblbug.0.dylib pulled a stale brew ladybug copy + its
       # openssl4 deps). Skip it.
       self_id="$(otool -D "$t" 2>/dev/null | tail -n1)"
