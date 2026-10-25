@@ -3910,9 +3910,23 @@ impl RootView {
             }))
     }
 
+    /// Fixed-width family for the query shell so box tables align, no
+    /// matter which proportional label font the canvas prefers.
+    fn shell_font_family() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "Menlo"
+        } else if cfg!(target_os = "windows") {
+            "Consolas"
+        } else {
+            "DejaVu Sans Mono"
+        }
+    }
+
     /// Query view: `lbug`-style shell — scrollback plus a readline input
     /// with history. Runs against the selected database (local or remote
     /// ADBC); graph-returning local Cypher also replaces the explorer.
+    /// Everything here renders in the fixed-width shell font so the box
+    /// tables line up.
     fn render_query_view(&mut self, theme: Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let sfocus = self.shell_focus.clone();
         let sfocused = self.shell_focus.is_focused(window);
@@ -3925,6 +3939,7 @@ impl RootView {
             .w_full()
             .id("shell-scroll")
             .overflow_y_scroll()
+            .font_family(Self::shell_font_family())
             .text_xs()
             .child(
                 div().text_color(theme.secondary).child(
@@ -3988,6 +4003,7 @@ impl RootView {
                             .border_1()
                             .border_color(if sfocused { theme.accent } else { theme.border })
                             .text_color(theme.bright)
+                            .font_family(Self::shell_font_family())
                             .text_sm()
                             .cursor_text()
                             .track_focus(&sfocus)
