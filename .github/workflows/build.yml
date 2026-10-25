@@ -37,7 +37,8 @@ jobs:
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
           # Pinned to 26.0.0 to match the Linux icebug 13.5 prebuilt, which
-          # links libarrow.so.2600 (macOS stays on Arrow 25 + icebug 13.4).
+          # links libarrow.so.2600 (macOS/Windows 13.5 builds link
+          # libarrow.2500, so they stay on the Arrow 25 setup).
           wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           # Bound mirror stalls: fail fast instead of hanging the run for hours.
@@ -154,7 +155,8 @@ jobs:
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
           # Pinned to 26.0.0 to match the Linux icebug 13.5 prebuilt, which
-          # links libarrow.so.2600 (macOS stays on Arrow 25 + icebug 13.4).
+          # links libarrow.so.2600 (macOS/Windows 13.5 builds link
+          # libarrow.2500, so they stay on the Arrow 25 setup).
           wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           # Bound mirror stalls: fail fast instead of hanging the run for hours.
