@@ -7,11 +7,12 @@ This is the native port of [bugscope-tauri](https://github.com/LadybugDB/bugscop
 ## Features
 
 - **Interactive Graph View** - Navigate through connected data using a force-directed graph. Drag nodes to rearrange, zoom in/out, and pan around the canvas.
-- **Database Selection** - Choose from available LadybugDB databases in the sidebar, or use **Open file…** to browse for any `*.lbdb` file.
+- **Database Selection** - Left pane with Explore/Query icons, recently opened `.lbdb` files, the scanned directory list plus **Open file…**, and a **Remote (ADBC)** connect box for Arrow Flight URIs (`grpc://…`).
 - **Visual Encoding** - Node size reflects connection count (more connections = larger nodes), and colors differentiate entity types.
 - **Dark/Light Mode** - Follows the system appearance automatically, same themes as the Tauri app.
 - **Relationship Labels** - Hover over edges to see the type of relationship between connected nodes.
-- **Search + Focus** - Substring search over node properties (`/foo`, bare `/` clears); click a match to focus its 1-hop neighborhood.
+- **Search + Focus** - Substring search over node properties (`/foo`, bare `/` clears); click a match to focus its 1-hop neighborhood. Explore-box and shell inputs share readline editing (↑/↓ history, `Ctrl-A/E/K/U/W`, `Alt-B/F`).
+- **Query Shell View** - `lbug`-style shell (`◈ Explore` / `❯ Query` in the header or left pane, `Ctrl-E`/`Ctrl-J`) with scrollback box tables, `:help :clear :schema :tables :max_rows`, and history persisted in `~/.bugscope_shell_history`.
 - **Breadcrumbs + dot-commands** - Drill-down trail under the header (`Root › A › B`, cached jumps) plus query-box `.root` / `.parent` (`.up`/`.back`) and `.schema` / `.data` (schema view without the menu).
 - **Schema View** - Header `Data`/`Schema` toggle (or `.schema` / `.data` in the query box, `File → Toggle Schema View` menu) to switch between node tables and the edge graph. The breadcrumb badge (`schema ✕`) is also a one-click way back to data.
 - **Menus everywhere** - macOS uses the native menu bar; Windows and Linux draw an equivalent in-app `File`/`View` bar with the same commands (`Ctrl` in place of `⌘`).

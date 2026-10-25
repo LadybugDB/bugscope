@@ -1,11 +1,13 @@
 //! GPUI view tree — port of `App.tsx` + `HeaderBar` + `Sidebar` +
 //! `QueryBox` + `GraphView` (layout, interaction, overlay).
 
+use crate::adbc;
 use crate::backend::{self, DatabaseInfo, GraphData, GraphNode};
 use crate::cli::CliOptions;
 use crate::clusters;
 use crate::decorations;
 use crate::model::{node_size, Camera, GraphModel, Vec2};
+use crate::recents;
 use crate::theme::{edge_color, highlight, node_color, Theme};
 use gpui::*;
 use std::cell::Cell;
@@ -59,6 +61,32 @@ pub enum ViewMode {
     Graph,
     Treemap,
     Sunburst,
+}
+
+/// Left-rail section: the graph explorer (current main view) or the
+/// `lbug`-style query shell (readline editing + history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppSection {
+    #[default]
+    Explore,
+    Query,
+}
+
+/// One scrollback row in the query shell: an echoed command (`prompt`) or
+/// output text. `error` renders in the secondary/error tone.
+#[derive(Clone)]
+struct ShellLine {
+    prompt: bool,
+    error: bool,
+    text: String,
+}
+
+/// Single-line input targeted by the shared readline handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineTarget {
+    Query,
+    Shell,
+    Remote,
 }
 
 /// Startup default threshold: the first graph shown with more than this
@@ -172,6 +200,28 @@ pub struct RootView {
     schema_node_sel: HashSet<String>,
     schema_edge_sel: HashSet<String>,
     schema_mode: bool,
+    /// Left-pane section: graph explorer vs `lbug`-style query shell.
+    app_section: AppSection,
+    /// Recently opened local `.lbdb` files (most recent first, persisted
+    /// in `~/.bugscope_recent.json`). Shown above the scanned list.
+    recent_local: Vec<String>,
+    /// Remote (ADBC / Arrow Flight) connect box state.
+    remote_uri: String,
+    remote_cursor: usize,
+    remote_focus: FocusHandle,
+    adbc_status: String,
+    /// Query-shell (`lbug`-style) state: input + cursor, readline history
+    /// (persisted in `~/.bugscope_shell_history`), and scrollback.
+    shell_input: String,
+    shell_cursor: usize,
+    shell_history: Vec<String>,
+    shell_hist_idx: Option<usize>,
+    shell_lines: Vec<ShellLine>,
+    shell_focus: FocusHandle,
+    shell_max_rows: usize,
+    /// Explore query-box history (↑/↓ like the shell).
+    query_history: Vec<String>,
+    query_hist_idx: Option<usize>,
     sidebar_open: bool,
     show_preferences: bool,
     /// Open in-app menu (`"File"` / `"View"`), `None` when closed. Only
@@ -238,6 +288,10 @@ impl RootView {
             .next()
             .or(if databases.is_empty() { None } else { Some(0) });
         let query_focus = cx.focus_handle();
+        let remote_focus = cx.focus_handle();
+        let shell_focus = cx.focus_handle();
+        let recent_local = recents::load_recent_local();
+        // Seed persisted remotes (not connected yet) after the scanned locals.
         let mut this = Self {
             databases,
             selected_db,
@@ -270,7 +324,27 @@ impl RootView {
             schema_node_sel: HashSet::new(),
             schema_edge_sel: HashSet::new(),
             schema_mode: opts.schema_mode,
-            sidebar_open: false,
+            app_section: AppSection::Explore,
+            recent_local,
+            remote_uri: String::new(),
+            remote_cursor: 0,
+            remote_focus,
+            adbc_status: "Not connected.".to_string(),
+            shell_input: String::new(),
+            shell_cursor: 0,
+            shell_history: recents::load_shell_history(),
+            shell_hist_idx: None,
+            shell_lines: vec![ShellLine {
+                prompt: false,
+                error: false,
+                text: "lbug shell — Cypher + :help :clear :schema :tables. ↑/↓ history."
+                    .to_string(),
+            }],
+            shell_focus,
+            shell_max_rows: 20,
+            query_history: Vec::new(),
+            query_hist_idx: None,
+            sidebar_open: true,
             show_preferences: false,
             open_menu: None,
             dark_override: None,
@@ -286,7 +360,22 @@ impl RootView {
             canvas_origin: Rc::new(Cell::new(point(px(0.), px(0.)))),
             canvas_size: Rc::new(Cell::new(size(px(900.), px(600.)))),
         };
-        if this.selected_db.is_some() {
+        // Persisted remotes join the list (selecting one connects on load).
+        for uri in recents::load_recent_remote() {
+            if !this.databases.iter().any(|d| d.path == uri) {
+                let mut info = DatabaseInfo::remote(&uri);
+                info.id = this.databases.len();
+                this.databases.push(info);
+            }
+        }
+        // Remember the startup file so it leads the recents list.
+        if let Some(id) = this.selected_db {
+            if let Some(db) = this.databases.get(id) {
+                if !db.is_remote() {
+                    recents::remember_local(&db.path);
+                    this.recent_local = recents::load_recent_local();
+                }
+            }
             this.load_graph(cx);
         }
         cx.spawn(async move |this, cx| loop {
@@ -330,11 +419,138 @@ impl RootView {
         cx.notify();
     }
 
+    /// Switch the active database (local file or remote URI) and load it.
+    /// Records the pick in the recents file so the left pane leads with it.
+    pub fn select_database(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(db) = self.databases.get(id) else {
+            return;
+        };
+        let (path, remote) = (db.path.clone(), db.remote_uri.clone());
+        self.selected_db = Some(id);
+        self.clear_schema_selection();
+        if let Some(uri) = remote {
+            recents::remember_remote(&uri);
+        } else {
+            recents::remember_local(&path);
+            self.recent_local = recents::load_recent_local();
+        }
+        self.load_graph(cx);
+    }
+
+    /// Left-rail section switch (Explore ⇄ Query shell).
+    pub fn set_section(&mut self, section: AppSection, cx: &mut Context<Self>) {
+        self.app_section = section;
+        cx.notify();
+    }
+
+    /// Connect to a remote Arrow Flight / ADBC database. On success the URI
+    /// joins the database list (and recents) and becomes selected.
+    pub fn connect_remote(&mut self, cx: &mut Context<Self>) {
+        let uri = self.remote_uri.trim().to_string();
+        if uri.is_empty() {
+            self.adbc_status = "Enter a URI like grpc://127.0.0.1:50051.".to_string();
+            cx.notify();
+            return;
+        }
+        if !adbc::is_remote_uri(&uri) {
+            self.adbc_status = "URI should start with grpc:// or http(s)://.".to_string();
+            cx.notify();
+            return;
+        }
+        self.adbc_status = format!("Connecting to {uri}…");
+        cx.notify();
+        match adbc::remote_table_catalog(&uri) {
+            Ok(catalog) => {
+                let tables = catalog.len();
+                if let Some(existing) = self.databases.iter().position(|d| d.path == uri) {
+                    self.selected_db = Some(existing);
+                } else {
+                    let mut info = DatabaseInfo::remote(&uri);
+                    info.id = self.databases.len();
+                    self.databases.push(info);
+                    self.selected_db = Some(self.databases.len() - 1);
+                }
+                recents::remember_remote(&uri);
+                self.clear_schema_selection();
+                self.adbc_status = format!("Connected: {tables} tables.");
+                self.remote_uri.clear();
+                self.remote_cursor = 0;
+                self.push_shell_line(
+                    false,
+                    false,
+                    format!("connected to {uri} ({tables} tables)"),
+                );
+                self.load_graph(cx);
+            }
+            Err(e) => {
+                self.adbc_status = format!("Connect failed: {e:#}");
+                self.push_shell_line(false, true, format!("connect {uri}: {e:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Drop a remote entry from the list (locals are never removed here).
+    pub fn disconnect_remote(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(db) = self.databases.get(id) else {
+            return;
+        };
+        let Some(uri) = db.remote_uri.clone() else {
+            return;
+        };
+        recents::forget_remote(&uri);
+        let was_selected = self.selected_db == Some(id);
+        self.databases.retain(|d| d.path != uri);
+        for (i, d) in self.databases.iter_mut().enumerate() {
+            d.id = i;
+        }
+        if was_selected {
+            self.selected_db = if self.databases.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+            if self.selected_db.is_some() {
+                self.load_graph(cx);
+            } else {
+                self.set_status("Disconnected.", cx);
+            }
+        }
+        self.adbc_status = format!("Removed {uri}.");
+        cx.notify();
+    }
+
     pub fn load_graph(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected_db else { return };
         let Some(db) = self.databases.get(id) else {
             return;
         };
+        // Remote databases load over Arrow Flight / ADBC; locals open in-process.
+        if let Some(uri) = db.remote_uri.clone() {
+            let name = db.name.clone();
+            let schema_mode = self.schema_mode;
+            let limit = self.limit;
+            let work = if schema_mode {
+                adbc::remote_collect_schema_graph(&uri)
+            } else {
+                adbc::remote_collect_edge_graph(&uri, limit)
+            };
+            match work {
+                Ok(data) => {
+                    let msg = format!(
+                        "{name}: {} nodes, {} edges (remote)",
+                        data.nodes.len(),
+                        data.links.len()
+                    );
+                    self.display_loaded(data, msg, cx);
+                }
+                Err(e) => {
+                    eprintln!("bugscope: remote load failed: {e:#}");
+                    self.set_status(format!("Remote load failed: {e:#}"), cx)
+                }
+            }
+            return;
+        }
         let path = db.path.clone();
         let name = db.name.clone();
         let schema_mode = self.schema_mode;
@@ -376,6 +592,30 @@ impl RootView {
                 self.set_status(format!("Load failed: {e:#}"), cx)
             }
         }
+    }
+
+    /// Shared tail of every full graph load: reset view state, settle the
+    /// layout, recompute analytics, and publish the status line.
+    fn display_loaded(&mut self, data: GraphData, msg: String, cx: &mut Context<Self>) {
+        self.full = data.clone();
+        self.model.load(&data);
+        self.model.settle();
+        self.frame_initial(None);
+        self.focused = None;
+        self.trail.clear();
+        self.selected = None;
+        self.hovered = None;
+        self.hover_pos = None;
+        self.hovered_edge = None;
+        self.treemap_hover = None;
+        self.drag_node = None;
+        self.panning = None;
+        self.search_results.clear();
+        self.running = !self.schema_mode;
+        self.maybe_auto_view(data.links.len());
+        self.shown = data;
+        self.refresh_analytics();
+        self.set_status(msg, cx);
     }
 
     /// Display name for a breadcrumb: node name when known, else the id.
@@ -657,6 +897,7 @@ impl RootView {
                 return;
             };
             let _ = this.update(cx, |view, cx| {
+                let path_str = path.to_string_lossy().into_owned();
                 let mut info = backend::database_info_for_path(&path);
                 if let Some(existing) = view.databases.iter().position(|d| d.path == info.path) {
                     view.selected_db = Some(existing);
@@ -667,6 +908,8 @@ impl RootView {
                 }
                 // A different file has a different schema: drop the selection.
                 view.clear_schema_selection();
+                recents::remember_local(&path_str);
+                view.recent_local = recents::load_recent_local();
                 view.load_graph(cx);
             });
         })
@@ -912,69 +1155,419 @@ impl RootView {
         self.load_graph(cx);
     }
 
-    /// Keep the cursor on a char boundary and inside the text.
-    fn clamp_cursor(&mut self) {
-        while !self.query.is_char_boundary(self.query_cursor) && self.query_cursor > 0 {
-            self.query_cursor -= 1;
+    /// Generic readline helpers shared by the explore query box, the query
+    /// shell, and the remote URI box. All keep the cursor on a char
+    /// boundary, mirroring `lbug` shell line editing.
+    fn clamp_text(text: &str, cursor: &mut usize) {
+        while !text.is_char_boundary(*cursor) && *cursor > 0 {
+            *cursor -= 1;
         }
-        self.query_cursor = self.query_cursor.min(self.query.len());
+        *cursor = (*cursor).min(text.len());
     }
 
-    fn query_insert(&mut self, text: &str) {
-        self.clamp_cursor();
-        self.query.insert_str(self.query_cursor, text);
-        self.query_cursor += text.len();
+    fn text_insert(text: &mut String, cursor: &mut usize, s: &str) {
+        Self::clamp_text(text, cursor);
+        text.insert_str(*cursor, s);
+        *cursor += s.len();
     }
 
-    /// Backspace: delete the char before the cursor (⌘⌫ clears to start).
-    fn query_backspace(&mut self, to_start: bool) {
-        self.clamp_cursor();
+    fn text_backspace(text: &mut String, cursor: &mut usize, to_start: bool) {
+        Self::clamp_text(text, cursor);
         if to_start {
-            self.query.drain(..self.query_cursor);
-            self.query_cursor = 0;
+            text.drain(..*cursor);
+            *cursor = 0;
             return;
         }
-        if self.query_cursor == 0 {
+        if *cursor == 0 {
             return;
         }
-        let mut start = self.query_cursor - 1;
-        while !self.query.is_char_boundary(start) && start > 0 {
+        let mut start = *cursor - 1;
+        while !text.is_char_boundary(start) && start > 0 {
             start -= 1;
         }
-        self.query.drain(start..self.query_cursor);
-        self.query_cursor = start;
+        text.drain(start..*cursor);
+        *cursor = start;
     }
 
-    /// Forward delete: remove the char under the cursor.
-    fn query_delete_fwd(&mut self) {
-        self.clamp_cursor();
-        if self.query_cursor >= self.query.len() {
+    fn text_delete_fwd(text: &mut String, cursor: &mut usize) {
+        Self::clamp_text(text, cursor);
+        if *cursor >= text.len() {
             return;
         }
-        let mut end = self.query_cursor + 1;
-        while !self.query.is_char_boundary(end) && end < self.query.len() {
+        let mut end = *cursor + 1;
+        while !text.is_char_boundary(end) && end < text.len() {
             end += 1;
         }
-        self.query.drain(self.query_cursor..end);
+        text.drain(*cursor..end);
     }
 
-    fn query_move(&mut self, dir: i8) {
-        self.clamp_cursor();
+    fn text_move(text: &str, cursor: &mut usize, dir: i8) {
+        Self::clamp_text(text, cursor);
         if dir < 0 {
-            if self.query_cursor > 0 {
-                let mut c = self.query_cursor - 1;
-                while !self.query.is_char_boundary(c) && c > 0 {
+            if *cursor > 0 {
+                let mut c = *cursor - 1;
+                while !text.is_char_boundary(c) && c > 0 {
                     c -= 1;
                 }
-                self.query_cursor = c;
+                *cursor = c;
             }
         } else {
-            self.query_cursor = self
-                .query
+            *cursor = text
                 .char_indices()
                 .map(|(i, _)| i)
-                .find(|&i| i > self.query_cursor)
-                .unwrap_or(self.query.len());
+                .find(|&i| i > *cursor)
+                .unwrap_or(text.len());
+        }
+    }
+
+    fn text_move_word(text: &str, cursor: &mut usize, dir: i8) {
+        Self::clamp_text(text, cursor);
+        let bytes = text.as_bytes();
+        if dir < 0 {
+            let mut i = *cursor;
+            while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            *cursor = i;
+        } else {
+            let mut i = *cursor;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            *cursor = i.min(text.len());
+        }
+        Self::clamp_text(text, cursor);
+    }
+
+    fn text_kill_to_start(text: &mut String, cursor: &mut usize) {
+        Self::clamp_text(text, cursor);
+        text.drain(..*cursor);
+        *cursor = 0;
+    }
+
+    fn text_kill_to_end(text: &mut String, cursor: &mut usize) {
+        Self::clamp_text(text, cursor);
+        text.truncate(*cursor);
+    }
+
+    fn text_kill_word_back(text: &mut String, cursor: &mut usize) {
+        Self::clamp_text(text, cursor);
+        let bytes = text.as_bytes();
+        let mut i = *cursor;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        text.drain(i..*cursor);
+        *cursor = i;
+    }
+
+    /// Which single-line input a key event targets.
+    fn line_text(&mut self, target: LineTarget) -> (&mut String, &mut usize) {
+        match target {
+            LineTarget::Query => (&mut self.query, &mut self.query_cursor),
+            LineTarget::Shell => (&mut self.shell_input, &mut self.shell_cursor),
+            LineTarget::Remote => (&mut self.remote_uri, &mut self.remote_cursor),
+        }
+    }
+
+    /// Shared `lbug`-style readline for all single-line inputs: history on
+    /// ↑/↓ (Ctrl-P/N), line ends (Ctrl-A/E, Home/End), char/word motion
+    /// (Ctrl-B/F, Alt-B/F), kills (Ctrl-K/U/W), paste (⌘V), Enter to
+    /// submit, Escape to clear. Returns true when the event was consumed.
+    fn apply_line_key(
+        &mut self,
+        target: LineTarget,
+        ev: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mods = &ev.keystroke.modifiers;
+        let cmd = mods.platform || mods.control;
+        let key = ev.keystroke.key.as_str();
+        // Submit / clear / history first (they don't need the text borrow).
+        match key {
+            "enter" => {
+                match target {
+                    LineTarget::Query => self.run_query(cx),
+                    LineTarget::Shell => self.run_shell_command(cx),
+                    LineTarget::Remote => self.connect_remote(cx),
+                }
+                return true;
+            }
+            "escape" => {
+                match target {
+                    LineTarget::Query => {
+                        self.query.clear();
+                        self.query_cursor = 0;
+                        self.query_hist_idx = None;
+                    }
+                    LineTarget::Shell => {
+                        self.shell_input.clear();
+                        self.shell_cursor = 0;
+                        self.shell_hist_idx = None;
+                    }
+                    LineTarget::Remote => {}
+                }
+                cx.notify();
+                return true;
+            }
+            "up" if !cmd => {
+                match target {
+                    LineTarget::Query => self.query_history_prev(),
+                    LineTarget::Shell => self.shell_history_prev(),
+                    LineTarget::Remote => return false,
+                }
+                cx.notify();
+                return true;
+            }
+            "down" if !cmd => {
+                match target {
+                    LineTarget::Query => self.query_history_next(),
+                    LineTarget::Shell => self.shell_history_next(),
+                    LineTarget::Remote => return false,
+                }
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        // Ctrl-P/N history (readline) when no other modifier crowds in.
+        if mods.control && !mods.platform && !mods.alt {
+            match key {
+                "p" => {
+                    match target {
+                        LineTarget::Query => self.query_history_prev(),
+                        LineTarget::Shell => self.shell_history_prev(),
+                        LineTarget::Remote => return false,
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "n" => {
+                    match target {
+                        LineTarget::Query => self.query_history_next(),
+                        LineTarget::Shell => self.shell_history_next(),
+                        LineTarget::Remote => return false,
+                    }
+                    cx.notify();
+                    return true;
+                }
+                "a" => {
+                    let (_, cursor) = self.line_text(target);
+                    *cursor = 0;
+                    cx.notify();
+                    return true;
+                }
+                "e" => {
+                    let (text, cursor) = self.line_text(target);
+                    *cursor = text.len();
+                    cx.notify();
+                    return true;
+                }
+                "b" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut c = *cursor;
+                    Self::text_move(text, &mut c, -1);
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "f" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut c = *cursor;
+                    Self::text_move(text, &mut c, 1);
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "k" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut t = std::mem::take(text);
+                    let mut c = *cursor;
+                    Self::text_kill_to_end(&mut t, &mut c);
+                    *text = t;
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "u" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut t = std::mem::take(text);
+                    let mut c = *cursor;
+                    Self::text_kill_to_start(&mut t, &mut c);
+                    *text = t;
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "w" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut t = std::mem::take(text);
+                    let mut c = *cursor;
+                    Self::text_kill_word_back(&mut t, &mut c);
+                    *text = t;
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "d" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut t = std::mem::take(text);
+                    let mut c = *cursor;
+                    Self::text_delete_fwd(&mut t, &mut c);
+                    *text = t;
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Word motion on Alt-B/F.
+        if mods.alt && !mods.control && !mods.platform {
+            match key {
+                "b" | "left" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut c = *cursor;
+                    Self::text_move_word(text, &mut c, -1);
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                "f" | "right" => {
+                    let (text, cursor) = self.line_text(target);
+                    let mut c = *cursor;
+                    Self::text_move_word(text, &mut c, 1);
+                    *cursor = c;
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        match key {
+            "backspace" => {
+                let (text, cursor) = self.line_text(target);
+                let mut t = std::mem::take(text);
+                let mut c = *cursor;
+                Self::text_backspace(&mut t, &mut c, cmd);
+                *text = t;
+                *cursor = c;
+                if target != LineTarget::Remote {
+                    self.clear_hist_idx(target);
+                }
+                cx.notify();
+                true
+            }
+            "delete" => {
+                let (text, cursor) = self.line_text(target);
+                let mut t = std::mem::take(text);
+                let mut c = *cursor;
+                Self::text_delete_fwd(&mut t, &mut c);
+                *text = t;
+                *cursor = c;
+                if target != LineTarget::Remote {
+                    self.clear_hist_idx(target);
+                }
+                cx.notify();
+                true
+            }
+            "left" => {
+                let (text, cursor) = self.line_text(target);
+                let mut c = *cursor;
+                if mods.alt {
+                    Self::text_move_word(text, &mut c, -1);
+                } else {
+                    Self::text_move(text, &mut c, -1);
+                }
+                *cursor = c;
+                cx.notify();
+                true
+            }
+            "right" => {
+                let (text, cursor) = self.line_text(target);
+                let mut c = *cursor;
+                if mods.alt {
+                    Self::text_move_word(text, &mut c, 1);
+                } else {
+                    Self::text_move(text, &mut c, 1);
+                }
+                *cursor = c;
+                cx.notify();
+                true
+            }
+            "home" => {
+                let (_, cursor) = self.line_text(target);
+                *cursor = 0;
+                cx.notify();
+                true
+            }
+            "end" => {
+                let (text, cursor) = self.line_text(target);
+                *cursor = text.len();
+                cx.notify();
+                true
+            }
+            "v" if cmd => {
+                if let Some(item) = cx.read_from_clipboard() {
+                    if let Some(text_content) = item.text() {
+                        let flat = text_content
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !flat.is_empty() {
+                            let (text, cursor) = self.line_text(target);
+                            let mut t = std::mem::take(text);
+                            let mut c = *cursor;
+                            Self::text_insert(&mut t, &mut c, &flat);
+                            *text = t;
+                            *cursor = c;
+                            self.clear_hist_idx(target);
+                        }
+                    }
+                }
+                cx.notify();
+                true
+            }
+            "c" if cmd => {
+                let (text, _) = self.line_text(target);
+                if !text.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                }
+                true
+            }
+            _ => {
+                if let Some(ch) = ev.keystroke.key_char.clone() {
+                    if !mods.control && !mods.platform && !mods.alt && ch.chars().count() == 1 {
+                        let (text, cursor) = self.line_text(target);
+                        let mut t = std::mem::take(text);
+                        let mut c = *cursor;
+                        Self::text_insert(&mut t, &mut c, &ch);
+                        *text = t;
+                        *cursor = c;
+                        self.clear_hist_idx(target);
+                        cx.notify();
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    fn clear_hist_idx(&mut self, target: LineTarget) {
+        match target {
+            LineTarget::Query => self.query_hist_idx = None,
+            LineTarget::Shell => self.shell_hist_idx = None,
+            LineTarget::Remote => {}
         }
     }
 
@@ -1014,6 +1607,42 @@ impl RootView {
             return;
         }
         if term.is_empty() {
+            return;
+        }
+        // Explore-box history (↑/↓ like the shell).
+        if self.query_history.last().map(|l| l.as_str()) != Some(raw.as_str()) {
+            self.query_history.push(raw.clone());
+            if self.query_history.len() > 200 {
+                self.query_history.remove(0);
+            }
+        }
+        self.query_hist_idx = None;
+        // Remote databases run Cypher over Arrow Flight and report table
+        // counts (full decoding of node structs is a Query-view concern).
+        if let Some(uri) = db.remote_uri.clone() {
+            if is_search {
+                self.set_status("Remote search runs in the Query view.", cx);
+                return;
+            }
+            match adbc::query_cypher(&uri, &raw) {
+                Ok((schema, batches)) => {
+                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    let table = adbc::format_batches(&schema, &batches, self.shell_max_rows);
+                    self.push_shell_line(true, false, raw.clone());
+                    self.push_shell_line(false, false, table.trim_end().to_string());
+                    self.set_status(
+                        format!(
+                            "Remote Cypher: {rows} rows, {} cols — see Query view",
+                            schema.fields().len()
+                        ),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("bugscope: remote query failed: {e:#}");
+                    self.set_status(format!("Remote query failed: {e:#}"), cx)
+                }
+            }
             return;
         }
         let path = db.path.clone();
@@ -1142,6 +1771,288 @@ impl RootView {
                 );
             }
         }
+    }
+
+    /// Append one scrollback row, capping the buffer so long sessions
+    /// stay cheap to render.
+    fn push_shell_line(&mut self, prompt: bool, error: bool, text: String) {
+        // Split multi-line tables into one row per line for `div` rendering.
+        let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let first = lines.len() == 1;
+        for (i, line) in lines.into_iter().enumerate() {
+            self.shell_lines.push(ShellLine {
+                prompt: prompt && (first || i == 0),
+                error,
+                text: line,
+            });
+        }
+        if self.shell_lines.len() > 2000 {
+            let drop = self.shell_lines.len() - 2000;
+            self.shell_lines.drain(..drop);
+        }
+    }
+
+    fn shell_history_prev(&mut self) {
+        if self.shell_history.is_empty() {
+            return;
+        }
+        let next = match self.shell_hist_idx {
+            None => self.shell_history.len().saturating_sub(1),
+            Some(i) => i.saturating_sub(1),
+        };
+        self.shell_hist_idx = Some(next);
+        if let Some(cmd) = self.shell_history.get(next).cloned() {
+            self.shell_input = cmd;
+            self.shell_cursor = self.shell_input.len();
+        }
+    }
+
+    fn shell_history_next(&mut self) {
+        let Some(i) = self.shell_hist_idx else {
+            return;
+        };
+        if i + 1 >= self.shell_history.len() {
+            self.shell_hist_idx = None;
+            self.shell_input.clear();
+            self.shell_cursor = 0;
+        } else {
+            self.shell_hist_idx = Some(i + 1);
+            if let Some(cmd) = self.shell_history.get(i + 1).cloned() {
+                self.shell_input = cmd;
+                self.shell_cursor = self.shell_input.len();
+            }
+        }
+    }
+
+    fn query_history_prev(&mut self) {
+        if self.query_history.is_empty() {
+            return;
+        }
+        let next = match self.query_hist_idx {
+            None => self.query_history.len().saturating_sub(1),
+            Some(i) => i.saturating_sub(1),
+        };
+        self.query_hist_idx = Some(next);
+        if let Some(cmd) = self.query_history.get(next).cloned() {
+            self.query = cmd;
+            self.query_cursor = self.query.len();
+        }
+    }
+
+    fn query_history_next(&mut self) {
+        let Some(i) = self.query_hist_idx else {
+            return;
+        };
+        if i + 1 >= self.query_history.len() {
+            self.query_hist_idx = None;
+            self.query.clear();
+            self.query_cursor = 0;
+        } else {
+            self.query_hist_idx = Some(i + 1);
+            if let Some(cmd) = self.query_history.get(i + 1).cloned() {
+                self.query = cmd;
+                self.query_cursor = self.query.len();
+            }
+        }
+    }
+
+    /// Shell `:help` text, mirroring `lbug` command names.
+    fn shell_help() -> &'static str {
+        "Cypher runs against the selected database (local or remote ADBC).\n\
+         :help          show this help\n\
+         :clear         clear the scrollback\n\
+         :schema        show node/rel tables (CALL SHOW_TABLES)\n\
+         :tables        alias for :schema\n\
+         :max_rows N    cap displayed rows (default 20)\n\
+         .root .parent  same drill-down navigation as the explore box\n\
+         /foo           substring search (explore matches pane)\n\
+         ↑/↓ Ctrl-P/N  history · Ctrl-A/E line ends · Ctrl-K/U kill"
+    }
+
+    /// Enter in the query shell: `lbug`-style commands + Cypher with a box
+    /// table. Graph-returning local Cypher also replaces the explorer graph
+    /// (same as the explore box); everything echoes to the scrollback.
+    fn run_shell_command(&mut self, cx: &mut Context<Self>) {
+        let raw = self.shell_input.trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        self.push_shell_line(true, false, raw.clone());
+        self.shell_input.clear();
+        self.shell_cursor = 0;
+        self.shell_hist_idx = None;
+        if self.shell_history.last().map(|l| l.as_str()) != Some(raw.as_str()) {
+            self.shell_history.push(raw.clone());
+            if self.shell_history.len() > 500 {
+                self.shell_history.remove(0);
+            }
+        }
+        recents::append_shell_history(&raw);
+        // Colon commands (`lbug`) and dot-commands (explore box) share the shell.
+        let lower = raw.to_ascii_lowercase();
+        if lower == ":help" || lower == "help" || lower == ":h" {
+            self.push_shell_line(false, false, Self::shell_help().to_string());
+            cx.notify();
+            return;
+        }
+        if lower == ":clear" || lower == ":c" {
+            self.shell_lines.clear();
+            cx.notify();
+            return;
+        }
+        if lower == ":schema" || lower == ":tables" || lower == ":s" {
+            self.run_shell_cypher("CALL SHOW_TABLES() RETURN *", cx);
+            return;
+        }
+        if lower.starts_with(":max_rows") {
+            let n = lower[" :max_rows".len().min(lower.len())..].trim();
+            // Accept both `:max_rows 50` and `:max_rows=50`.
+            let n = n.trim_start_matches(['=', ' ']).trim();
+            match n.parse::<usize>() {
+                Ok(v) if (1..=1000).contains(&v) => {
+                    self.shell_max_rows = v;
+                    self.push_shell_line(false, false, format!("max_rows = {v}"));
+                }
+                _ => self.push_shell_line(false, true, "usage: :max_rows N (1..1000)".to_string()),
+            }
+            cx.notify();
+            return;
+        }
+        if lower.starts_with(':') {
+            self.push_shell_line(false, true, format!("unknown command {raw:?} — try :help"));
+            cx.notify();
+            return;
+        }
+        if raw.starts_with('.') {
+            // Reuse explore-box navigation, echoing the outcome.
+            let before = self.status.clone();
+            self.run_dot_command(&raw, cx);
+            if self.status != before {
+                self.push_shell_line(false, false, self.status.clone());
+            }
+            // run_dot_command clears the explore box, not the shell.
+            cx.notify();
+            return;
+        }
+        if raw.starts_with('/') {
+            let term = raw.trim_start_matches('/').trim().to_string();
+            if term.is_empty() {
+                self.clear_text_search(cx);
+                self.push_shell_line(false, false, self.status.clone());
+            } else {
+                // Temporarily reuse the explore search path.
+                let saved = std::mem::take(&mut self.query);
+                let saved_cur = self.query_cursor;
+                self.query = raw.clone();
+                self.query_cursor = self.query.len();
+                self.run_query(cx);
+                self.query = saved;
+                self.query_cursor = saved_cur;
+                self.push_shell_line(false, false, self.status.clone());
+            }
+            cx.notify();
+            return;
+        }
+        self.run_shell_cypher(&raw, cx);
+    }
+
+    /// Shared Cypher execution for the shell: table to the scrollback, plus
+    /// graph replacement on local node/rel results (like the explore box).
+    fn run_shell_cypher(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_db else {
+            self.push_shell_line(false, true, "no database selected".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(db) = self.databases.get(id).cloned() else {
+            self.push_shell_line(false, true, "no database selected".to_string());
+            cx.notify();
+            return;
+        };
+        if let Some(uri) = db.remote_uri.clone() {
+            match adbc::query_cypher(&uri, raw) {
+                Ok((schema, batches)) => {
+                    let table = adbc::format_batches(&schema, &batches, self.shell_max_rows);
+                    self.push_shell_line(false, false, table.trim_end().to_string());
+                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    self.set_status(
+                        format!(
+                            "Shell: {rows} rows, {} cols (remote)",
+                            schema.fields().len()
+                        ),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    self.push_shell_line(false, true, format!("Query failed: {e:#}"));
+                    self.set_status(format!("Query failed: {e:#}"), cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let path = db.path.clone();
+        let conn = match backend::open_connection(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_shell_line(false, true, format!("Open failed: {e:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        // Graph-capable path (nodes/rels) for explorer replacement.
+        let graph = backend::run_cypher(&conn, raw);
+        // Table path for the scrollback (columns + timings like `lbug`).
+        match backend::run_cypher_table(&conn, raw, 5000) {
+            Ok((columns, rows, total, compile_ms, exec_ms)) => {
+                let table = adbc::format_table(&columns, &rows, total, self.shell_max_rows);
+                self.push_shell_line(false, false, table.trim_end().to_string());
+                self.push_shell_line(
+                    false,
+                    false,
+                    format!("Time: {compile_ms:.2}ms (compiling), {exec_ms:.2}ms (executing)"),
+                );
+            }
+            Err(e) => {
+                self.push_shell_line(false, true, format!("Query failed: {e:#}"));
+                self.set_status(format!("Query failed: {e:#}"), cx);
+                cx.notify();
+                return;
+            }
+        }
+        match graph {
+            Ok(data) if !data.nodes.is_empty() || !data.links.is_empty() => {
+                self.search_results.clear();
+                self.trail.clear();
+                self.focused = None;
+                self.selected = None;
+                self.hovered = None;
+                self.hovered_edge = None;
+                self.hover_pos = None;
+                self.treemap_hover = None;
+                self.clear_schema_selection();
+                self.full = data.clone();
+                self.model.load(&data);
+                self.model.settle();
+                self.frame_initial(None);
+                self.running = !data.nodes.is_empty() && !self.schema_mode;
+                let (nn, ne) = (data.nodes.len(), data.links.len());
+                self.maybe_auto_view(ne);
+                self.shown = data;
+                self.refresh_analytics();
+                self.set_status(format!("Shell Cypher: {nn} nodes, {ne} edges"), cx);
+            }
+            Ok(_) => {
+                self.set_status("Shell: scalar result — see scrollback".to_string(), cx);
+            }
+            Err(e) => {
+                self.set_status(format!("Query failed: {e:#}"), cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Bare-`/` behavior: drop text-search matches + any zoom/selection
@@ -1590,6 +2501,21 @@ impl RootView {
             ))
             .child(Self::menu_separator(theme))
             .child(Self::menu_row(
+                "Explore View",
+                Some("Ctrl+E"),
+                theme,
+                cx,
+                |view, cx| view.set_section(AppSection::Explore, cx),
+            ))
+            .child(Self::menu_row(
+                "Query Shell View",
+                Some("Ctrl+J"),
+                theme,
+                cx,
+                |view, cx| view.set_section(AppSection::Query, cx),
+            ))
+            .child(Self::menu_separator(theme))
+            .child(Self::menu_row(
                 "Graph View",
                 Some("Ctrl+1"),
                 theme,
@@ -1626,6 +2552,38 @@ impl RootView {
         // The theme button flips between the two palettes; the glyph shows
         // what you get when you click (sun on dark, moon on light).
         let theme_button = if theme.dark { "☀" } else { "☾" };
+        // Explore ⇄ Query section toggle so the shell stays reachable when
+        // the left pane is collapsed.
+        let mut section_toggle = div().flex().flex_row().gap_1();
+        for (label, glyph, mode) in [
+            ("Explore", "◈", AppSection::Explore),
+            ("Query", "❯", AppSection::Query),
+        ] {
+            let active = self.app_section == mode;
+            section_toggle = section_toggle.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(if active {
+                        theme.accent
+                    } else {
+                        theme.selection
+                    })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| view.set_section(mode, cx)),
+                    )
+                    .child(format!("{glyph} {label}")),
+            );
+        }
         // Data ↔ schema toggle: same control language as the view toggle.
         // Active side reads as a filled pill; the other as a quiet button.
         let mut schema_toggle = div().flex().flex_row().gap_1();
@@ -1714,6 +2672,7 @@ impl RootView {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .child(section_toggle)
                     .child(schema_toggle)
                     .child(toggle)
                     .child(
@@ -1890,26 +2849,194 @@ impl RootView {
             .child(line())
     }
 
-    fn render_sidebar(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Single-line text field with a block caret, shared by the remote URI
+    /// box and the shell input. `placeholder` shows when empty + unfocused.
+    fn render_text_field(
+        value: &str,
+        cursor: usize,
+        focused: bool,
+        placeholder: &str,
+        theme: Theme,
+    ) -> Div {
+        let (before, cur, after) = if focused && !value.is_empty() {
+            let mut at = cursor.min(value.len());
+            if !value.is_char_boundary(at) {
+                at = value.len();
+            }
+            let (b, rest) = value.split_at(at);
+            match rest.chars().next() {
+                Some(c) => (
+                    b.to_string(),
+                    c.to_string(),
+                    rest[c.len_utf8()..].to_string(),
+                ),
+                None => (b.to_string(), " ".to_string(), String::new()),
+            }
+        } else if value.is_empty() && !focused {
+            (placeholder.to_string(), String::new(), String::new())
+        } else if value.is_empty() {
+            ("▍".to_string(), String::new(), String::new())
+        } else {
+            (value.to_string(), String::new(), String::new())
+        };
+        let mut cur_el = div().child(cur);
+        if focused && !value.is_empty() {
+            cur_el = cur_el
+                .bg(theme.accent)
+                .text_color(theme.on_accent)
+                .rounded_sm();
+        }
+        div()
+            .flex()
+            .flex_row()
+            .child(before)
+            .child(cur_el)
+            .child(after)
+    }
+
+    /// Open a local file from the recents list: reuse the entry when the
+    /// database is already listed, otherwise append it first.
+    fn open_recent_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(existing) = self.databases.iter().position(|d| d.path == path) {
+            self.select_database(existing, cx);
+            return;
+        }
+        let p = std::path::PathBuf::from(path);
+        if !p.is_file() {
+            self.set_status(format!("Missing file: {path}"), cx);
+            return;
+        }
+        let mut info = backend::database_info_for_path(&p);
+        info.id = self.databases.len();
+        self.databases.push(info);
+        self.select_database(self.databases.len() - 1, cx);
+    }
+
+    /// Left pane: view-switch icons, recently opened `.lbdb` files, local
+    /// databases, and the remote (ADBC) connect box — then matches/schema
+    /// details below.
+    fn render_sidebar(
+        &mut self,
+        theme: Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let section = self.app_section;
         let mut col = div()
             .flex()
             .flex_col()
             .gap_1()
             .p_2()
-            .w(px(260.))
+            .w(px(280.))
             .h_full()
             .id("sidebar")
             .overflow_y_scroll()
             .bg(theme.surface)
             .text_color(theme.foreground)
-            .text_sm()
-            .child(div().font_weight(FontWeight::BOLD).child("Databases"))
+            .text_sm();
+        // View-switch icons: Explore (current main view) ⇄ Query shell.
+        let mut switcher = div().flex().flex_row().gap_1();
+        for (label, glyph, mode) in [
+            ("Explore", "◈", AppSection::Explore),
+            ("Query", "❯_", AppSection::Query),
+        ] {
+            let active = section == mode;
+            switcher = switcher.child(
+                div()
+                    .flex_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .items_center()
+                    .justify_center()
+                    .bg(if active {
+                        theme.accent
+                    } else {
+                        theme.selection
+                    })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .hover(|s| s.bg(if active { theme.accent } else { theme.border }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| view.set_section(mode, cx)),
+                    )
+                    .child(format!("{glyph} {label}")),
+            );
+        }
+        col = col.child(switcher);
+        // Recently opened local databases.
+        col = col.child(
+            div()
+                .pt_2()
+                .text_xs()
+                .text_color(theme.secondary)
+                .child("RECENT · local .lbdb".to_string()),
+        );
+        if self.recent_local.is_empty() {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("No recent files yet.".to_string()),
+            );
+        }
+        for path in self.recent_local.clone().into_iter().take(8) {
+            let short = std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let active = self
+                .selected_db
+                .and_then(|id| self.databases.get(id))
+                .map(|d| d.path == path)
+                .unwrap_or(false);
+            col = col.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { theme.accent } else { theme.surface })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .hover(|s| {
+                        s.bg(if active {
+                            theme.accent
+                        } else {
+                            theme.selection
+                        })
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.open_recent_path(&path.clone(), cx);
+                        }),
+                    )
+                    .child(format!("▤ {short}")),
+            );
+        }
+        col = col
+            .child(div().pt_1().font_weight(FontWeight::BOLD).child("Local"))
             .child(
                 div()
                     .text_xs()
+                    .text_color(theme.secondary)
                     .child(self.db_dir.to_string_lossy().to_string()),
             );
-        for d in self.databases.clone() {
+        for d in self
+            .databases
+            .clone()
+            .into_iter()
+            .filter(|d| !d.is_remote())
+        {
             let id = d.id;
             let active = Some(id) == self.selected_db;
             col = col.child(
@@ -1919,15 +3046,163 @@ impl RootView {
                     .rounded_md()
                     .cursor_pointer()
                     .bg(if active { theme.accent } else { theme.surface })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |view, _, _, cx| {
-                            view.selected_db = Some(id);
-                            view.clear_schema_selection();
-                            view.load_graph(cx);
+                            view.select_database(id, cx);
                         }),
                     )
-                    .child(d.name.clone()),
+                    .child(format!("▤ {}", d.name.clone())),
+            );
+        }
+        col = col.child(
+            div()
+                .px_2()
+                .py_1()
+                .mt_1()
+                .rounded_md()
+                .bg(theme.selection)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.border))
+                .text_sm()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| view.open_file_dialog(cx)),
+                )
+                .child("＋ Open file…".to_string()),
+        );
+        // Remote databases over Arrow Flight / ADBC.
+        col = col.child(
+            div()
+                .pt_2()
+                .font_weight(FontWeight::BOLD)
+                .child("Remote (ADBC)".to_string()),
+        );
+        {
+            let rfocus = self.remote_focus.clone();
+            let rfocused = self.remote_focus.is_focused(window);
+            let field = Self::render_text_field(
+                &self.remote_uri.clone(),
+                self.remote_cursor,
+                rfocused,
+                adbc::DEFAULT_URI_HINT,
+                theme,
+            );
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("remote-uri")
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme.inset)
+                            .border_1()
+                            .border_color(if rfocused { theme.accent } else { theme.border })
+                            .text_color(if self.remote_uri.is_empty() && !rfocused {
+                                theme.secondary
+                            } else {
+                                theme.bright
+                            })
+                            .text_xs()
+                            .cursor_text()
+                            .track_focus(&rfocus)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, window, cx| {
+                                    let h = view.remote_focus.clone();
+                                    window.focus(&h);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _, cx| {
+                                view.apply_line_key(LineTarget::Remote, ev, cx);
+                            }))
+                            .child(field),
+                    )
+                    .child(
+                        div().flex().flex_row().gap_1().child(
+                            div()
+                                .flex_1()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.accent)
+                                .text_color(theme.on_accent)
+                                .cursor_pointer()
+                                .text_sm()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|view, _, _, cx| view.connect_remote(cx)),
+                                )
+                                .child("⇄ Connect".to_string()),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child(self.adbc_status.clone()),
+                    ),
+            );
+        }
+        for d in self.databases.clone().into_iter().filter(|d| d.is_remote()) {
+            let id = d.id;
+            let active = Some(id) == self.selected_db;
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { theme.accent } else { theme.surface })
+                    .text_color(if active {
+                        theme.on_accent
+                    } else {
+                        theme.foreground
+                    })
+                    .hover(|s| {
+                        s.bg(if active {
+                            theme.accent
+                        } else {
+                            theme.selection
+                        })
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.select_database(id, cx);
+                        }),
+                    )
+                    .child(format!("⇄ {}", d.name.clone()))
+                    .child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .hover(|s| s.bg(theme.border))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.disconnect_remote(id, cx);
+                                }),
+                            )
+                            .child("×".to_string()),
+                    ),
             );
         }
         if self.schema_mode {
@@ -2634,6 +3909,103 @@ impl RootView {
                 }
             }))
     }
+
+    /// Query view: `lbug`-style shell — scrollback plus a readline input
+    /// with history. Runs against the selected database (local or remote
+    /// ADBC); graph-returning local Cypher also replaces the explorer.
+    fn render_query_view(&mut self, theme: Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let sfocus = self.shell_focus.clone();
+        let sfocused = self.shell_focus.is_focused(window);
+        let mut scroll = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .flex_1()
+            .w_full()
+            .id("shell-scroll")
+            .overflow_y_scroll()
+            .text_xs()
+            .child(
+                div().text_color(theme.secondary).child(
+                    "lbug shell — Cypher + :help :clear :schema :tables :max_rows · ↑/↓ history"
+                        .to_string(),
+                ),
+            );
+        for line in self.shell_lines.clone() {
+            let mut row = div().flex().flex_row();
+            if line.prompt {
+                row = row
+                    .child(div().text_color(theme.accent).child("lbug> ".to_string()))
+                    .child(div().text_color(theme.bright).child(line.text));
+            } else if line.error {
+                row = row.child(div().text_color(theme.secondary).child(line.text));
+            } else {
+                row = row.child(div().text_color(theme.foreground).child(line.text));
+            }
+            scroll = scroll.child(row);
+        }
+        let field = Self::render_text_field(
+            &self.shell_input.clone(),
+            self.shell_cursor,
+            sfocused,
+            "MATCH (n) RETURN n LIMIT 25 — Enter to run",
+            theme,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .bg(theme.inset)
+            .child(scroll)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .bg(theme.surface)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_color(theme.accent)
+                            .text_sm()
+                            .child("lbug> ".to_string()),
+                    )
+                    .child(
+                        div()
+                            .id("shell-input")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme.inset)
+                            .border_1()
+                            .border_color(if sfocused { theme.accent } else { theme.border })
+                            .text_color(theme.bright)
+                            .text_sm()
+                            .cursor_text()
+                            .track_focus(&sfocus)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, window, cx| {
+                                    let h = view.shell_focus.clone();
+                                    window.focus(&h);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _, cx| {
+                                view.apply_line_key(LineTarget::Shell, ev, cx);
+                            }))
+                            .child(field),
+                    ),
+            )
+    }
 }
 
 impl Render for RootView {
@@ -2691,21 +4063,28 @@ impl Render for RootView {
             .child(cur_el)
             .child(after);
         let sidebar = if self.sidebar_open {
-            Some(self.render_sidebar(theme, cx))
+            Some(self.render_sidebar(theme, window, cx))
         } else {
             None
         };
-        let center = match self.view_mode {
+        let explore_center = match self.view_mode {
             ViewMode::Graph => self.render_graph_canvas(theme, cx),
             ViewMode::Treemap => self.render_treemap_canvas(theme, cx),
             ViewMode::Sunburst => self.render_sunburst_canvas(theme, cx),
         };
-        let insights = if self.right_open {
+        // Query section replaces the canvas with the `lbug`-style shell;
+        // the bottom explore box and the insights pane stay explore-only.
+        let center: Div = if self.app_section == AppSection::Query {
+            self.render_query_view(theme, window, cx)
+        } else {
+            explore_center
+        };
+        let insights = if self.right_open && self.app_section == AppSection::Explore {
             Some(self.render_insights(theme, cx))
         } else {
             None
         };
-        let root = div()
+        let mut root = div()
             .flex()
             .flex_col()
             .size_full()
@@ -2716,24 +4095,27 @@ impl Render for RootView {
             // the native bar). Must come before the header so tab order
             // and layout match the platform convention.
             .children(self.render_menu_bar(theme, cx))
-            .child(self.render_header(theme, window, cx))
-            .child(self.render_breadcrumbs(theme, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    .children(sidebar)
-                    .child(self.render_divider(theme, cx))
-                    .child(center)
-                    .child(self.render_right_divider(theme, cx))
-                    .children(insights),
-            )
+            .child(self.render_header(theme, window, cx));
+        if self.app_section == AppSection::Explore {
+            root = root.child(self.render_breadcrumbs(theme, cx));
+        }
+        root = root.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .children(sidebar)
+                .child(self.render_divider(theme, cx))
+                .child(center)
+                .child(self.render_right_divider(theme, cx))
+                .children(insights),
+        );
+        if self.app_section == AppSection::Explore {
             // Compact query bar at the bottom: `/foo` searches, bare `/`
             // clears, `.root` / `.parent` / `.schema` / `.data` navigate, anything
-            // else runs as Cypher. Enter submits; Escape clears.
-            .child(
+            // else runs as Cypher. Enter submits; Escape clears; ↑/↓ history.
+            root = root.child(
                 div()
                     .flex()
                     .flex_row()
@@ -2769,80 +4151,13 @@ impl Render for RootView {
                                 }),
                             )
                             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _, cx| {
-                                let mods = &ev.keystroke.modifiers;
-                                let cmd = mods.platform || mods.control;
-                                match ev.keystroke.key.as_str() {
-                                    "backspace" => {
-                                        view.query_backspace(cmd);
-                                        cx.notify();
-                                    }
-                                    "delete" => {
-                                        view.query_delete_fwd();
-                                        cx.notify();
-                                    }
-                                    "enter" => view.run_query(cx),
-                                    "escape" => {
-                                        view.query.clear();
-                                        view.query_cursor = 0;
-                                        cx.notify();
-                                    }
-                                    "left" => {
-                                        view.query_move(-1);
-                                        cx.notify();
-                                    }
-                                    "right" => {
-                                        view.query_move(1);
-                                        cx.notify();
-                                    }
-                                    "home" => {
-                                        view.query_cursor = 0;
-                                        cx.notify();
-                                    }
-                                    "end" => {
-                                        view.query_cursor = view.query.len();
-                                        cx.notify();
-                                    }
-                                    // ⌘V paste (clipboard text, flattened to
-                                    // one line); ⌘C copies the whole query.
-                                    "v" if cmd => {
-                                        if let Some(item) = cx.read_from_clipboard() {
-                                            if let Some(text) = item.text() {
-                                                let flat = text
-                                                    .split_whitespace()
-                                                    .collect::<Vec<_>>()
-                                                    .join(" ");
-                                                if !flat.is_empty() {
-                                                    view.query_insert(&flat);
-                                                    cx.notify();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "c" if cmd => {
-                                        if !view.query.is_empty() {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                view.query.clone(),
-                                            ));
-                                        }
-                                    }
-                                    _ => {
-                                        if let Some(ch) = ev.keystroke.key_char.clone() {
-                                            if !mods.control
-                                                && !mods.platform
-                                                && !mods.alt
-                                                && ch.chars().count() == 1
-                                            {
-                                                view.query_insert(&ch);
-                                                cx.notify();
-                                            }
-                                        }
-                                    }
-                                }
+                                view.apply_line_key(LineTarget::Query, ev, cx);
                             }))
                             .child(query_content),
                     ),
-            )
-            .children(self.render_preferences_modal(theme, cx));
+            );
+        }
+        root = root.children(self.render_preferences_modal(theme, cx));
         decorations::client_frame(root, theme, window)
     }
 }

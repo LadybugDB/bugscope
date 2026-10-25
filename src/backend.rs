@@ -20,6 +20,34 @@ pub struct DatabaseInfo {
     pub id: usize,
     pub name: String,
     pub path: String,
+    /// `Some(uri)` marks a remote Arrow Flight / ADBC database. `path`
+    /// then holds the URI for display; local files leave this as `None`.
+    #[serde(default)]
+    pub remote_uri: Option<String>,
+}
+
+impl DatabaseInfo {
+    pub fn is_remote(&self) -> bool {
+        self.remote_uri.is_some()
+    }
+
+    pub fn local(path: &str, name: String) -> Self {
+        Self {
+            id: 0,
+            name,
+            path: path.to_string(),
+            remote_uri: None,
+        }
+    }
+
+    pub fn remote(uri: &str) -> Self {
+        Self {
+            id: 0,
+            name: uri.trim().to_string(),
+            path: uri.trim().to_string(),
+            remote_uri: Some(uri.trim().to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +124,38 @@ pub fn database_info_for_path(path: &Path) -> DatabaseInfo {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         path: path.to_string_lossy().into_owned(),
+        remote_uri: None,
     }
+}
+
+/// One shell-table cell: `Display` renders scalars raw and Node/Rel
+/// values in their compact `lbug` form.
+pub fn value_to_display(v: &Value) -> String {
+    format!("{v}")
+}
+
+/// Shell table: columns, up-to-`collect_cap` row strings, total rows seen,
+/// and compile/execution timings.
+pub type ShellTable = (Vec<String>, Vec<Vec<String>>, usize, f64, f64);
+
+/// Run arbitrary Cypher and return a shell table. Rows are capped at
+/// `collect_cap` (the caller truncates display further with `max_rows`);
+/// `total_rows` reports how many were collected so the footer can note
+/// truncation.
+#[allow(clippy::type_complexity)]
+pub fn run_cypher_table(conn: &Connection, query: &str, collect_cap: usize) -> Result<ShellTable> {
+    let mut result = conn.query(query)?;
+    let columns = result.get_column_names();
+    let (compile_ms, exec_ms) = (result.get_compiling_time(), result.get_execution_time());
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for row in &mut result {
+        total += 1;
+        if rows.len() < collect_cap {
+            rows.push(row.iter().map(value_to_display).collect());
+        }
+    }
+    Ok((columns, rows, total, compile_ms, exec_ms))
 }
 
 pub fn default_db_dir() -> PathBuf {
