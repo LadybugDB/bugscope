@@ -36,13 +36,13 @@ jobs:
           wget -qO- --timeout=60 --tries=3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
-          # Pinned to 25.0.1: the icebug prebuilt links libarrow.so.2500; the
-          # repo now defaults to 26.x, which breaks test/runtime loads.
+          # Pinned to 26.0.0 to match the Linux icebug 13.5 prebuilt, which
+          # links libarrow.so.2600 (macOS stays on Arrow 25 + icebug 13.4).
           wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           # Bound mirror stalls: fail fast instead of hanging the run for hours.
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev=25.0.1-1 libarrow2500=25.0.1-1 libomp-20-dev
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev=26.0.0-1 libarrow2600=26.0.0-1 libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
@@ -160,13 +160,13 @@ jobs:
           wget -qO- --timeout=60 --tries=3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
           echo "deb http://apt.llvm.org/jammy llvm-toolchain-jammy-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
           # Apache Arrow repo (icebug's cxx bridge needs arrow headers).
-          # Pinned to 25.0.1: the icebug prebuilt links libarrow.so.2500; the
-          # repo now defaults to 26.x, which breaks test/runtime loads.
+          # Pinned to 26.0.0 to match the Linux icebug 13.5 prebuilt, which
+          # links libarrow.so.2600 (macOS stays on Arrow 25 + icebug 13.4).
           wget --timeout=60 --tries=3 https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb
           sudo apt-get install -y ./apache-arrow-apt-source-latest-jammy.deb
           # Bound mirror stalls: fail fast instead of hanging the run for hours.
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev=25.0.1-1 libarrow2500=25.0.1-1 libomp-20-dev
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 install -y --no-install-recommends gcc-13 g++-13 cmake pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libarrow-dev=26.0.0-1 libarrow2600=26.0.0-1 libomp-20-dev
           echo "CC=gcc-13" >> "$GITHUB_ENV"
           echo "CXX=g++-13" >> "$GITHUB_ENV"
 
